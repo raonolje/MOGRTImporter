@@ -1,0 +1,288 @@
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background-color: #1e1e1e;
+    color: #c8c8c8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 12px;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ── Toolbar ── */
+#toolbar {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 7px 8px;
+    background: #2a2a2a;
+    border-bottom: 1px solid #3a3a3a;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+#toolbar label {
+    font-size: 11px;
+    color: #999;
+    white-space: nowrap;
+}
+
+#trackSelect {
+    background: #3a3a3a;
+    color: #c8c8c8;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 3px 6px;
+    font-size: 11px;
+}
+
+.btn {
+    background: #0d66d0;
+    color: #fff;
+    border: none;
+    border-radius: 3px;
+    padding: 5px 9px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background 0.15s;
+    display: inline-flex;
+    align-items: center;
+    line-height: 1;
+}
+.btn:hover { background: #0b56b0; }
+.btn.secondary {
+    background: #3a3a3a;
+    color: #c8c8c8;
+    border: 1px solid #555;
+}
+.btn.secondary:hover { background: #4a4a4a; }
+.btn.success { background: #1a7f37; }
+.btn.success:hover { background: #166d2f; }
+.btn:disabled {
+    background: #333;
+    color: #666;
+    cursor: not-allowed;
+}
+
+.spacer { flex: 1; }
+
+/* ── Status bar ── */
+#statusBar {
+    padding: 5px 10px;
+    background: #252525;
+    border-top: 1px solid #3a3a3a;
+    font-size: 11px;
+    color: #888;
+    flex-shrink: 0;
+    min-height: 24px;
+}
+#statusBar.ok  { color: #4caf50; }
+#statusBar.err { color: #f44336; }
+#statusBar.info { color: #64b5f6; }
+
+/* ── Main content ── */
+#mainContent {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ── Empty state ── */
+#emptyState {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #555;
+    gap: 10px;
+}
+#emptyState .icon { font-size: 36px; }
+#emptyState p { font-size: 13px; }
+
+/* ── Subtitle list ── */
+#subtitleList {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px;
+    display: none;
+    flex-direction: column;
+    gap: 4px;
+}
+#subtitleList.visible { display: flex; }
+
+/* ── Subtitle row ── */
+.sub-row {
+    background: #2a2a2a;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    overflow: hidden;
+    transition: border-color 0.15s;
+}
+.sub-row:hover { border-color: #555; }
+.sub-row.expanded { border-color: #0d66d0; }
+
+.sub-row-header {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 8px;
+    cursor: pointer;
+    user-select: none;
+}
+.sub-row-header:hover { background: #333; }
+
+.sub-index {
+    color: #666;
+    font-size: 10px;
+    min-width: 18px;
+    text-align: right;
+    flex-shrink: 0;
+}
+
+.sub-time {
+    color: #888;
+    font-size: 10px;
+    white-space: nowrap;
+    min-width: 130px;
+    flex-shrink: 0;
+}
+
+.sub-text {
+    flex: 1;
+    color: #c8c8c8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.mogrt-select {
+    background: #3a3a3a;
+    color: #c8c8c8;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 3px 5px;
+    font-size: 11px;
+    max-width: 150px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.mogrt-select:focus { outline: none; border-color: #0d66d0; }
+
+/* ── Param panel ── */
+.sub-params {
+    display: none;
+    padding: 8px 10px;
+    background: #252525;
+    border-top: 1px solid #3a3a3a;
+    flex-direction: column;
+    gap: 6px;
+}
+.sub-params.visible { display: flex; }
+
+.param-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.param-label {
+    color: #888;
+    font-size: 11px;
+    min-width: 90px;
+    text-align: right;
+    flex-shrink: 0;
+}
+.param-input {
+    flex: 1;
+    background: #3a3a3a;
+    color: #c8c8c8;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 4px 6px;
+    font-size: 11px;
+    min-width: 0;
+}
+.param-input:focus { outline: none; border-color: #0d66d0; }
+.param-input.main-text {
+    border-color: #0d66d0;
+    background: #1a2a3a;
+}
+
+.param-badge {
+    font-size: 9px;
+    background: #0d66d0;
+    color: #fff;
+    border-radius: 2px;
+    padding: 1px 4px;
+    flex-shrink: 0;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #1e1e1e; }
+::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #555; }
+
+/* ── 폰트 select 드롭다운 ── */
+.mogrt-font-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0 2px 0;
+}
+.mogrt-font-select {
+    flex: 1;
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+    background: #3a3a3a;
+    color: #c8c8c8;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 4px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    outline: none;
+}
+.mogrt-font-select:focus { border-color: #0d66d0; }
+.mogrt-font-select:hover { border-color: #888; }
+
+
+
+
+/* ── 내보내기 모달 오버레이 ── */
+.custom-modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+}
+.custom-modal-overlay.open {
+    display: flex;
+}
+.custom-modal-box {
+    background: #2a2a2a;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 18px 20px 14px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.6);
+}
+.custom-modal-btns {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
+}

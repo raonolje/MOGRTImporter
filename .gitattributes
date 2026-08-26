@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.exe binary
+*.min.js -diff linguist-vendored
+CSInterface.js -diff linguist-vendored
