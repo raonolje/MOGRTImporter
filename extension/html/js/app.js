@@ -1658,9 +1658,16 @@
 		});
 	}
 	//#endregion
-	//#region src/ui/modal.ts
-var _setStatus$1 = () => {};
-
+	//#region src/ui/fontModal.ts
+	// 싱글톤 폰트 선택 모달. 현재 호출자가 없다.
+	//
+	// 진입점인 _openFontModal을 부르는 코드가 번들 어디에도 없고,
+	// 나머지 셋은 _openFontModal 또는 _ensureFontModal이 붙인 핸들러에서만
+	// 불린다. 즉 이 region 전체가 도달 불가다. 실제 폰트 선택은
+	// ui/paramEditor와 ui/modal이 만드는 <select class="mogrt-font-select">가
+	// 담당한다.
+	//
+	// 지우지 않고 격리만 해둔다. 삭제 여부는 별도 판단이 필요하다.
 // ─── 싱글톤 폰트 모달 (전역 1개) ───────────────────────────────
 var _fontModalEl = null;
 var _fontModalCallback = null;
@@ -1763,7 +1770,9 @@ function _closeFontModal() {
 	var searchInp = document.getElementById("_gFontSearch");
 	if (searchInp) searchInp.value = "";
 }
-// ────────────────────────────────────────────────────────────────
+	//#endregion
+	//#region src/ui/modal.ts
+var _setStatus$1 = () => {};
 
 var modalState = {
 		paramList: null,
