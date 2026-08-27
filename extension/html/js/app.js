@@ -2148,390 +2148,14 @@ function _closeFontModal() {
 		}, 1000);
 	}
 	//#endregion
-	//#region src/ui/modal.ts
-var _setStatus$1 = () => {};
-
-var modalState = {
-		paramList: null,
-		mogrtPath: "",
-		presetId: null,
-		exposedIndices: [],
-		textParamIndex: -1,
-		exposedFontFields: {},
-		folderTree: null,
-		selectedFolderPath: "__all__"
-	};
-	function initModal(setStatus) {
-		_setStatus$1 = setStatus;
-	}
-	function openPresetModal(presetId) {
-		const modal = document.getElementById("defaultModal");
-		const modalBody = document.getElementById("defaultModalBody");
-		const mogrtSel = document.getElementById("defaultMogrtSel");
-		const nameInput = document.getElementById("presetNameInput");
-		modalState.presetId = presetId;
-		modalState.paramList = null;
-		modalState.exposedIndices = [];
-		modalState.textParamIndex = -1;
-		modalState.exposedFontFields = {};
-		_lastPreviewSrc = null;   // 모달 열릴 때마다 쓰네일 초기화
-		modalBody.innerHTML = "<p style=\"color:#64b5f6;font-size:11px;padding:20px 0;text-align:center;\">MOGRT를 선택하면 파라미터를 설정할 수 있습니다.</p>";
-		const previewArea = document.getElementById("modalPreviewArea");
-		if (previewArea) previewArea.innerHTML = "";
-		if (nameInput) nameInput.value = presetId && state.presets[presetId] ? state.presets[presetId].name : "";
-		mogrtSel.innerHTML = "";
-		const none = document.createElement("option");
-		none.value = "";
-		none.textContent = "-- MOGRT 선택 --";
-		mogrtSel.appendChild(none);
-		state.mogrtList.forEach((m) => {
-			const opt = document.createElement("option");
-			opt.value = m.path;
-			opt.textContent = m.name;
-			if (presetId && state.presets[presetId]?.mogrtPath === m.path) opt.selected = true;
-			mogrtSel.appendChild(opt);
-		});
-		const currentPath = presetId ? state.presets[presetId]?.mogrtPath ?? "" : "";
-		// 저장된 보기 상태 적용
-		const gridEl = document.getElementById("mogrtPickerGrid");
-		const savedView = localStorage.getItem("mogrtPickerView") || "card";
-		if (gridEl) { gridEl.classList.toggle("list-view", savedView === "list"); }
-		document.getElementById("btnMogrtViewCard")?.classList.toggle("active", savedView === "card");
-		document.getElementById("btnMogrtViewList")?.classList.toggle("active", savedView === "list");
-		// 폴더 트리 로드 (캐시 우선 사용)
-		modalState.selectedFolderPath = "__all__";
-		const statusEl = document.getElementById("mogrtPickerStatus");
-		function _applyFolderTree(tree) {
-			modalState.folderTree = tree;
-			// mogrtList 동기화 (트리에서 수집)
-			const collected = [];
-			collectMogrtsFromTree(tree, collected);
-			collected.forEach((item) => {
-				if (!state.mogrtList.some((m) => m.path === item.path)) {
-					state.mogrtList.push(item);
-					const opt = document.createElement("option");
-					opt.value = item.path;
-					opt.textContent = item.name;
-					mogrtSel.appendChild(opt);
-				}
-			});
-			// 루트 폴더를 기본 선택으로 설정 (신규 프리셋 추가 시)
-			if (!currentPath && tree) {
-				modalState.selectedFolderPath = tree.path;
-			}
-			// 폴더 트리 패널 렌더링 (선택 상태 포함)
-			renderFolderTree();
-			// 카드 렌더링 (전체 or 선택 폴더)
-			renderMogrtPickerCards(currentPath);
-			updatePickerLabel(currentPath);
-			const statusEl2 = document.getElementById("mogrtPickerStatus");
-			if (statusEl2) statusEl2.textContent = "";
-		}
-		if (window._cachedFolderTree) {
-			// 캐시 있으면 즉시 렌더링
-			_applyFolderTree(window._cachedFolderTree);
-		} else {
-			// 최초 1회만 JSX 호출
-			if (statusEl) statusEl.textContent = "폴더 구조 로드 중...";
-			host.getMogrtFolderTree().then((tree) => {
-				window._cachedFolderTree = tree; // 캐시 저장
-				_applyFolderTree(tree);
-			}).catch(() => {
-				const statusEl2 = document.getElementById("mogrtPickerStatus");
-				if (statusEl2) statusEl2.textContent = "폴더 로드 실패";
-			});
-		}
-		modal.classList.add("open");
-		// 시스템 폰트 캐시 로드 (최초 1회)
-		if (!_cachedSystemFonts) {
-			host.getSystemFonts().then((fonts) => {
-				_cachedSystemFonts = fonts;
-			}).catch(() => {});
-		}
-		// 기존 프리셋 편집 시 2차 모달도 바로 열기
-		if (presetId && state.presets[presetId]) {
-			const editModal = document.getElementById("presetEditModal");
-			const titleEl = document.getElementById("presetEditTitle");
-			const found = state.mogrtList.find((m) => m.path === state.presets[presetId].mogrtPath);
-			if (titleEl) titleEl.textContent = "⚙ " + (found ? found.name : state.presets[presetId].mogrtPath.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? "");
-			if (editModal) editModal.classList.add("open");
-			loadMogrtForModal(state.presets[presetId].mogrtPath, presetId);
-			// 역방향 동기화 시작
-			setTimeout(() => { if (typeof _startReverseSync === "function" && !_reverseSyncActive) _startReverseSync(); }, 3000);
-		}
-	}
-	// definition.json 데이터로 params 배열의 드롭다운 옵션명, 슬라이더 min/max, 폰트명 보강
-	function patchParamsFromDefinition(params, def) {
-		if (!def) return;
-
-		// uiName 중첩 객체 파싱 헬퍼
-		function getUIName(c) {
-			if (!c) return "";
-			const n = c.capPropUIName || c.uiName || c.displayName || "";
-			if (typeof n === "string") return n;
-			// {strDB:[{localeString:"en_US",str:"..."}]} 형태
-			try { return n.strDB?.[0]?.str || ""; } catch(_) { return ""; }
-		}
-
-		// menucontent 에서 옵션 문자열 추출 헬퍼
-		function extractMenuOptions(opts) {
-			if (!Array.isArray(opts)) return [];
-			return opts.map((o) => {
-				if (typeof o === "string") return o;
-				// {strDB:[{str:"..."}]} 형태
-				if (o && o.strDB) try { return o.strDB[0]?.str || ""; } catch(_) {}
-				return o.label || o.name || o.str || String(o);
-			});
-		}
-
-		// capParams 우선 (평문 필드), 없으면 clientControls 사용
-		const capParams = def.sourceInfoLocalized?.en_US?.capsuleparams?.capParams || null;
-		const clientControls = def.clientControls || null;
-
-		// displayName 기준 매핑 테이블 구성
-		const capMap = {};
-		if (Array.isArray(capParams)) {
-			capParams.forEach((c) => {
-				const name = getUIName(c);
-				if (name) capMap[name] = c;
-			});
-		}
-		const ctrlMap = {};
-		if (Array.isArray(clientControls)) {
-			clientControls.forEach((c) => {
-				const name = getUIName(c);
-				if (name) ctrlMap[name] = c;
-			});
-		}
-
-		params.forEach((p) => {
-			const cap = capMap[p.displayName];
-			const ctrl = ctrlMap[p.displayName];
-
-			// 드롭다운 옵션명 보강 (number로 잘못 감지된 경우도 포함)
-			if (p.type === "dropdown" || p.type === "number") {
-				// capParams의 menuContent (평문 배열) 우선
-				const rawMenuOpts = cap?.menuContent || cap?.menucontent || null;
-				const ctrlMenuOpts = ctrl?.menucontent || ctrl?.menuContent || null;
-				const opts = rawMenuOpts
-					? (Array.isArray(rawMenuOpts) ? rawMenuOpts : extractMenuOptions(rawMenuOpts))
-					: extractMenuOptions(ctrlMenuOpts);
-				if (Array.isArray(opts) && opts.length > 0) {
-					p.dropdownOptions = opts.map((o) => (typeof o === "string" ? o : String(o)));
-					// number로 잘못 감지된 경우 dropdown으로 강제 변환
-					if (p.type === "number") p.type = "dropdown";
-				}
-			}
-
-			// 슬라이더 min/max 보강
-			if (p.type === "number") {
-				// capParams의 capPropMin/Max 우선
-				const defMin = cap?.capPropMin ?? ctrl?.min ?? null;
-				const defMax = cap?.capPropMax ?? ctrl?.max ?? null;
-				if (defMin !== null && defMin !== undefined) p.minValue = Number(defMin);
-				if (defMax !== null && defMax !== undefined) p.maxValue = Number(defMax);
-			}
-
-			// 텍스트 폰트명 보강 (rawValue가 없거나 fontEditValue가 비어있을 때)
-			if (p.type === "text") {
-				// capParams에서 fontEditValue 배열 직접 추출
-				const fontArr = cap?.fontEditValue || (ctrl?.fonteditinfo?.fontEditValue ? [ctrl.fonteditinfo.fontEditValue] : null);
-				if (fontArr && fontArr.length > 0) {
-					p.fontEditValue = fontArr; // 미리보기에서 직접 사용
-					if (p.rawValue) {
-						try {
-							const rv = JSON.parse(p.rawValue);
-							if (!rv.fontEditValue || rv.fontEditValue.length === 0) {
-								rv.fontEditValue = fontArr;
-								p.rawValue = JSON.stringify(rv);
-							}
-						} catch(_) {}
-					}
-				}
-
-				// ★ capPropFontEdit 기반 fontExposed 보강
-				// definition.json의 capPropFontEdit: true → 폰트 편집 가능
-				// capPropFontEdit: false 또는 없음 → 텍스트 내용만 편집 가능
-				const capFontEdit = cap?.capPropFontEdit ?? ctrl?.fonteditinfo?.capPropFontEdit ?? null;
-				if (capFontEdit === true) {
-					// 폰트 편집 가능: fontExposed를 true로 설정
-					p.fontExposed = true;
-				} else if (capFontEdit === false) {
-					// 폰트 편집 불가: fontExposed를 false로 명시
-					p.fontExposed = false;
-				}
-				// capFontEdit === null: hostscript.jsx의 fontExposed 값 유지
-			}
-		});
-	}
-
-	function loadMogrtForModal(mogrtPath, presetId) {
-		const modalBody = document.getElementById("defaultModalBody");
-
-		// 캐시된 파라미터가 있으면 즉시 사용 (호스트 호출 생략)
-		if (state.mogrtOriginals[mogrtPath]) {
-			_applyMogrtParamsToModal(state.mogrtOriginals[mogrtPath], mogrtPath, presetId);
-			return;
-		}
-
-		modalBody.innerHTML = "<p style=\"color:#64b5f6;font-size:11px;padding:10px 0;text-align:center;\">파라미터 로드 중... (최대 90초)</p><p style=\"color:#aaa;font-size:10px;padding:0;text-align:center;\">첫 번째 로드는 Premiere가 MOGRT를 초기화하는 시간이 필요합니다.<br>두 번째부터는 즉시 로드됩니다.</p>";
-		let timedOut = false;
-		const timeoutId = setTimeout(() => {
-			timedOut = true;
-			modalBody.innerHTML = "<p style=\"color:#f44336;font-size:11px;padding:10px 0;\">파라미터 로드 타임아웃 (90초 초과). MOGRT 파일이 유효한지 확인하거나 Premiere Pro를 재시작하세요.</p>";
-		}, 9e4);
-		host.getMogrtParams(mogrtPath).then((parsed) => {
-			if (timedOut) return;
-			clearTimeout(timeoutId);
-			try {
-				// getMogrtParams는 {params, mogrtPath} 객체 또는 기존 배열 형태 모두 지원
-				const freshList = Array.isArray(parsed) ? parsed : (parsed.params || []);
-				if (!state.mogrtOriginals[mogrtPath]) state.mogrtOriginals[mogrtPath] = JSON.parse(JSON.stringify(freshList));
-				const existingPreset = presetId ? state.presets[presetId] : null;
-				if (existingPreset) freshList.forEach((p) => {
-					const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
-					if (ep) {
-						p.value = ep.value;
-						if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
-						if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
-					}
-				});
-				modalState.paramList = freshList;
-				modalState.mogrtPath = mogrtPath;
-				modalState.presetId = presetId;
-				if (existingPreset) {
-					modalState.exposedIndices = [...existingPreset.exposedIndices];
-					modalState.textParamIndex = existingPreset.textParamIndex ?? -1;
-					modalState.exposedFontFields = existingPreset.exposedFontFields ? JSON.parse(JSON.stringify(existingPreset.exposedFontFields)) : {};
-				} else {
-					const defaultExposed = [];
-					let defaultTextIdx = -1;
-					freshList.forEach((p) => {
-						if (p.type === "text") {
-							defaultExposed.push(p.index);
-							if (defaultTextIdx === -1) defaultTextIdx = p.index;
-						}
-					});
-					modalState.exposedIndices = defaultExposed;
-					modalState.textParamIndex = defaultTextIdx;
-					// ★ hostscript.jsx의 p.numItems 기반 exposedFontFields를 그대로 사용
-					// entry.exposedFontFields: 실제 MOGRT Properties 패널에 노출된 폰트 필드 목록
-					// - 빈 배열 [] → 텍스트만 표시
-					// - ["font","size",...] → 해당 필드만 표시
-					const initFontFields = {};
-					freshList.forEach((p) => {
-						if (p.type === "text") {
-							if (Array.isArray(p.exposedFontFields)) {
-								// hostscript에서 계산된 값 직접 사용
-								initFontFields[p.index] = p.exposedFontFields;
-							} else if (p.fontExposed === true) {
-								// exposedFontFields 없으면 fontExposed 기반 폴백
-								initFontFields[p.index] = ["font", "size", "bold", "italic", "allcaps", "smallcaps"];
-							} else {
-								initFontFields[p.index] = [];
-							}
-						}
-					});
-					modalState.exposedFontFields = initFontFields;
-				}
-				// definition.json 파싱으로 드롭다운 옵션명, 슬라이더 min/max, 폰트명 보강
-				if (typeof JSZip !== "undefined" && window.cep && window.cep.fs) {
-					try {
-						const readResult = window.cep.fs.readFile(mogrtPath, window.cep.encoding.Base64);
-						if (readResult.err === 0 && readResult.data) {
-							JSZip.loadAsync(readResult.data, {base64: true}).then((zip) => {
-								const defEntry = zip.file("definition.json");
-								if (!defEntry) { renderModalLayout(modalBody, freshList, mogrtPath); return; }
-								return defEntry.async("string").then((defStr) => {
-								try {
-									const def = JSON.parse(defStr);
-									patchParamsFromDefinition(freshList, def);
-								} catch(_) {}
-								// patchParamsFromDefinition 이후 신규 프리셋이면 fontExposed 기반으로 exposedFontFields 재계산
-								if (!presetId) {
-									const recomputed = {};
-									freshList.forEach((p) => {
-										if (p.type === "text") {
-											if (p.fontExposed === true) {
-												// hostscript에서 계산된 exposedFontFields가 있으면 그대로 사용
-												// 없을 때만 전체 배열로 폴백 (하위 호환)
-												recomputed[p.index] = Array.isArray(p.exposedFontFields) && p.exposedFontFields.length > 0
-													? p.exposedFontFields
-													: ["font", "size", "bold", "italic", "allcaps", "smallcaps"];
-											} else {
-												recomputed[p.index] = [];
-											}
-										}
-									});
-									modalState.exposedFontFields = recomputed;
-								}
-								renderModalLayout(modalBody, freshList, mogrtPath);
-								});
-							}).catch(() => renderModalLayout(modalBody, freshList, mogrtPath));
-							return; // renderModalLayout은 Promise 내부에서 호출
-						}
-					} catch(_) {}
-				}
-				renderModalLayout(modalBody, freshList, mogrtPath);
-			} catch (ex) {
-				clearTimeout(timeoutId);
-				modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파싱 오류: ${escapeHtml(ex.message)}</p>`;
-			}
-		}).catch((err) => {
-			if (timedOut) return;
-			clearTimeout(timeoutId);
-			modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파라미터 로드 실패: ${escapeHtml(err.hostRaw || err.message || "")}</p>`;
-		});
-	}
-	// 캐시 히트 시 또는 호스트 응답 도착 후 공통으로 모달에 파라미터 적용
-	function _applyMogrtParamsToModal(cachedList, mogrtPath, presetId) {
-		const modalBody = document.getElementById("defaultModalBody");
-		// 깊은 복사로 원본 캐시 보호
-		const freshList = JSON.parse(JSON.stringify(cachedList));
-		const existingPreset = presetId ? state.presets[presetId] : null;
-		if (existingPreset) freshList.forEach((p) => {
-			const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
-			if (ep) {
-				p.value = ep.value;
-				if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
-				if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
-			}
-		});
-		modalState.paramList = freshList;
-		modalState.mogrtPath = mogrtPath;
-		modalState.presetId = presetId;
-		if (existingPreset) {
-			modalState.exposedIndices = [...existingPreset.exposedIndices];
-			modalState.textParamIndex = existingPreset.textParamIndex ?? -1;
-			modalState.exposedFontFields = existingPreset.exposedFontFields ? JSON.parse(JSON.stringify(existingPreset.exposedFontFields)) : {};
-		} else {
-			const defaultExposed = [];
-			let defaultTextIdx = -1;
-			freshList.forEach((p) => {
-				if (p.type === "text") {
-					defaultExposed.push(p.index);
-					if (defaultTextIdx === -1) defaultTextIdx = p.index;
-				}
-			});
-			modalState.exposedIndices = defaultExposed;
-			modalState.textParamIndex = defaultTextIdx;
-			const initFontFields = {};
-			freshList.forEach((p) => {
-				if (p.type === "text") {
-					if (Array.isArray(p.exposedFontFields)) {
-						initFontFields[p.index] = p.exposedFontFields;
-					} else if (p.fontExposed === true) {
-						initFontFields[p.index] = ["font", "size", "bold", "italic", "allcaps", "smallcaps"];
-					} else {
-						initFontFields[p.index] = [];
-					}
-				}
-			});
-			modalState.exposedFontFields = initFontFields;
-		}
-		renderModalLayout(modalBody, freshList, mogrtPath);
-	}
-
+	//#region src/ui/modalParams.ts
+	// 프리셋 모달의 파라미터 폼 렌더 트리.
+	// renderModalLayout → renderModalParams → buildModalParamRow /
+	// buildModalTextBlock 한 갈래로 이어지고, toggleFontField는 텍스트
+	// 블록의 폰트 필드 체크박스 헬퍼다. 진입점은 renderModalLayout 하나.
+	//
+	// mogrtPicker와 마찬가지로 modalState(exposedIndices, textParamIndex,
+	// exposedFontFields)를 읽고 쓴다. 그 선언은 뒤따르는 ui/modal에 있다.
 	function renderModalLayout(container, list, mogrtPath) {
 		container.innerHTML = "";
 		const previewArea = document.getElementById("modalPreviewArea");
@@ -3227,6 +2851,391 @@ var modalState = {
 		if (on && pos === -1) arr.push(field);
 		else if (!on && pos !== -1) arr.splice(pos, 1);
 	}
+	//#endregion
+	//#region src/ui/modal.ts
+var _setStatus$1 = () => {};
+
+var modalState = {
+		paramList: null,
+		mogrtPath: "",
+		presetId: null,
+		exposedIndices: [],
+		textParamIndex: -1,
+		exposedFontFields: {},
+		folderTree: null,
+		selectedFolderPath: "__all__"
+	};
+	function initModal(setStatus) {
+		_setStatus$1 = setStatus;
+	}
+	function openPresetModal(presetId) {
+		const modal = document.getElementById("defaultModal");
+		const modalBody = document.getElementById("defaultModalBody");
+		const mogrtSel = document.getElementById("defaultMogrtSel");
+		const nameInput = document.getElementById("presetNameInput");
+		modalState.presetId = presetId;
+		modalState.paramList = null;
+		modalState.exposedIndices = [];
+		modalState.textParamIndex = -1;
+		modalState.exposedFontFields = {};
+		_lastPreviewSrc = null;   // 모달 열릴 때마다 쓰네일 초기화
+		modalBody.innerHTML = "<p style=\"color:#64b5f6;font-size:11px;padding:20px 0;text-align:center;\">MOGRT를 선택하면 파라미터를 설정할 수 있습니다.</p>";
+		const previewArea = document.getElementById("modalPreviewArea");
+		if (previewArea) previewArea.innerHTML = "";
+		if (nameInput) nameInput.value = presetId && state.presets[presetId] ? state.presets[presetId].name : "";
+		mogrtSel.innerHTML = "";
+		const none = document.createElement("option");
+		none.value = "";
+		none.textContent = "-- MOGRT 선택 --";
+		mogrtSel.appendChild(none);
+		state.mogrtList.forEach((m) => {
+			const opt = document.createElement("option");
+			opt.value = m.path;
+			opt.textContent = m.name;
+			if (presetId && state.presets[presetId]?.mogrtPath === m.path) opt.selected = true;
+			mogrtSel.appendChild(opt);
+		});
+		const currentPath = presetId ? state.presets[presetId]?.mogrtPath ?? "" : "";
+		// 저장된 보기 상태 적용
+		const gridEl = document.getElementById("mogrtPickerGrid");
+		const savedView = localStorage.getItem("mogrtPickerView") || "card";
+		if (gridEl) { gridEl.classList.toggle("list-view", savedView === "list"); }
+		document.getElementById("btnMogrtViewCard")?.classList.toggle("active", savedView === "card");
+		document.getElementById("btnMogrtViewList")?.classList.toggle("active", savedView === "list");
+		// 폴더 트리 로드 (캐시 우선 사용)
+		modalState.selectedFolderPath = "__all__";
+		const statusEl = document.getElementById("mogrtPickerStatus");
+		function _applyFolderTree(tree) {
+			modalState.folderTree = tree;
+			// mogrtList 동기화 (트리에서 수집)
+			const collected = [];
+			collectMogrtsFromTree(tree, collected);
+			collected.forEach((item) => {
+				if (!state.mogrtList.some((m) => m.path === item.path)) {
+					state.mogrtList.push(item);
+					const opt = document.createElement("option");
+					opt.value = item.path;
+					opt.textContent = item.name;
+					mogrtSel.appendChild(opt);
+				}
+			});
+			// 루트 폴더를 기본 선택으로 설정 (신규 프리셋 추가 시)
+			if (!currentPath && tree) {
+				modalState.selectedFolderPath = tree.path;
+			}
+			// 폴더 트리 패널 렌더링 (선택 상태 포함)
+			renderFolderTree();
+			// 카드 렌더링 (전체 or 선택 폴더)
+			renderMogrtPickerCards(currentPath);
+			updatePickerLabel(currentPath);
+			const statusEl2 = document.getElementById("mogrtPickerStatus");
+			if (statusEl2) statusEl2.textContent = "";
+		}
+		if (window._cachedFolderTree) {
+			// 캐시 있으면 즉시 렌더링
+			_applyFolderTree(window._cachedFolderTree);
+		} else {
+			// 최초 1회만 JSX 호출
+			if (statusEl) statusEl.textContent = "폴더 구조 로드 중...";
+			host.getMogrtFolderTree().then((tree) => {
+				window._cachedFolderTree = tree; // 캐시 저장
+				_applyFolderTree(tree);
+			}).catch(() => {
+				const statusEl2 = document.getElementById("mogrtPickerStatus");
+				if (statusEl2) statusEl2.textContent = "폴더 로드 실패";
+			});
+		}
+		modal.classList.add("open");
+		// 시스템 폰트 캐시 로드 (최초 1회)
+		if (!_cachedSystemFonts) {
+			host.getSystemFonts().then((fonts) => {
+				_cachedSystemFonts = fonts;
+			}).catch(() => {});
+		}
+		// 기존 프리셋 편집 시 2차 모달도 바로 열기
+		if (presetId && state.presets[presetId]) {
+			const editModal = document.getElementById("presetEditModal");
+			const titleEl = document.getElementById("presetEditTitle");
+			const found = state.mogrtList.find((m) => m.path === state.presets[presetId].mogrtPath);
+			if (titleEl) titleEl.textContent = "⚙ " + (found ? found.name : state.presets[presetId].mogrtPath.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? "");
+			if (editModal) editModal.classList.add("open");
+			loadMogrtForModal(state.presets[presetId].mogrtPath, presetId);
+			// 역방향 동기화 시작
+			setTimeout(() => { if (typeof _startReverseSync === "function" && !_reverseSyncActive) _startReverseSync(); }, 3000);
+		}
+	}
+	// definition.json 데이터로 params 배열의 드롭다운 옵션명, 슬라이더 min/max, 폰트명 보강
+	function patchParamsFromDefinition(params, def) {
+		if (!def) return;
+
+		// uiName 중첩 객체 파싱 헬퍼
+		function getUIName(c) {
+			if (!c) return "";
+			const n = c.capPropUIName || c.uiName || c.displayName || "";
+			if (typeof n === "string") return n;
+			// {strDB:[{localeString:"en_US",str:"..."}]} 형태
+			try { return n.strDB?.[0]?.str || ""; } catch(_) { return ""; }
+		}
+
+		// menucontent 에서 옵션 문자열 추출 헬퍼
+		function extractMenuOptions(opts) {
+			if (!Array.isArray(opts)) return [];
+			return opts.map((o) => {
+				if (typeof o === "string") return o;
+				// {strDB:[{str:"..."}]} 형태
+				if (o && o.strDB) try { return o.strDB[0]?.str || ""; } catch(_) {}
+				return o.label || o.name || o.str || String(o);
+			});
+		}
+
+		// capParams 우선 (평문 필드), 없으면 clientControls 사용
+		const capParams = def.sourceInfoLocalized?.en_US?.capsuleparams?.capParams || null;
+		const clientControls = def.clientControls || null;
+
+		// displayName 기준 매핑 테이블 구성
+		const capMap = {};
+		if (Array.isArray(capParams)) {
+			capParams.forEach((c) => {
+				const name = getUIName(c);
+				if (name) capMap[name] = c;
+			});
+		}
+		const ctrlMap = {};
+		if (Array.isArray(clientControls)) {
+			clientControls.forEach((c) => {
+				const name = getUIName(c);
+				if (name) ctrlMap[name] = c;
+			});
+		}
+
+		params.forEach((p) => {
+			const cap = capMap[p.displayName];
+			const ctrl = ctrlMap[p.displayName];
+
+			// 드롭다운 옵션명 보강 (number로 잘못 감지된 경우도 포함)
+			if (p.type === "dropdown" || p.type === "number") {
+				// capParams의 menuContent (평문 배열) 우선
+				const rawMenuOpts = cap?.menuContent || cap?.menucontent || null;
+				const ctrlMenuOpts = ctrl?.menucontent || ctrl?.menuContent || null;
+				const opts = rawMenuOpts
+					? (Array.isArray(rawMenuOpts) ? rawMenuOpts : extractMenuOptions(rawMenuOpts))
+					: extractMenuOptions(ctrlMenuOpts);
+				if (Array.isArray(opts) && opts.length > 0) {
+					p.dropdownOptions = opts.map((o) => (typeof o === "string" ? o : String(o)));
+					// number로 잘못 감지된 경우 dropdown으로 강제 변환
+					if (p.type === "number") p.type = "dropdown";
+				}
+			}
+
+			// 슬라이더 min/max 보강
+			if (p.type === "number") {
+				// capParams의 capPropMin/Max 우선
+				const defMin = cap?.capPropMin ?? ctrl?.min ?? null;
+				const defMax = cap?.capPropMax ?? ctrl?.max ?? null;
+				if (defMin !== null && defMin !== undefined) p.minValue = Number(defMin);
+				if (defMax !== null && defMax !== undefined) p.maxValue = Number(defMax);
+			}
+
+			// 텍스트 폰트명 보강 (rawValue가 없거나 fontEditValue가 비어있을 때)
+			if (p.type === "text") {
+				// capParams에서 fontEditValue 배열 직접 추출
+				const fontArr = cap?.fontEditValue || (ctrl?.fonteditinfo?.fontEditValue ? [ctrl.fonteditinfo.fontEditValue] : null);
+				if (fontArr && fontArr.length > 0) {
+					p.fontEditValue = fontArr; // 미리보기에서 직접 사용
+					if (p.rawValue) {
+						try {
+							const rv = JSON.parse(p.rawValue);
+							if (!rv.fontEditValue || rv.fontEditValue.length === 0) {
+								rv.fontEditValue = fontArr;
+								p.rawValue = JSON.stringify(rv);
+							}
+						} catch(_) {}
+					}
+				}
+
+				// ★ capPropFontEdit 기반 fontExposed 보강
+				// definition.json의 capPropFontEdit: true → 폰트 편집 가능
+				// capPropFontEdit: false 또는 없음 → 텍스트 내용만 편집 가능
+				const capFontEdit = cap?.capPropFontEdit ?? ctrl?.fonteditinfo?.capPropFontEdit ?? null;
+				if (capFontEdit === true) {
+					// 폰트 편집 가능: fontExposed를 true로 설정
+					p.fontExposed = true;
+				} else if (capFontEdit === false) {
+					// 폰트 편집 불가: fontExposed를 false로 명시
+					p.fontExposed = false;
+				}
+				// capFontEdit === null: hostscript.jsx의 fontExposed 값 유지
+			}
+		});
+	}
+
+	function loadMogrtForModal(mogrtPath, presetId) {
+		const modalBody = document.getElementById("defaultModalBody");
+
+		// 캐시된 파라미터가 있으면 즉시 사용 (호스트 호출 생략)
+		if (state.mogrtOriginals[mogrtPath]) {
+			_applyMogrtParamsToModal(state.mogrtOriginals[mogrtPath], mogrtPath, presetId);
+			return;
+		}
+
+		modalBody.innerHTML = "<p style=\"color:#64b5f6;font-size:11px;padding:10px 0;text-align:center;\">파라미터 로드 중... (최대 90초)</p><p style=\"color:#aaa;font-size:10px;padding:0;text-align:center;\">첫 번째 로드는 Premiere가 MOGRT를 초기화하는 시간이 필요합니다.<br>두 번째부터는 즉시 로드됩니다.</p>";
+		let timedOut = false;
+		const timeoutId = setTimeout(() => {
+			timedOut = true;
+			modalBody.innerHTML = "<p style=\"color:#f44336;font-size:11px;padding:10px 0;\">파라미터 로드 타임아웃 (90초 초과). MOGRT 파일이 유효한지 확인하거나 Premiere Pro를 재시작하세요.</p>";
+		}, 9e4);
+		host.getMogrtParams(mogrtPath).then((parsed) => {
+			if (timedOut) return;
+			clearTimeout(timeoutId);
+			try {
+				// getMogrtParams는 {params, mogrtPath} 객체 또는 기존 배열 형태 모두 지원
+				const freshList = Array.isArray(parsed) ? parsed : (parsed.params || []);
+				if (!state.mogrtOriginals[mogrtPath]) state.mogrtOriginals[mogrtPath] = JSON.parse(JSON.stringify(freshList));
+				const existingPreset = presetId ? state.presets[presetId] : null;
+				if (existingPreset) freshList.forEach((p) => {
+					const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
+					if (ep) {
+						p.value = ep.value;
+						if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
+						if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
+					}
+				});
+				modalState.paramList = freshList;
+				modalState.mogrtPath = mogrtPath;
+				modalState.presetId = presetId;
+				if (existingPreset) {
+					modalState.exposedIndices = [...existingPreset.exposedIndices];
+					modalState.textParamIndex = existingPreset.textParamIndex ?? -1;
+					modalState.exposedFontFields = existingPreset.exposedFontFields ? JSON.parse(JSON.stringify(existingPreset.exposedFontFields)) : {};
+				} else {
+					const defaultExposed = [];
+					let defaultTextIdx = -1;
+					freshList.forEach((p) => {
+						if (p.type === "text") {
+							defaultExposed.push(p.index);
+							if (defaultTextIdx === -1) defaultTextIdx = p.index;
+						}
+					});
+					modalState.exposedIndices = defaultExposed;
+					modalState.textParamIndex = defaultTextIdx;
+					// ★ hostscript.jsx의 p.numItems 기반 exposedFontFields를 그대로 사용
+					// entry.exposedFontFields: 실제 MOGRT Properties 패널에 노출된 폰트 필드 목록
+					// - 빈 배열 [] → 텍스트만 표시
+					// - ["font","size",...] → 해당 필드만 표시
+					const initFontFields = {};
+					freshList.forEach((p) => {
+						if (p.type === "text") {
+							if (Array.isArray(p.exposedFontFields)) {
+								// hostscript에서 계산된 값 직접 사용
+								initFontFields[p.index] = p.exposedFontFields;
+							} else if (p.fontExposed === true) {
+								// exposedFontFields 없으면 fontExposed 기반 폴백
+								initFontFields[p.index] = ["font", "size", "bold", "italic", "allcaps", "smallcaps"];
+							} else {
+								initFontFields[p.index] = [];
+							}
+						}
+					});
+					modalState.exposedFontFields = initFontFields;
+				}
+				// definition.json 파싱으로 드롭다운 옵션명, 슬라이더 min/max, 폰트명 보강
+				if (typeof JSZip !== "undefined" && window.cep && window.cep.fs) {
+					try {
+						const readResult = window.cep.fs.readFile(mogrtPath, window.cep.encoding.Base64);
+						if (readResult.err === 0 && readResult.data) {
+							JSZip.loadAsync(readResult.data, {base64: true}).then((zip) => {
+								const defEntry = zip.file("definition.json");
+								if (!defEntry) { renderModalLayout(modalBody, freshList, mogrtPath); return; }
+								return defEntry.async("string").then((defStr) => {
+								try {
+									const def = JSON.parse(defStr);
+									patchParamsFromDefinition(freshList, def);
+								} catch(_) {}
+								// patchParamsFromDefinition 이후 신규 프리셋이면 fontExposed 기반으로 exposedFontFields 재계산
+								if (!presetId) {
+									const recomputed = {};
+									freshList.forEach((p) => {
+										if (p.type === "text") {
+											if (p.fontExposed === true) {
+												// hostscript에서 계산된 exposedFontFields가 있으면 그대로 사용
+												// 없을 때만 전체 배열로 폴백 (하위 호환)
+												recomputed[p.index] = Array.isArray(p.exposedFontFields) && p.exposedFontFields.length > 0
+													? p.exposedFontFields
+													: ["font", "size", "bold", "italic", "allcaps", "smallcaps"];
+											} else {
+												recomputed[p.index] = [];
+											}
+										}
+									});
+									modalState.exposedFontFields = recomputed;
+								}
+								renderModalLayout(modalBody, freshList, mogrtPath);
+								});
+							}).catch(() => renderModalLayout(modalBody, freshList, mogrtPath));
+							return; // renderModalLayout은 Promise 내부에서 호출
+						}
+					} catch(_) {}
+				}
+				renderModalLayout(modalBody, freshList, mogrtPath);
+			} catch (ex) {
+				clearTimeout(timeoutId);
+				modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파싱 오류: ${escapeHtml(ex.message)}</p>`;
+			}
+		}).catch((err) => {
+			if (timedOut) return;
+			clearTimeout(timeoutId);
+			modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파라미터 로드 실패: ${escapeHtml(err.hostRaw || err.message || "")}</p>`;
+		});
+	}
+	// 캐시 히트 시 또는 호스트 응답 도착 후 공통으로 모달에 파라미터 적용
+	function _applyMogrtParamsToModal(cachedList, mogrtPath, presetId) {
+		const modalBody = document.getElementById("defaultModalBody");
+		// 깊은 복사로 원본 캐시 보호
+		const freshList = JSON.parse(JSON.stringify(cachedList));
+		const existingPreset = presetId ? state.presets[presetId] : null;
+		if (existingPreset) freshList.forEach((p) => {
+			const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
+			if (ep) {
+				p.value = ep.value;
+				if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
+				if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
+			}
+		});
+		modalState.paramList = freshList;
+		modalState.mogrtPath = mogrtPath;
+		modalState.presetId = presetId;
+		if (existingPreset) {
+			modalState.exposedIndices = [...existingPreset.exposedIndices];
+			modalState.textParamIndex = existingPreset.textParamIndex ?? -1;
+			modalState.exposedFontFields = existingPreset.exposedFontFields ? JSON.parse(JSON.stringify(existingPreset.exposedFontFields)) : {};
+		} else {
+			const defaultExposed = [];
+			let defaultTextIdx = -1;
+			freshList.forEach((p) => {
+				if (p.type === "text") {
+					defaultExposed.push(p.index);
+					if (defaultTextIdx === -1) defaultTextIdx = p.index;
+				}
+			});
+			modalState.exposedIndices = defaultExposed;
+			modalState.textParamIndex = defaultTextIdx;
+			const initFontFields = {};
+			freshList.forEach((p) => {
+				if (p.type === "text") {
+					if (Array.isArray(p.exposedFontFields)) {
+						initFontFields[p.index] = p.exposedFontFields;
+					} else if (p.fontExposed === true) {
+						initFontFields[p.index] = ["font", "size", "bold", "italic", "allcaps", "smallcaps"];
+					} else {
+						initFontFields[p.index] = [];
+					}
+				}
+			});
+			modalState.exposedFontFields = initFontFields;
+		}
+		renderModalLayout(modalBody, freshList, mogrtPath);
+	}
+
 	async function applyPreviewToTimeline(paramList) {
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
