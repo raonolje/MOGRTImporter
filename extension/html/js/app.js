@@ -273,6 +273,129 @@
 		const json = JSON.stringify(payload);
 		return evalScript(`${funcName}(decodeURIComponent("${encodeURIComponent(json)}"))`);
 	}
+
+	// ─────────────────────────────────────────────────────────────
+	// 호스트 어댑터
+	//
+	// 패널(JS) → 호스트(JSX) 진입점을 이 객체 하나에 모은다. 호출부는
+	// 함수명 문자열을 직접 다루지 않는다. UXP 전환 시 아래 구현부와
+	// hostscript.jsx만 교체하면 UI·상태·파서 코드는 그대로 쓴다.
+	//
+	// getCS / evalScript / evalScriptWithPayload 는 이 region 전용이다.
+	// 바깥에서 부르지 말 것.
+	//
+	// 호스트 응답 계약 (hostscript.jsx 확인 결과):
+	//   정상     JSON 문자열 · "SUCCESS..." · 경로 문자열 · "CANCEL"
+	//   실패     "ERROR: ..."
+	//   전송실패 ""              호스트 함수 미정의 또는 무응답
+	//            "EvalScript error."  JSX가 잡지 못한 예외
+	//
+	// 패널이 쓰는 진입점 중 정상 경로에서 빈 문자열을 돌려주는 것은
+	// 하나도 없다. 따라서 ""는 전송 실패로 단정해도 안전하다.
+	// ─────────────────────────────────────────────────────────────
+
+	// 에러 객체를 만들면서 콘솔에도 남긴다. 던지는 쪽은 로깅을 신경쓰지 않는다.
+	function _hostError(funcName, reason, raw) {
+		const err = new Error(`[host] ${funcName}: ${reason}`);
+		err.name = "HostError";
+		err.hostFunc = funcName;
+		err.hostReason = reason;
+		err.hostRaw = raw == null ? "" : String(raw);
+		console.error(err.message, err.hostRaw ? { 응답: err.hostRaw } : "");
+		return err;
+	}
+
+	// 인자 직렬화. 문자열은 encodeURIComponent로 감싸 ExtendScript 인코딩과
+	// 따옴표·역슬래시 이스케이프 문제를 한 번에 피한다(한글 경로 포함).
+	function _encodeArg(v) {
+		if (typeof v === "number") return String(v);
+		return `decodeURIComponent("${encodeURIComponent(String(v))}")`;
+	}
+
+	// 전송 계층만 판별한다. SUCCESS/ERROR/CANCEL 같은 프로토콜 해석은 상위 몫.
+	async function _invoke(funcName, script) {
+		let res;
+		try {
+			res = await evalScript(script);
+		} catch (e) {
+			throw _hostError(funcName, "evalScript 예외: " + ((e && e.message) || e));
+		}
+		if (!res) throw _hostError(funcName, "빈 응답 (호스트 함수 미정의 또는 무응답)");
+		if (res === "EvalScript error.") throw _hostError(funcName, "ExtendScript 실행 오류");
+		return res;
+	}
+
+	function _callNoArgs(funcName) {
+		return _invoke(funcName, `${funcName}()`);
+	}
+	function _callWithArgs(funcName, ...args) {
+		return _invoke(funcName, `${funcName}(${args.map(_encodeArg).join(",")})`);
+	}
+	function _callWithPayload(funcName, payload) {
+		let json;
+		try {
+			json = JSON.stringify(payload);
+		} catch (e) {
+			throw _hostError(funcName, "페이로드 직렬화 실패: " + ((e && e.message) || e));
+		}
+		return _invoke(funcName, `${funcName}(decodeURIComponent("${encodeURIComponent(json)}"))`);
+	}
+
+	// JSON을 돌려주는 진입점용. ERROR 응답과 파싱 실패를 모두 던진다.
+	// quietError: 호스트의 "ERROR:..." 응답이 정상 흐름의 일부인 진입점용.
+	//   로그도 예외도 없이 null을 돌려준다. 폴링처럼 초당 여러 번 도는 호출에서
+	//   "아직 대상이 없음"이 콘솔을 뒤덮는 것을 막는다.
+	//   전송 실패(빈 응답 / EvalScript error.)는 이 경우에도 그대로 던진다.
+	async function _callJson(funcName, resPromise, quietError) {
+		const res = await resPromise;
+		if (res.indexOf("ERROR") === 0) {
+			if (quietError) return null;
+			throw _hostError(funcName, "호스트 오류 응답", res);
+		}
+		try {
+			return JSON.parse(res);
+		} catch (e) {
+			throw _hostError(funcName, "JSON 파싱 실패: " + ((e && e.message) || e), res);
+		}
+	}
+
+	var host = {
+		// ── JSON 반환. 실패 시 throw, 성공 시 파싱된 값 ──
+		getMogrtFolderTree: () => _callJson("getMogrtFolderTree", _callNoArgs("getMogrtFolderTree")),
+		getMogrtScanDirs: () => _callJson("getMogrtScanDirs", _callNoArgs("getMogrtScanDirs")),
+		getActiveSequenceInfo: () => _callJson("getActiveSequenceInfo", _callNoArgs("getActiveSequenceInfo")),
+		// 프리뷰 시퀀스/클립이 아직 없을 때 ERROR를 돌려주는 것이 정상이다 → quiet
+		getPreviewClipParams: () => _callJson("getPreviewClipParams", _callNoArgs("getPreviewClipParams"), true),
+		getSystemFonts: () => _callJson("getSystemFonts", _callNoArgs("getSystemFonts")),
+		getMogrtParams: (mogrtPath) => _callJson("getMogrtParams", _callWithArgs("getMogrtParams", mogrtPath)),
+		scanMogrtFolder: (folderPath) => _callJson("scanMogrtFolder", _callWithArgs("scanMogrtFolder", folderPath)),
+		syncAllClipsFromTimeline: (trackIndex) => _callJson("syncAllClipsFromTimeline", _callWithArgs("syncAllClipsFromTimeline", Number(trackIndex))),
+
+		// ── 문자열 프로토콜 반환. "SUCCESS:..." / "ERROR:..." / "CANCEL" 해석은 호출부 몫 ──
+		applyToTimeline: (payload) => _callWithPayload("applyToTimeline", payload),
+		updateClipAtTime: (payload) => _callWithPayload("updateClipAtTime", payload),
+		setupPreviewSequence: (payload) => _callWithPayload("setupPreviewSequence", payload),
+		applyPreviewParams: (payload) => _callWithPayload("applyPreviewParams", payload),
+		capturePreviewFrame: (payload) => _callWithPayload("capturePreviewFrame", payload),
+		seekToClip: (payload) => _callWithPayload("seekToClip", payload),
+		previewParamsOnFirstClip: (payload) => _callWithPayload("previewParamsOnFirstClip", payload),
+		saveTextFile: (payload) => _callWithPayload("saveTextFile", payload),
+		saveTextFileWithDialog: (payload) => _callWithPayload("saveTextFileWithDialog", payload),
+
+		// ── 경로 문자열 반환 ──
+		selectExportFolder: () => _callNoArgs("selectExportFolder"),
+
+		// 호스트 함수가 아니라 ExtendScript 식이다. 프리뷰 캡처 임시 경로용으로,
+		// 실패해도 진행에 지장이 없어 여기서만 예외를 삼키고 기본값을 준다.
+		getTempDir: async () => {
+			try {
+				const res = await _invoke("getTempDir", '$.getenv("TEMP") || $.getenv("TMP") || "C:/Temp"');
+				return res.length > 2 ? res.replace(/\\/g, "/") : "C:/Temp";
+			} catch (_) {
+				return "C:/Temp";
+			}
+		}
+	};
 	//#endregion
 	//#region src/srtParser.ts
 	function timeToSec(t) {
@@ -1665,27 +1788,20 @@ var modalState = {
 		} else {
 			// 최초 1회만 JSX 호출
 			if (statusEl) statusEl.textContent = "폴더 구조 로드 중...";
-			evalScript("getMogrtFolderTree()").then((treeRes) => {
-				if (treeRes && !treeRes.startsWith("ERROR")) {
-					try {
-						const tree = JSON.parse(treeRes);
-						window._cachedFolderTree = tree; // 캐시 저장
-						_applyFolderTree(tree);
-					} catch (_) {}
-				} else {
-					const statusEl2 = document.getElementById("mogrtPickerStatus");
-					if (statusEl2) statusEl2.textContent = "폴더 로드 실패";
-				}
+			host.getMogrtFolderTree().then((tree) => {
+				window._cachedFolderTree = tree; // 캐시 저장
+				_applyFolderTree(tree);
+			}).catch(() => {
+				const statusEl2 = document.getElementById("mogrtPickerStatus");
+				if (statusEl2) statusEl2.textContent = "폴더 로드 실패";
 			});
 		}
 		modal.classList.add("open");
 		// 시스템 폰트 캐시 로드 (최초 1회)
 		if (!_cachedSystemFonts) {
-			evalScript("getSystemFonts()").then((fontRes) => {
-				if (fontRes && !fontRes.startsWith("ERROR")) {
-					try { _cachedSystemFonts = JSON.parse(fontRes); } catch(_) {}
-				}
-			});
+			host.getSystemFonts().then((fonts) => {
+				_cachedSystemFonts = fonts;
+			}).catch(() => {});
 		}
 		// 기존 프리셋 편집 시 2차 모달도 바로 열기
 		if (presetId && state.presets[presetId]) {
@@ -1807,29 +1923,23 @@ var modalState = {
 	function loadMogrtForModal(mogrtPath, presetId) {
 		const modalBody = document.getElementById("defaultModalBody");
 
-		// 캐시된 파라미터가 있으면 즉시 사용 (evalScript 호출 생략)
+		// 캐시된 파라미터가 있으면 즉시 사용 (호스트 호출 생략)
 		if (state.mogrtOriginals[mogrtPath]) {
 			_applyMogrtParamsToModal(state.mogrtOriginals[mogrtPath], mogrtPath, presetId);
 			return;
 		}
 
 		modalBody.innerHTML = "<p style=\"color:#64b5f6;font-size:11px;padding:10px 0;text-align:center;\">파라미터 로드 중... (최대 90초)</p><p style=\"color:#aaa;font-size:10px;padding:0;text-align:center;\">첫 번째 로드는 Premiere가 MOGRT를 초기화하는 시간이 필요합니다.<br>두 번째부터는 즉시 로드됩니다.</p>";
-		const esc = mogrtPath.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
 		let timedOut = false;
 		const timeoutId = setTimeout(() => {
 			timedOut = true;
 			modalBody.innerHTML = "<p style=\"color:#f44336;font-size:11px;padding:10px 0;\">파라미터 로드 타임아웃 (90초 초과). MOGRT 파일이 유효한지 확인하거나 Premiere Pro를 재시작하세요.</p>";
 		}, 9e4);
-		evalScript(`getMogrtParams("${esc}")`).then((res) => {
+		host.getMogrtParams(mogrtPath).then((parsed) => {
 			if (timedOut) return;
 			clearTimeout(timeoutId);
-			if (!res || res.startsWith("ERROR")) {
-				modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파라미터 로드 실패: ${res || ""}</p>`;
-				return;
-			}
 			try {
 				// getMogrtParams는 {params, mogrtPath} 객체 또는 기존 배열 형태 모두 지원
-				const parsed = JSON.parse(res);
 				const freshList = Array.isArray(parsed) ? parsed : (parsed.params || []);
 				if (!state.mogrtOriginals[mogrtPath]) state.mogrtOriginals[mogrtPath] = JSON.parse(JSON.stringify(freshList));
 				const existingPreset = presetId ? state.presets[presetId] : null;
@@ -1922,9 +2032,13 @@ var modalState = {
 				clearTimeout(timeoutId);
 				modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파싱 오류: ${ex.message}</p>`;
 			}
+		}).catch((err) => {
+			if (timedOut) return;
+			clearTimeout(timeoutId);
+			modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파라미터 로드 실패: ${err.hostRaw || err.message || ""}</p>`;
 		});
 	}
-	// 캐시 히트 시 또는 evalScript 완료 후 공통으로 모달에 파라미터 적용
+	// 캐시 히트 시 또는 호스트 응답 도착 후 공통으로 모달에 파라미터 적용
 	function _applyMogrtParamsToModal(cachedList, mogrtPath, presetId) {
 		const modalBody = document.getElementById("defaultModalBody");
 		// 깊은 복사로 원본 캐시 보호
@@ -2042,7 +2156,7 @@ var modalState = {
 		if (statusEl) { statusEl.textContent = "시퀀스 생성 중..."; statusEl.style.color = "#aaa"; }
 		try {
 			// 1. 프리뷰 시퀀스 생성 + mogrt 삽입
-			const setupRes = await evalScriptWithPayload("setupPreviewSequence", {
+			const setupRes = await host.setupPreviewSequence({
 				mogrtPath: mogrtPath,
 				durationSec: 5
 			});
@@ -2053,17 +2167,13 @@ var modalState = {
 			}
 			if (statusEl) statusEl.textContent = "파라미터 적용 중...";
 			// 2. 현재 파라미터 적용
-			const applyRes = await evalScriptWithPayload("applyPreviewParams", { params: list });
+			const applyRes = await host.applyPreviewParams({ params: list });
 			// 적용 실패해도 캡처 시도
 			if (statusEl) statusEl.textContent = "프레임 캡처 중...";
 			// 3. 프레임 캡처
-			let tmpDir = "C:/Temp";
-			try {
-				const tmpDirRes = await evalScript('$.getenv("TEMP") || $.getenv("TMP") || "C:/Temp"');
-				if (tmpDirRes && tmpDirRes.length > 2) tmpDir = tmpDirRes.replace(/\\/g, "/");
-			} catch(_) {}
+			const tmpDir = await host.getTempDir();
 			const tmpPath = tmpDir + "/mogrt_preview_" + Date.now() + ".jpg";
-			const captureRes = await evalScriptWithPayload("capturePreviewFrame", { outputPath: tmpPath });
+			const captureRes = await host.capturePreviewFrame({ outputPath: tmpPath });
 			let savedPath = "";
 			if (captureRes.startsWith("SUCCESS:")) {
 				savedPath = captureRes.replace("SUCCESS:", "").trim();
@@ -2888,12 +2998,18 @@ var modalState = {
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
 		_setStatus$1("프리뷰 적용 중...", "info");
-		const res = await evalScriptWithPayload("previewParamsOnFirstClip", {
-			videoTrackIndex: trackIndex,
-			startSec: -1,
-			endSec: 0,
-			params: paramList
-		});
+		let res;
+		try {
+			res = await host.previewParamsOnFirstClip({
+				videoTrackIndex: trackIndex,
+				startSec: -1,
+				endSec: 0,
+				params: paramList
+			});
+		} catch (err) {
+			_setStatus$1("프리뷰 적용 실패: " + (err.hostReason || err.message), "err");
+			return;
+		}
 		if (res.startsWith("SUCCESS")) _setStatus$1("프리뷰 적용됨", "ok");
 		else _setStatus$1(res.replace("ERROR:", "").trim(), "err");
 	}
@@ -3169,13 +3285,12 @@ var modalState = {
 				if (!_reverseSyncActive) return;
 				if (!modalState.paramList || !modalState.mogrtPath) return;
 				try {
-					const res = await evalScript("getPreviewClipParams()");
-					if (!res || res.startsWith("ERROR")) return;
-					// 변경 없으면 무시
-					if (res === _reverseSyncLastHash) return;
-					_reverseSyncLastHash = res;
-					const freshParams = JSON.parse(res);
+					const freshParams = await host.getPreviewClipParams();
 					if (!Array.isArray(freshParams)) return;
+					// 변경 없으면 무시
+					const freshHash = JSON.stringify(freshParams);
+					if (freshHash === _reverseSyncLastHash) return;
+					_reverseSyncLastHash = freshHash;
 					let changed = false;
 					freshParams.forEach(fp => {
 						const mp = modalState.paramList.find(p => p.index === fp.index);
@@ -3519,7 +3634,13 @@ var modalState = {
 		seekBtn.style.color = "#64b5f6";
 		seekBtn.addEventListener("click", async (e) => {
 			e.stopPropagation();
-			const res = await evalScriptWithPayload("seekToClip", { startSec: sub.startSec });
+			let res;
+			try {
+				res = await host.seekToClip({ startSec: sub.startSec });
+			} catch (err) {
+				_setStatus("이동 실패: " + (err.hostReason || err.message), "err");
+				return;
+			}
 			if (res.startsWith("SUCCESS")) _setStatus("이동: " + sub.startTime, "ok");
 			else _setStatus(res || "이동 실패", "err");
 		});
@@ -3570,10 +3691,8 @@ var modalState = {
 		};
 		// 시스템 폰트 캐시가 없으면 먼저 로드 후 렌더링
 		if (!_cachedSystemFonts) {
-			evalScript("getSystemFonts()").then((fontRes) => {
-				if (fontRes && !fontRes.startsWith("ERROR")) {
-					try { _cachedSystemFonts = JSON.parse(fontRes); } catch(_) {}
-				}
+			host.getSystemFonts().then((fonts) => {
+				_cachedSystemFonts = fonts;
 				doRender();
 			}).catch(() => doRender());
 		} else {
@@ -3715,13 +3834,19 @@ var modalState = {
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
 		_setStatus("클립 업데이트 중...", "info");
-		const res = await evalScriptWithPayload("updateClipAtTime", {
-			videoTrackIndex: trackIndex,
-			startSec: sub.startSec,
-			endSec: sub.endSec,
-			mogrtPath: preset.mogrtPath,
-			params
-		});
+		let res;
+		try {
+			res = await host.updateClipAtTime({
+				videoTrackIndex: trackIndex,
+				startSec: sub.startSec,
+				endSec: sub.endSec,
+				mogrtPath: preset.mogrtPath,
+				params
+			});
+		} catch (err) {
+			_setStatus("클립 업데이트 실패: " + (err.hostReason || err.message), "err");
+			return;
+		}
 		if (res.startsWith("SUCCESS")) _setStatus("[" + sub.index + "] " + res.replace("SUCCESS:", "").trim(), "ok");
 		else _setStatus(res.replace("ERROR:", "").trim(), "err");
 	}
@@ -3747,16 +3872,11 @@ var modalState = {
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
 		_setStatus("타임라인에서 동기화 중...", "info");
-		const res = await evalScript(`syncAllClipsFromTimeline(${trackIndex})`);
-		if (!res || res.startsWith("ERROR")) {
-			_setStatus("동기화 실패: " + (res || "응답 없음"), "err");
-			return;
-		}
 		let syncData;
 		try {
-			syncData = JSON.parse(res);
-		} catch (_) {
-			_setStatus("동기화 데이터 파싱 실패", "err");
+			syncData = await host.syncAllClipsFromTimeline(trackIndex);
+		} catch (err) {
+			_setStatus("동기화 실패: " + (err.hostRaw || err.hostReason || err.message), "err");
 			return;
 		}
 		if (!syncData || syncData.length === 0) {
@@ -3908,17 +4028,13 @@ var modalState = {
 			mogrtStatus.className = "";
 		}
 		// 1단계: 스캔 대상 폴더 목록 가져오기 (빠른 JSX 호출)
-		evalScript("getMogrtScanDirs()").then((dirsRes) => {
-			let dirs = [];
-			try {
-				if (dirsRes && !dirsRes.startsWith("ERROR")) dirs = JSON.parse(dirsRes);
-			} catch(_) {}
-			if (dirs.length === 0) {
+		host.getMogrtScanDirs().catch(() => []).then((dirs) => {
+			if (!Array.isArray(dirs) || dirs.length === 0) {
 				if (!silent) mogrtStatus.textContent = "MOGRT 없음";
 				_scanInProgress = false;
 				return;
 			}
-			// 2단계: 폴더별로 순차 스캔 (각 호출 사이에 다른 evalScript 끼어들기 가능)
+			// 2단계: 폴더별로 순차 스캔 (각 호출 사이에 다른 호스트 호출 끼어들기 가능)
 			let idx = 0;
 			let totalAdded = 0;
 			function scanNext() {
@@ -3933,20 +4049,16 @@ var modalState = {
 					return;
 				}
 				const folderPath = dirs[idx++];
-				// 폴더 경로를 인코딩하여 JSX에 전달
-				const encoded = encodeURIComponent(folderPath);
-				evalScript(`scanMogrtFolder(decodeURIComponent("${encoded}"))`).then((res) => {
-					try {
-						if (res && !res.startsWith("ERROR") && res !== "[]") {
-							const list = JSON.parse(res);
-							list.forEach((item) => {
-								if (!state.mogrtList.some((m) => m.path === item.path)) {
-									state.mogrtList.push(item);
-									totalAdded++;
-								}
-							});
+				host.scanMogrtFolder(folderPath).then((list) => {
+					if (Array.isArray(list)) list.forEach((item) => {
+						if (!state.mogrtList.some((m) => m.path === item.path)) {
+							state.mogrtList.push(item);
+							totalAdded++;
 						}
-					} catch(_) {}
+					});
+				}).catch(() => {}).then(() => {
+					// 한 폴더가 실패해도 스캔 전체가 멈추지 않도록 진행은 항상 보장한다.
+					// (여기서 멈추면 _scanInProgress가 true로 고착된다)
 					// 다음 폴더 스캔 (setTimeout 0으로 큐 양보)
 					setTimeout(scanNext, 0);
 				});
@@ -3966,20 +4078,17 @@ var modalState = {
 	// MOGRT 폴더 트리 프리로드: 첫 모달 오픈 시 즉시 표시를 위해 백그라운드에서 미리 로드
 	setTimeout(() => {
 		if (!window._cachedFolderTree) {
-			evalScript("getMogrtFolderTree()").then((treeRes) => {
-				if (treeRes && !treeRes.startsWith("ERROR")) {
-					try { window._cachedFolderTree = JSON.parse(treeRes); } catch(_) {}
-				}
-			});
+			host.getMogrtFolderTree().then((tree) => {
+				window._cachedFolderTree = tree;
+			}).catch(() => {});
 		}
 	}, 1000);
 	// MOGRT 스캔: JSX 응답을 기다리지 않고 독립적으로 시작 (스캔이 시퀀스 정보에 의존하지 않음)
 	setTimeout(() => doScanMogrt(false), 0);
 	setInterval(() => doScanMogrt(true), 3e4);
 	// 시퀀스 정보는 백그라운드로 비동기 로드 (스캔을 블로킹하지 않음)
-	evalScript("getActiveSequenceInfo()").then((res) => {
-		if (res && !res.startsWith("ERROR")) try {
-			const info = JSON.parse(res);
+	host.getActiveSequenceInfo().then((info) => {
+		try {
 			const hashFn = (s) => {
 				let h = 0;
 				for (let i = 0; i < s.length; i++) {
@@ -4006,7 +4115,7 @@ var modalState = {
 			updatePresetTabCount();
 			_loadTrackFromStorage();
 		} catch (_) {}
-	});
+	}).catch(() => {});
 	function simpleHash(str) {
 		let hash = 0;
 		for (let i = 0; i < str.length; i++) {
@@ -4021,10 +4130,13 @@ var modalState = {
 		if (_seqPollingActive) return;
 		_seqPollingActive = true;
 		setInterval(async () => {
-			const res = await evalScript("getActiveSequenceInfo()");
-			if (!res || res.startsWith("ERROR")) return;
+			let info;
 			try {
-				const info = JSON.parse(res);
+				info = await host.getActiveSequenceInfo();
+			} catch (_) {
+				return;
+			}
+			try {
 				const newSeqId = info.seqId || "";
 				const newSeqName = info.seqName || "";
 				const newProjPath = info.projPath || "";
@@ -4328,15 +4440,18 @@ var modalState = {
 		setStatus("타임라인에 배치 중... (" + items.length + "개)", "info");
 		const btnApply = document.getElementById("btnApply");
 		btnApply.disabled = true;
-		const res = await evalScriptWithPayload("applyToTimeline", {
-			videoTrackIndex: trackIndex,
-			subtitles: items
-		});
-		btnApply.disabled = false;
-		if (!res) {
-			setStatus("응답 없음", "err");
+		let res;
+		try {
+			res = await host.applyToTimeline({
+				videoTrackIndex: trackIndex,
+				subtitles: items
+			});
+		} catch (err) {
+			btnApply.disabled = false;
+			setStatus("타임라인 적용 실패: " + (err.hostReason || err.message), "err");
 			return;
 		}
+		btnApply.disabled = false;
 		if (res.startsWith("SUCCESS")) {
 			_saveHistoryOnAction("타임라인 적용 (" + items.length + "개)");
 			setStatus(res.replace("SUCCESS:", "").trim(), "ok");
@@ -4407,11 +4522,11 @@ var modalState = {
 			const _msBrowse = document.getElementById("mogrtStatus");
 			const _scanDoneBrowse = !_scanInProgress || (_msBrowse && _msBrowse.className === "ok");
 			if (!_scanDoneBrowse) { showAlert("MOGRT 스캔 완료 후 사용 가능합니다."); return; }
-			evalScript("selectExportFolder()").then((result) => {
-				if (result && result !== "CANCEL" && !result.startsWith("ERROR")) {
+			host.selectExportFolder().then((result) => {
+				if (result !== "CANCEL" && !result.startsWith("ERROR")) {
 					document.getElementById("exportFolderPath").value = result.trim();
 				}
-			});
+			}).catch(() => {});
 		});
 		const newCancel = cancelBtn.cloneNode(true);
 		cancelBtn.parentNode.replaceChild(newCancel, cancelBtn);
@@ -4432,20 +4547,22 @@ var modalState = {
 				const json = JSON.stringify(exportData, null, 2);
 				const defaultFileName = "mogrt_presets_" + new Date().toLocaleDateString("ko-KR").replace(/\./g, "").replace(/ /g, "_") + ".json";
 				const savePath = folderPath.replace(/[\\/]+$/, "") + "\\" + defaultFileName;
-				// CEP 네이티브 파일 쓰기 (evalScript 문자열 길이 제한 우회)
+				// CEP 네이티브 파일 쓰기 (호스트 호출 문자열 길이 제한 우회)
 				const writeResult = window.cep && window.cep.fs ? window.cep.fs.writeFile(savePath, json, cep.encoding.UTF8) : null;
 				if (writeResult && writeResult.err === 0) {
 					modal.classList.remove("open");
 					setStatus("프리셋 내보내기 완료: " + selectedIds.length + "개 → " + savePath, "ok");
 				} else {
-					// fallback: evalScriptWithPayload
-					evalScriptWithPayload("saveTextFile", { path: savePath, content: json }).then((r) => {
-						if (r && r.startsWith("SUCCESS")) {
+					// fallback: 호스트 어댑터를 통한 저장
+					host.saveTextFile({ path: savePath, content: json }).then((r) => {
+						if (r.startsWith("SUCCESS")) {
 							modal.classList.remove("open");
 							setStatus("프리셋 내보내기 완료: " + selectedIds.length + "개 → " + savePath, "ok");
 						} else {
-							setStatus("저장 실패: " + (r || "응답 없음"), "err");
+							setStatus("저장 실패: " + r, "err");
 						}
+					}).catch((err) => {
+						setStatus("저장 실패: " + (err.hostReason || err.message), "err");
 					});
 				}
 		});
@@ -4562,10 +4679,12 @@ var modalState = {
 		const dateStr = new Date().toLocaleDateString("ko-KR").replace(/\./g, "").replace(/ /g, "_");
 		const defaultFileName = "mogrt_work_" + seqName + "_" + dateStr + ".json";
 		// JSX 저장 다이얼로그 (폴더 직접 지정)
-		evalScriptWithPayload("saveTextFileWithDialog", { defaultName: defaultFileName, content: json }).then((r) => {
-			if (!r || r === "CANCEL") { setStatus("저장 취소", ""); return; }
+		host.saveTextFileWithDialog({ defaultName: defaultFileName, content: json }).then((r) => {
+			if (r === "CANCEL") { setStatus("저장 취소", ""); return; }
 			if (r.startsWith("SUCCESS")) setStatus("작업 저장 완료: " + r.replace("SUCCESS:", "").trim(), "ok");
-			else setStatus("저장 실패: " + (r || "응답 없음"), "err");
+			else setStatus("저장 실패: " + r, "err");
+		}).catch((err) => {
+			setStatus("저장 실패: " + (err.hostReason || err.message), "err");
 		});
 	});
 
