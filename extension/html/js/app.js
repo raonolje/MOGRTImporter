@@ -1925,6 +1925,229 @@ function _closeFontModal() {
 		label.textContent = found ? found.name : path.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? path;
 	}
 	//#endregion
+	//#region src/ui/previewPanel.ts
+	// 프리셋 모달 우측 프리뷰 패널 — 프리뷰 시퀀스 생성, 파라미터 적용,
+	// 프레임 캡처, 디바운스 갱신까지의 파이프라인.
+	//
+	// 외부 의존은 host 어댑터뿐이라 ui/modal보다 앞에 둘 수 있다.
+	// 호출 방향은 modal → preview 한쪽이다.
+	//
+	// extractPreviewValues는 호출자가 없다. CSS 기반 프리뷰를 그리려던
+	// 흔적으로 보이고, 실제 프리뷰는 runPreviewCapture가 PP에서 뽑은
+	// 프레임 이미지를 쓴다. ui/fontModal과 같은 이유로 지우지 않고 남겨둔다.
+	function buildPreviewPanel(list, mogrtPath) {
+		const panel = document.createElement("div");
+		panel.className = "modal-preview-panel";
+
+		// --- 이미지 표시 영역 (항상 표시) ---
+		const imgArea = document.createElement("div");
+		imgArea.id = "modalPreviewImgArea";
+		imgArea.className = "modal-preview-img-area";
+
+		const img = document.createElement("img");
+		img.id = "modalPreviewImg";
+		img.className = "modal-preview-img";
+
+		const statusEl = document.createElement("div");
+		statusEl.id = "modalPreviewStatus";
+		statusEl.className = "modal-preview-status";
+		statusEl.textContent = "프리뷰 준비 중...";
+		statusEl.style.color = "#aaa";
+
+		imgArea.appendChild(img);
+		imgArea.appendChild(statusEl);
+		panel.appendChild(imgArea);
+
+		// 모달 열릴 때 자동 캐처 - 중복 예약 방지 (definition.json 파싱 후 renderModalLayout 재호출 시 중복 실행됨)
+		_previewMogrtPath = mogrtPath;
+		_previewParamList = list;
+		if (_previewAutoTimer) { clearTimeout(_previewAutoTimer); _previewAutoTimer = null; }
+		_previewAutoTimer = setTimeout(() => {
+			_previewAutoTimer = null;
+			runPreviewCapture(mogrtPath, list);
+		}, 1200);
+		return panel;
+	}
+
+	// 프리뷰 별도 창 기능 제거 (팝업 차단 문제로 삭제)
+	function _updatePreviewWindowFile(src) {
+		// 프리뷰 별도 창 기능 제거됨 - 아무 동작 안 함
+	}
+	// 프리뷰 캡처 실행 (버튼 클릭 시)
+	let _previewRunning = false;
+	let _previewDebounceTimer = null;
+	let _previewAutoTimer = null;   // buildPreviewPanel 자동 캡처 중복 방지용
+	let _previewMogrtPath = null;
+	let _previewParamList = null;
+	let _lastPreviewSrc = null;   // 마지막 캡처된 프리뷰 data URL (프리셋 저장 시 썸네일로 사용)
+	async function runPreviewCapture(mogrtPath, list) {
+		if (_previewRunning) return;
+		_previewRunning = true;
+		const statusEl = document.getElementById("modalPreviewStatus");
+		const imgArea = document.getElementById("modalPreviewImgArea");
+		const img = document.getElementById("modalPreviewImg");
+		if (statusEl) { statusEl.textContent = "시퀀스 생성 중..."; statusEl.style.color = "#aaa"; }
+		try {
+			// 1. 프리뷰 시퀀스 생성 + mogrt 삽입
+			const setupRes = await host.setupPreviewSequence({
+				mogrtPath: mogrtPath,
+				durationSec: 5
+			});
+			if (!setupRes.startsWith("SUCCESS")) {
+				if (statusEl) { statusEl.textContent = "시퀀스 생성 실패: " + setupRes; statusEl.style.color = "#f66"; }
+				_previewRunning = false;
+				return;
+			}
+			if (statusEl) statusEl.textContent = "파라미터 적용 중...";
+			// 2. 현재 파라미터 적용
+			const applyRes = await host.applyPreviewParams({ params: list });
+			// 적용 실패해도 캡처 시도
+			if (statusEl) statusEl.textContent = "프레임 캡처 중...";
+			// 3. 프레임 캡처
+			const tmpDir = await host.getTempDir();
+			const tmpPath = tmpDir + "/mogrt_preview_" + Date.now() + ".jpg";
+			const captureRes = await host.capturePreviewFrame({ outputPath: tmpPath });
+			let savedPath = "";
+			if (captureRes.startsWith("SUCCESS:")) {
+				savedPath = captureRes.replace("SUCCESS:", "").trim();
+			} else if (captureRes.startsWith("PENDING:")) {
+				// exportFrameJPEG가 비동기로 동작 → JS에서 폴링
+				const pendingPath = captureRes.replace("PENDING:", "").trim();
+				if (statusEl) statusEl.textContent = "PP 익스포트 대기 중...";
+				let found = false;
+				for (let pi = 0; pi < 120; pi++) {
+					await new Promise(r => setTimeout(r, 500));
+					if (statusEl) statusEl.textContent = `PP 익스포트 대기 중... (${Math.round((pi+1)*0.5)}s)`;
+				if (window.cep && window.cep.fs) {
+					// readFile로 직접 읽기 시도 (슬래시/백슬래시 두 버전)
+					const pathFwd = pendingPath.replace(/\\/g, "/");
+					const pathBack = pendingPath.replace(/\//g, "\\");
+					const r1 = window.cep.fs.readFile(pathFwd, window.cep.encoding.Base64);
+					if (r1.err === 0 && r1.data && r1.data.length > 100) {
+						const src1 = `data:image/jpeg;base64,${r1.data}`;
+					_lastPreviewSrc = src1;
+					if (img) img.src = src1;
+					_updatePreviewWindowFile(src1);
+					if (statusEl) { statusEl.textContent = "✓ 프리뷰 캐처 완료"; statusEl.style.color = "#4caf50"; }
+							try { window.cep.fs.deleteFile(pathFwd); } catch(_) {}
+							_previewRunning = false;
+							return;
+						}
+						const r2 = window.cep.fs.readFile(pathBack, window.cep.encoding.Base64);
+						if (r2.err === 0 && r2.data && r2.data.length > 100) {
+						const src2 = `data:image/jpeg;base64,${r2.data}`;
+					_lastPreviewSrc = src2;
+					if (img) img.src = src2;
+					_updatePreviewWindowFile(src2);
+					if (statusEl) { statusEl.textContent = "✓ 프리뷰 캐처 완료"; statusEl.style.color = "#4caf50"; }
+							try { window.cep.fs.deleteFile(pathBack); } catch(_) {}
+							_previewRunning = false;
+							return;
+						}
+				}
+				}
+				if (!found) {
+					if (statusEl) { statusEl.textContent = "익스포트 시간 초과 (60초)"; statusEl.style.color = "#f66"; }
+					_previewRunning = false;
+					return;
+				}
+			} else {
+				if (statusEl) { statusEl.textContent = "캡처 실패: " + captureRes; statusEl.style.color = "#f66"; }
+				_previewRunning = false;
+				return;
+			}
+			// 4. 이미지 표시
+			if (img && window.cep && window.cep.fs) {
+				const readRes = window.cep.fs.readFile(savedPath, window.cep.encoding.Base64);
+				if (readRes.err === 0 && readRes.data) {
+					const ext = savedPath.endsWith(".png") ? "png" : "jpeg";
+						const finalSrc = `data:image/${ext};base64,${readRes.data}`;
+						_lastPreviewSrc = finalSrc;
+						img.src = finalSrc;
+						_updatePreviewWindowFile(finalSrc);
+						if (statusEl) { statusEl.textContent = "✓ 프리뷰 캐처 완료"; statusEl.style.color = "#4caf50"; }
+						try { window.cep.fs.deleteFile(savedPath); } catch(_) {}
+				} else {
+					if (statusEl) { statusEl.textContent = "이미지 읽기 실패 (err: " + readRes.err + ")"; statusEl.style.color = "#f66"; }
+				}
+			} else {
+				if (statusEl) { statusEl.textContent = "캡처 완료: " + savedPath; statusEl.style.color = "#4caf50"; }
+			}
+		} catch(err) {
+			if (statusEl) { statusEl.textContent = "오류: " + err.message; statusEl.style.color = "#f66"; }
+		}
+		_previewRunning = false;
+	}
+	function extractPreviewValues(list) {
+		// 첫 번째 text 타입 파라미터 (전체 텍스트)
+		const textParam = list.find((p) => p.type === "text");
+		let text = "샘플 자막 텍스트";
+		let fontFamily = "";
+		let fontSize = 60;
+		let isBold = false;
+		let isItalic = false;
+		if (textParam?.rawValue) try {
+			const parsed = JSON.parse(textParam.rawValue);
+			text = parsed.textEditValue || textParam.value || text;
+			// PostScript 폰트명 → CSS font-family 변환 (rawValue 또는 patchParamsFromDefinition이 주입한 fontEditValue)
+			const rawFont = parsed.fontEditValue?.[0] || textParam.fontEditValue?.[0] || "";
+			function toCSS(f) { return f.replace(/TTF-/gi, " ").replace(/OTF-/gi, " ").replace(/-/g, " ").trim() || f; }
+			fontFamily = toCSS(rawFont);
+			fontSize = parsed.fontSizeEditValue?.[0] || 60;
+			isBold = parsed.fontFSBoldValue?.[0] || false;
+			isItalic = parsed.fontFSItalicValue?.[0] || false;
+		} catch (_) {}
+		else if (textParam) {
+			text = textParam.value || text;
+			// patchParamsFromDefinition이 주입한 fontEditValue 사용
+			const rawFont = textParam.fontEditValue?.[0] || "";
+			if (rawFont) fontFamily = rawFont.replace(/TTF-/gi, " ").replace(/OTF-/gi, " ").replace(/-/g, " ").trim() || rawFont;
+		}
+
+		// 색상: 전체 텍스트 그룹 내 첫 번째 color 타입 우선
+		let color = "#ffffff";
+		const textGroupName = textParam?.group || "";
+		const colorParam = textGroupName
+			? list.find((p) => p.type === "color" && p.group === textGroupName)
+			: list.find((p) => p.type === "color");
+		if (colorParam) color = colorParam.colorHex || packedToHex(parsePackedColor(colorParam.rawValue));
+
+		// 자간 (letter-spacing): 전체 텍스트 그룹 내 자간 파라미터
+		let letterSpacing = 0;
+		const spacingParam = list.find((p) => p.type === "number" &&
+			(p.displayName === "자간" || p.displayName === "Tracking" || p.displayName === "Letter Spacing") &&
+			(!textGroupName || p.group === textGroupName));
+		if (spacingParam) letterSpacing = parseFloat(spacingParam.value) || 0;
+
+		// 장평 (scaleX): 전체 텍스트 그룹 내 장평 파라미터
+		let scaleX = 100;
+		const scaleParam = list.find((p) => p.type === "number" &&
+			(p.displayName === "장평" || p.displayName === "Horizontal Scale" || p.displayName === "Scale") &&
+			(!textGroupName || p.group === textGroupName));
+		if (scaleParam) scaleX = parseFloat(scaleParam.value) || 100;
+
+		return {
+			text,
+			color,
+			fontFamily,
+			fontSize,
+			isBold,
+			isItalic,
+			letterSpacing,
+			scaleX
+		};
+	}
+	// 파라미터 변경 시 디바운스 기반 실시간 갱신 트리거 (1초 후 자동 캡처)
+	function updatePreview(list) {
+		if (_previewDebounceTimer) clearTimeout(_previewDebounceTimer);
+		const mogrtPath = _previewMogrtPath;
+		if (!mogrtPath) return;
+		_previewDebounceTimer = setTimeout(() => {
+			_previewDebounceTimer = null;
+			runPreviewCapture(mogrtPath, list);
+		}, 1000);
+	}
+	//#endregion
 	//#region src/ui/modal.ts
 var _setStatus$1 = () => {};
 
@@ -2323,218 +2546,6 @@ var modalState = {
 		guide.innerHTML = "<b>☑ 노출</b>: SRT 편집 시 이 속성을 표시합니다. &nbsp; <b style=\"color:#4caf50\">T</b>: SRT 자막 텍스트가 자동 입력됩니다.";
 		container.appendChild(guide);
 		renderModalParams(container, list, mogrtPath);
-	}
-	function buildPreviewPanel(list, mogrtPath) {
-		const panel = document.createElement("div");
-		panel.className = "modal-preview-panel";
-
-		// --- 이미지 표시 영역 (항상 표시) ---
-		const imgArea = document.createElement("div");
-		imgArea.id = "modalPreviewImgArea";
-		imgArea.className = "modal-preview-img-area";
-
-		const img = document.createElement("img");
-		img.id = "modalPreviewImg";
-		img.className = "modal-preview-img";
-
-		const statusEl = document.createElement("div");
-		statusEl.id = "modalPreviewStatus";
-		statusEl.className = "modal-preview-status";
-		statusEl.textContent = "프리뷰 준비 중...";
-		statusEl.style.color = "#aaa";
-
-		imgArea.appendChild(img);
-		imgArea.appendChild(statusEl);
-		panel.appendChild(imgArea);
-
-		// 모달 열릴 때 자동 캐처 - 중복 예약 방지 (definition.json 파싱 후 renderModalLayout 재호출 시 중복 실행됨)
-		_previewMogrtPath = mogrtPath;
-		_previewParamList = list;
-		if (_previewAutoTimer) { clearTimeout(_previewAutoTimer); _previewAutoTimer = null; }
-		_previewAutoTimer = setTimeout(() => {
-			_previewAutoTimer = null;
-			runPreviewCapture(mogrtPath, list);
-		}, 1200);
-		return panel;
-	}
-
-	// 프리뷰 별도 창 기능 제거 (팝업 차단 문제로 삭제)
-	function _updatePreviewWindowFile(src) {
-		// 프리뷰 별도 창 기능 제거됨 - 아무 동작 안 함
-	}
-	// 프리뷰 캡처 실행 (버튼 클릭 시)
-	let _previewRunning = false;
-	let _previewDebounceTimer = null;
-	let _previewAutoTimer = null;   // buildPreviewPanel 자동 캡처 중복 방지용
-	let _previewMogrtPath = null;
-	let _previewParamList = null;
-	let _lastPreviewSrc = null;   // 마지막 캡처된 프리뷰 data URL (프리셋 저장 시 썸네일로 사용)
-	async function runPreviewCapture(mogrtPath, list) {
-		if (_previewRunning) return;
-		_previewRunning = true;
-		const statusEl = document.getElementById("modalPreviewStatus");
-		const imgArea = document.getElementById("modalPreviewImgArea");
-		const img = document.getElementById("modalPreviewImg");
-		if (statusEl) { statusEl.textContent = "시퀀스 생성 중..."; statusEl.style.color = "#aaa"; }
-		try {
-			// 1. 프리뷰 시퀀스 생성 + mogrt 삽입
-			const setupRes = await host.setupPreviewSequence({
-				mogrtPath: mogrtPath,
-				durationSec: 5
-			});
-			if (!setupRes.startsWith("SUCCESS")) {
-				if (statusEl) { statusEl.textContent = "시퀀스 생성 실패: " + setupRes; statusEl.style.color = "#f66"; }
-				_previewRunning = false;
-				return;
-			}
-			if (statusEl) statusEl.textContent = "파라미터 적용 중...";
-			// 2. 현재 파라미터 적용
-			const applyRes = await host.applyPreviewParams({ params: list });
-			// 적용 실패해도 캡처 시도
-			if (statusEl) statusEl.textContent = "프레임 캡처 중...";
-			// 3. 프레임 캡처
-			const tmpDir = await host.getTempDir();
-			const tmpPath = tmpDir + "/mogrt_preview_" + Date.now() + ".jpg";
-			const captureRes = await host.capturePreviewFrame({ outputPath: tmpPath });
-			let savedPath = "";
-			if (captureRes.startsWith("SUCCESS:")) {
-				savedPath = captureRes.replace("SUCCESS:", "").trim();
-			} else if (captureRes.startsWith("PENDING:")) {
-				// exportFrameJPEG가 비동기로 동작 → JS에서 폴링
-				const pendingPath = captureRes.replace("PENDING:", "").trim();
-				if (statusEl) statusEl.textContent = "PP 익스포트 대기 중...";
-				let found = false;
-				for (let pi = 0; pi < 120; pi++) {
-					await new Promise(r => setTimeout(r, 500));
-					if (statusEl) statusEl.textContent = `PP 익스포트 대기 중... (${Math.round((pi+1)*0.5)}s)`;
-				if (window.cep && window.cep.fs) {
-					// readFile로 직접 읽기 시도 (슬래시/백슬래시 두 버전)
-					const pathFwd = pendingPath.replace(/\\/g, "/");
-					const pathBack = pendingPath.replace(/\//g, "\\");
-					const r1 = window.cep.fs.readFile(pathFwd, window.cep.encoding.Base64);
-					if (r1.err === 0 && r1.data && r1.data.length > 100) {
-						const src1 = `data:image/jpeg;base64,${r1.data}`;
-					_lastPreviewSrc = src1;
-					if (img) img.src = src1;
-					_updatePreviewWindowFile(src1);
-					if (statusEl) { statusEl.textContent = "✓ 프리뷰 캐처 완료"; statusEl.style.color = "#4caf50"; }
-							try { window.cep.fs.deleteFile(pathFwd); } catch(_) {}
-							_previewRunning = false;
-							return;
-						}
-						const r2 = window.cep.fs.readFile(pathBack, window.cep.encoding.Base64);
-						if (r2.err === 0 && r2.data && r2.data.length > 100) {
-						const src2 = `data:image/jpeg;base64,${r2.data}`;
-					_lastPreviewSrc = src2;
-					if (img) img.src = src2;
-					_updatePreviewWindowFile(src2);
-					if (statusEl) { statusEl.textContent = "✓ 프리뷰 캐처 완료"; statusEl.style.color = "#4caf50"; }
-							try { window.cep.fs.deleteFile(pathBack); } catch(_) {}
-							_previewRunning = false;
-							return;
-						}
-				}
-				}
-				if (!found) {
-					if (statusEl) { statusEl.textContent = "익스포트 시간 초과 (60초)"; statusEl.style.color = "#f66"; }
-					_previewRunning = false;
-					return;
-				}
-			} else {
-				if (statusEl) { statusEl.textContent = "캡처 실패: " + captureRes; statusEl.style.color = "#f66"; }
-				_previewRunning = false;
-				return;
-			}
-			// 4. 이미지 표시
-			if (img && window.cep && window.cep.fs) {
-				const readRes = window.cep.fs.readFile(savedPath, window.cep.encoding.Base64);
-				if (readRes.err === 0 && readRes.data) {
-					const ext = savedPath.endsWith(".png") ? "png" : "jpeg";
-						const finalSrc = `data:image/${ext};base64,${readRes.data}`;
-						_lastPreviewSrc = finalSrc;
-						img.src = finalSrc;
-						_updatePreviewWindowFile(finalSrc);
-						if (statusEl) { statusEl.textContent = "✓ 프리뷰 캐처 완료"; statusEl.style.color = "#4caf50"; }
-						try { window.cep.fs.deleteFile(savedPath); } catch(_) {}
-				} else {
-					if (statusEl) { statusEl.textContent = "이미지 읽기 실패 (err: " + readRes.err + ")"; statusEl.style.color = "#f66"; }
-				}
-			} else {
-				if (statusEl) { statusEl.textContent = "캡처 완료: " + savedPath; statusEl.style.color = "#4caf50"; }
-			}
-		} catch(err) {
-			if (statusEl) { statusEl.textContent = "오류: " + err.message; statusEl.style.color = "#f66"; }
-		}
-		_previewRunning = false;
-	}
-	function extractPreviewValues(list) {
-		// 첫 번째 text 타입 파라미터 (전체 텍스트)
-		const textParam = list.find((p) => p.type === "text");
-		let text = "샘플 자막 텍스트";
-		let fontFamily = "";
-		let fontSize = 60;
-		let isBold = false;
-		let isItalic = false;
-		if (textParam?.rawValue) try {
-			const parsed = JSON.parse(textParam.rawValue);
-			text = parsed.textEditValue || textParam.value || text;
-			// PostScript 폰트명 → CSS font-family 변환 (rawValue 또는 patchParamsFromDefinition이 주입한 fontEditValue)
-			const rawFont = parsed.fontEditValue?.[0] || textParam.fontEditValue?.[0] || "";
-			function toCSS(f) { return f.replace(/TTF-/gi, " ").replace(/OTF-/gi, " ").replace(/-/g, " ").trim() || f; }
-			fontFamily = toCSS(rawFont);
-			fontSize = parsed.fontSizeEditValue?.[0] || 60;
-			isBold = parsed.fontFSBoldValue?.[0] || false;
-			isItalic = parsed.fontFSItalicValue?.[0] || false;
-		} catch (_) {}
-		else if (textParam) {
-			text = textParam.value || text;
-			// patchParamsFromDefinition이 주입한 fontEditValue 사용
-			const rawFont = textParam.fontEditValue?.[0] || "";
-			if (rawFont) fontFamily = rawFont.replace(/TTF-/gi, " ").replace(/OTF-/gi, " ").replace(/-/g, " ").trim() || rawFont;
-		}
-
-		// 색상: 전체 텍스트 그룹 내 첫 번째 color 타입 우선
-		let color = "#ffffff";
-		const textGroupName = textParam?.group || "";
-		const colorParam = textGroupName
-			? list.find((p) => p.type === "color" && p.group === textGroupName)
-			: list.find((p) => p.type === "color");
-		if (colorParam) color = colorParam.colorHex || packedToHex(parsePackedColor(colorParam.rawValue));
-
-		// 자간 (letter-spacing): 전체 텍스트 그룹 내 자간 파라미터
-		let letterSpacing = 0;
-		const spacingParam = list.find((p) => p.type === "number" &&
-			(p.displayName === "자간" || p.displayName === "Tracking" || p.displayName === "Letter Spacing") &&
-			(!textGroupName || p.group === textGroupName));
-		if (spacingParam) letterSpacing = parseFloat(spacingParam.value) || 0;
-
-		// 장평 (scaleX): 전체 텍스트 그룹 내 장평 파라미터
-		let scaleX = 100;
-		const scaleParam = list.find((p) => p.type === "number" &&
-			(p.displayName === "장평" || p.displayName === "Horizontal Scale" || p.displayName === "Scale") &&
-			(!textGroupName || p.group === textGroupName));
-		if (scaleParam) scaleX = parseFloat(scaleParam.value) || 100;
-
-		return {
-			text,
-			color,
-			fontFamily,
-			fontSize,
-			isBold,
-			isItalic,
-			letterSpacing,
-			scaleX
-		};
-	}
-	// 파라미터 변경 시 디바운스 기반 실시간 갱신 트리거 (1초 후 자동 캡처)
-	function updatePreview(list) {
-		if (_previewDebounceTimer) clearTimeout(_previewDebounceTimer);
-		const mogrtPath = _previewMogrtPath;
-		if (!mogrtPath) return;
-		_previewDebounceTimer = setTimeout(() => {
-			_previewDebounceTimer = null;
-			runPreviewCapture(mogrtPath, list);
-		}, 1000);
 	}
 	function renderModalParams(container, list, mogrtPath) {
 		const groupBodies = {};
