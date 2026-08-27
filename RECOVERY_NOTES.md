@@ -24,6 +24,8 @@
 
 **온전히 복구됨** — `hostscript.jsx`(2,654줄), `index.html`(1,361줄), `style.css`,
 `srtParser.js`, `manifest.xml`, `README.md`. 난독화·압축이 없어 원본 그대로다.
+(`html/js/srtParser.js`는 index.html이 로드하지 않는 사본이라 2026-08-27
+리팩토링 §5에서 삭제했다. 파서 실체는 번들 안 `srtParser.ts` region에 있다.)
 
 **부분 복구** — `html/js/app.js`는 TypeScript 빌드 산출물이다. 소스맵이 없어
 `.ts` 원본과 타입 정의는 복구 불가. 다만 `//#region src/*.ts` 마커가 남아 있어
@@ -33,6 +35,12 @@
 타입 선언, 원본 주석 중 빌드 과정에서 제거된 것.
 
 ## `src/`를 다룰 때 주의
+
+> **2026-08-27 추가:** REFACTORING_PLAN.md의 리팩토링은 전부 번들
+> `extension/html/js/app.js`를 직접 고쳤다. `src/`는 **다시 생성하지 않았고
+> 앞으로도 동기화하지 않는다.** 복구 시점의 구조 파악용 스냅샷으로만 남긴다.
+> 여기를 고쳐도 Premiere에는 반영되지 않으니 주의할 것. 현재 번들의 region
+> 구성은 아래 "모듈 로드 순서"가 아니라 app.js의 `//#region` 마커를 보면 된다.
 
 `src/`의 각 파일은 **참고·수정용 분리본**이며 그대로는 빌드되지 않는다.
 원래 하나의 IIFE 스코프를 공유하던 코드라 모듈 간 import/export가 없고,
