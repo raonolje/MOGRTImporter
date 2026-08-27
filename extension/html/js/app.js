@@ -1771,6 +1771,160 @@ function _closeFontModal() {
 	if (searchInp) searchInp.value = "";
 }
 	//#endregion
+	//#region src/ui/mogrtPicker.ts
+	// MOGRT 선택기 — 프리셋 모달 좌측 폴더 트리와 우측 카드 그리드.
+	// 폴더 트리 순회, 썸네일 지연 로딩, 선택 라벨 갱신까지 담당한다.
+	//
+	// modalState(folderTree / selectedFolderPath)를 읽고 쓴다. 그 선언은
+	// 뒤따르는 ui/modal region에 있다. 모달이 선택기를 부르고 선택기가
+	// 모달의 상태를 만지는 양방향 결합이라 어느 쪽에 두어도 역참조가 남는다.
+	// 모달을 조율자로 보고 부품을 앞세우는 배치를 골랐다.
+	// ─── 폴더 트리 유틸 ─────────────────────────────
+	function collectMogrtsFromTree(node, out) {
+		if (!node) return;
+		if (node.mogrts) node.mogrts.forEach((m) => out.push(m));
+		if (node.children) node.children.forEach((c) => collectMogrtsFromTree(c, out));
+	}
+	function getMogrtsForSelectedFolder() {
+		const sel = modalState.selectedFolderPath;
+		if (!modalState.folderTree) return state.mogrtList;
+		// 선택된 폴더 노드 찾기
+		function findNode(node, path) {
+			if (!node) return null;
+			if (node.path === path) return node;
+			for (const c of (node.children || [])) {
+				const found = findNode(c, path);
+				if (found) return found;
+			}
+			return null;
+		}
+		const node = findNode(modalState.folderTree, sel);
+		if (!node) return [];
+		// 해당 폴더의 직접 mogrt만 반환 (하위 폴더 포함 안 함)
+		return node.mogrts || [];
+	}
+	function renderFolderTree() {
+		const panel = document.getElementById("mogrtFolderPanel");
+		if (!panel) return;
+		panel.innerHTML = "";
+		// 루트 폴더 직접 파일 보기 항목 ("Motion Graphics Templates" 루트)
+		const rootPath = modalState.folderTree ? modalState.folderTree.path : "__all__";
+		const rootDirectCount = modalState.folderTree && modalState.folderTree.mogrts ? modalState.folderTree.mogrts.length : 0;
+		const allItem = document.createElement("div");
+		allItem.className = "folder-tree-item folder-tree-root" + (modalState.selectedFolderPath === rootPath ? " selected" : "");
+		allItem.dataset.path = rootPath;
+		allItem.innerHTML = `<span class='folder-icon folder-icon-root'>\uD83D\uDDC2</span><span class='folder-name'>\ub8e8\ud2b8 \ud3f4\ub354</span><span class='folder-count'>${rootDirectCount > 0 ? rootDirectCount : ""}</span>`;
+		allItem.addEventListener("click", () => {
+			modalState.selectedFolderPath = rootPath;
+			panel.querySelectorAll(".folder-tree-item").forEach((el) => el.classList.remove("selected"));
+			allItem.classList.add("selected");
+			renderMogrtPickerCards("");
+		});
+		panel.appendChild(allItem);
+		if (modalState.folderTree) {
+			// 루트 폴더의 직접 자식들만 렌더링 (재귀)
+			renderFolderNode(panel, modalState.folderTree, 0);
+		}
+	}
+	function renderFolderNode(panel, node, depth) {
+		if (!node) return;
+		// depth 0은 루트(Motion Graphics Templates) 자체 - 표시 안 함, 자식만 표시
+		if (depth > 0) {
+			const item = document.createElement("div");
+			item.className = "folder-tree-item" + (node.path === modalState.selectedFolderPath ? " selected" : "");
+			item.dataset.path = node.path;
+			item.style.paddingLeft = (8 + (depth - 1) * 14) + "px";
+			const directCount = node.mogrts ? node.mogrts.length : 0;
+			item.innerHTML = `<span class='folder-icon'>📂</span><span class='folder-name'>${escapeHtml(node.name)}</span><span class='folder-count'>${directCount > 0 ? directCount : ""}</span>`;
+			item.addEventListener("click", () => {
+				modalState.selectedFolderPath = node.path;
+				panel.querySelectorAll(".folder-tree-item").forEach((el) => el.classList.remove("selected"));
+				item.classList.add("selected");
+				renderMogrtPickerCards("");
+			});
+			panel.appendChild(item);
+		}
+		if (node.children) node.children.forEach((c) => renderFolderNode(panel, c, depth + 1));
+	}
+	// 쓸네일 캐시 (path → base64 data URL)
+	const _thumbCache = new Map();
+	function loadThumbLazy(img, path) {
+		if (_thumbCache.has(path)) {
+			img.src = _thumbCache.get(path);
+			return;
+		}
+		if (typeof JSZip === "undefined" || !window.cep || !window.cep.fs) return;
+		const readResult = window.cep.fs.readFile(path, window.cep.encoding.Base64);
+		if (readResult.err !== 0 || !readResult.data) return;
+		JSZip.loadAsync(readResult.data, {base64: true}).then((zip) => {
+			const thumbFile = zip.file("thumb.png") || zip.file("thumbnail.png") || zip.file("preview.png");
+			if (!thumbFile) return;
+			return thumbFile.async("base64").then((b64) => {
+				const dataUrl = "data:image/png;base64," + b64;
+				_thumbCache.set(path, dataUrl);
+				img.src = dataUrl;
+			});
+		}).catch(() => {});
+	}
+	function renderMogrtPickerCards(selectedPath) {
+		const grid = document.getElementById("mogrtPickerGrid");
+		const statusEl = document.getElementById("mogrtPickerStatus");
+		if (!grid) return;
+		grid.innerHTML = "";
+		const displayList = getMogrtsForSelectedFolder();
+		if (displayList.length === 0) {
+			if (statusEl) statusEl.textContent = "MOGRT 파일이 없습니다.";
+			return;
+		}
+		if (statusEl) statusEl.textContent = "";
+		// IntersectionObserver로 레이지 로딩
+		const scrollRoot = document.getElementById("mogrtPickerRight");
+		const io = window.IntersectionObserver ? new IntersectionObserver((entries, obs) => {
+			entries.forEach((entry) => {
+				if (!entry.isIntersecting) return;
+				const img = entry.target.querySelector(".mogrt-picker-thumb-img");
+				const path = entry.target.dataset.path;
+				if (img && path) loadThumbLazy(img, path);
+				obs.unobserve(entry.target);
+			});
+		}, { root: scrollRoot, rootMargin: "100px" }) : null;
+		displayList.forEach((m) => {
+			const card = document.createElement("div");
+			card.className = "mogrt-picker-card" + (m.path === selectedPath ? " selected" : "");
+			card.dataset.path = m.path;
+			const thumb = document.createElement("div");
+			thumb.className = "mogrt-picker-thumb";
+			const img = document.createElement("img");
+			img.className = "mogrt-picker-thumb-img";
+			img.alt = m.name;
+			thumb.appendChild(img);
+			const nameEl = document.createElement("div");
+			nameEl.className = "mogrt-picker-name";
+			nameEl.textContent = m.name;
+			card.appendChild(thumb);
+			card.appendChild(nameEl);
+			grid.appendChild(card);
+			// 캐시 있으면 즉시, 없으면 IntersectionObserver로 레이지 로딩
+			if (_thumbCache.has(m.path)) {
+				img.src = _thumbCache.get(m.path);
+			} else if (io) {
+				io.observe(card);
+			} else {
+				loadThumbLazy(img, m.path);
+			}
+		});
+	}
+	function updatePickerLabel(path) {
+		const label = document.getElementById("mogrtSelectedLabel");
+		if (!label) return;
+		if (!path) {
+			label.textContent = "-- MOGRT 미선택 --";
+			return;
+		}
+		const found = state.mogrtList.find((m) => m.path === path);
+		label.textContent = found ? found.name : path.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? path;
+	}
+	//#endregion
 	//#region src/ui/modal.ts
 var _setStatus$1 = () => {};
 
@@ -3080,151 +3234,6 @@ var modalState = {
 		}
 		if (res.startsWith("SUCCESS")) _setStatus$1("프리뷰 적용됨", "ok");
 		else _setStatus$1(res.replace("ERROR:", "").trim(), "err");
-	}
-	// ─── 폴더 트리 유틸 ─────────────────────────────
-	function collectMogrtsFromTree(node, out) {
-		if (!node) return;
-		if (node.mogrts) node.mogrts.forEach((m) => out.push(m));
-		if (node.children) node.children.forEach((c) => collectMogrtsFromTree(c, out));
-	}
-	function getMogrtsForSelectedFolder() {
-		const sel = modalState.selectedFolderPath;
-		if (!modalState.folderTree) return state.mogrtList;
-		// 선택된 폴더 노드 찾기
-		function findNode(node, path) {
-			if (!node) return null;
-			if (node.path === path) return node;
-			for (const c of (node.children || [])) {
-				const found = findNode(c, path);
-				if (found) return found;
-			}
-			return null;
-		}
-		const node = findNode(modalState.folderTree, sel);
-		if (!node) return [];
-		// 해당 폴더의 직접 mogrt만 반환 (하위 폴더 포함 안 함)
-		return node.mogrts || [];
-	}
-	function renderFolderTree() {
-		const panel = document.getElementById("mogrtFolderPanel");
-		if (!panel) return;
-		panel.innerHTML = "";
-		// 루트 폴더 직접 파일 보기 항목 ("Motion Graphics Templates" 루트)
-		const rootPath = modalState.folderTree ? modalState.folderTree.path : "__all__";
-		const rootDirectCount = modalState.folderTree && modalState.folderTree.mogrts ? modalState.folderTree.mogrts.length : 0;
-		const allItem = document.createElement("div");
-		allItem.className = "folder-tree-item folder-tree-root" + (modalState.selectedFolderPath === rootPath ? " selected" : "");
-		allItem.dataset.path = rootPath;
-		allItem.innerHTML = `<span class='folder-icon folder-icon-root'>\uD83D\uDDC2</span><span class='folder-name'>\ub8e8\ud2b8 \ud3f4\ub354</span><span class='folder-count'>${rootDirectCount > 0 ? rootDirectCount : ""}</span>`;
-		allItem.addEventListener("click", () => {
-			modalState.selectedFolderPath = rootPath;
-			panel.querySelectorAll(".folder-tree-item").forEach((el) => el.classList.remove("selected"));
-			allItem.classList.add("selected");
-			renderMogrtPickerCards("");
-		});
-		panel.appendChild(allItem);
-		if (modalState.folderTree) {
-			// 루트 폴더의 직접 자식들만 렌더링 (재귀)
-			renderFolderNode(panel, modalState.folderTree, 0);
-		}
-	}
-	function renderFolderNode(panel, node, depth) {
-		if (!node) return;
-		// depth 0은 루트(Motion Graphics Templates) 자체 - 표시 안 함, 자식만 표시
-		if (depth > 0) {
-			const item = document.createElement("div");
-			item.className = "folder-tree-item" + (node.path === modalState.selectedFolderPath ? " selected" : "");
-			item.dataset.path = node.path;
-			item.style.paddingLeft = (8 + (depth - 1) * 14) + "px";
-			const directCount = node.mogrts ? node.mogrts.length : 0;
-			item.innerHTML = `<span class='folder-icon'>📂</span><span class='folder-name'>${escapeHtml(node.name)}</span><span class='folder-count'>${directCount > 0 ? directCount : ""}</span>`;
-			item.addEventListener("click", () => {
-				modalState.selectedFolderPath = node.path;
-				panel.querySelectorAll(".folder-tree-item").forEach((el) => el.classList.remove("selected"));
-				item.classList.add("selected");
-				renderMogrtPickerCards("");
-			});
-			panel.appendChild(item);
-		}
-		if (node.children) node.children.forEach((c) => renderFolderNode(panel, c, depth + 1));
-	}
-	// 쓸네일 캐시 (path → base64 data URL)
-	const _thumbCache = new Map();
-	function loadThumbLazy(img, path) {
-		if (_thumbCache.has(path)) {
-			img.src = _thumbCache.get(path);
-			return;
-		}
-		if (typeof JSZip === "undefined" || !window.cep || !window.cep.fs) return;
-		const readResult = window.cep.fs.readFile(path, window.cep.encoding.Base64);
-		if (readResult.err !== 0 || !readResult.data) return;
-		JSZip.loadAsync(readResult.data, {base64: true}).then((zip) => {
-			const thumbFile = zip.file("thumb.png") || zip.file("thumbnail.png") || zip.file("preview.png");
-			if (!thumbFile) return;
-			return thumbFile.async("base64").then((b64) => {
-				const dataUrl = "data:image/png;base64," + b64;
-				_thumbCache.set(path, dataUrl);
-				img.src = dataUrl;
-			});
-		}).catch(() => {});
-	}
-	function renderMogrtPickerCards(selectedPath) {
-		const grid = document.getElementById("mogrtPickerGrid");
-		const statusEl = document.getElementById("mogrtPickerStatus");
-		if (!grid) return;
-		grid.innerHTML = "";
-		const displayList = getMogrtsForSelectedFolder();
-		if (displayList.length === 0) {
-			if (statusEl) statusEl.textContent = "MOGRT 파일이 없습니다.";
-			return;
-		}
-		if (statusEl) statusEl.textContent = "";
-		// IntersectionObserver로 레이지 로딩
-		const scrollRoot = document.getElementById("mogrtPickerRight");
-		const io = window.IntersectionObserver ? new IntersectionObserver((entries, obs) => {
-			entries.forEach((entry) => {
-				if (!entry.isIntersecting) return;
-				const img = entry.target.querySelector(".mogrt-picker-thumb-img");
-				const path = entry.target.dataset.path;
-				if (img && path) loadThumbLazy(img, path);
-				obs.unobserve(entry.target);
-			});
-		}, { root: scrollRoot, rootMargin: "100px" }) : null;
-		displayList.forEach((m) => {
-			const card = document.createElement("div");
-			card.className = "mogrt-picker-card" + (m.path === selectedPath ? " selected" : "");
-			card.dataset.path = m.path;
-			const thumb = document.createElement("div");
-			thumb.className = "mogrt-picker-thumb";
-			const img = document.createElement("img");
-			img.className = "mogrt-picker-thumb-img";
-			img.alt = m.name;
-			thumb.appendChild(img);
-			const nameEl = document.createElement("div");
-			nameEl.className = "mogrt-picker-name";
-			nameEl.textContent = m.name;
-			card.appendChild(thumb);
-			card.appendChild(nameEl);
-			grid.appendChild(card);
-			// 캐시 있으면 즉시, 없으면 IntersectionObserver로 레이지 로딩
-			if (_thumbCache.has(m.path)) {
-				img.src = _thumbCache.get(m.path);
-			} else if (io) {
-				io.observe(card);
-			} else {
-				loadThumbLazy(img, m.path);
-			}
-		});
-	}
-	function updatePickerLabel(path) {
-		const label = document.getElementById("mogrtSelectedLabel");
-		if (!label) return;
-		if (!path) {
-			label.textContent = "-- MOGRT 미선택 --";
-			return;
-		}
-		const found = state.mogrtList.find((m) => m.path === path);
-		label.textContent = found ? found.name : path.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? path;
 	}
 	function bindModalEvents() {
 		const modal = document.getElementById("defaultModal");
