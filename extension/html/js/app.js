@@ -673,6 +673,51 @@
 		return { open };
 	})();
 	//#endregion
+	//#region src/ui/dialog.ts
+	// 패널 공용 확인/알림 다이얼로그. index.html의 #confirmModal / #alertModal을
+	// 쓰고, 없으면 브라우저 기본 confirm/alert로 폴백한다.
+	// 의존성이 없어 어느 region에서든 부를 수 있다.
+	function showConfirm(message, onYes, onNo) {
+		const overlay = document.getElementById("confirmModal");
+		const msgEl = document.getElementById("confirmMessage");
+		const btnYes = document.getElementById("confirmYes");
+		const btnNo = document.getElementById("confirmNo");
+		if (!overlay || !msgEl || !btnYes || !btnNo) {
+			if (confirm(message)) onYes();
+			else onNo?.();
+			return;
+		}
+		msgEl.textContent = message;
+		overlay.classList.add("open");
+		const cleanup = () => overlay.classList.remove("open");
+		const yesHandler = () => {
+			cleanup();
+			onYes();
+		};
+		const noHandler = () => {
+			cleanup();
+			onNo?.();
+		};
+		btnYes.onclick = yesHandler;
+		btnNo.onclick = noHandler;
+	}
+	function showAlert(message, onOk) {
+		const overlay = document.getElementById("alertModal");
+		const msgEl = document.getElementById("alertMessage");
+		const btnOk = document.getElementById("alertOk");
+		if (!overlay || !msgEl || !btnOk) {
+			alert(message);
+			onOk?.();
+			return;
+		}
+		msgEl.textContent = message;
+		overlay.classList.add("open");
+		btnOk.onclick = () => {
+			overlay.classList.remove("open");
+			onOk?.();
+		};
+	}
+	//#endregion
 	//#region src/ui/paramEditor.ts
 	function renderParams(panel, list, onChange, exposedFontFields) {
 		panel.innerHTML = "";
@@ -3026,46 +3071,6 @@ var modalState = {
 		}
 		if (res.startsWith("SUCCESS")) _setStatus$1("프리뷰 적용됨", "ok");
 		else _setStatus$1(res.replace("ERROR:", "").trim(), "err");
-	}
-	function showConfirm(message, onYes, onNo) {
-		const overlay = document.getElementById("confirmModal");
-		const msgEl = document.getElementById("confirmMessage");
-		const btnYes = document.getElementById("confirmYes");
-		const btnNo = document.getElementById("confirmNo");
-		if (!overlay || !msgEl || !btnYes || !btnNo) {
-			if (confirm(message)) onYes();
-			else onNo?.();
-			return;
-		}
-		msgEl.textContent = message;
-		overlay.classList.add("open");
-		const cleanup = () => overlay.classList.remove("open");
-		const yesHandler = () => {
-			cleanup();
-			onYes();
-		};
-		const noHandler = () => {
-			cleanup();
-			onNo?.();
-		};
-		btnYes.onclick = yesHandler;
-		btnNo.onclick = noHandler;
-	}
-	function showAlert(message, onOk) {
-		const overlay = document.getElementById("alertModal");
-		const msgEl = document.getElementById("alertMessage");
-		const btnOk = document.getElementById("alertOk");
-		if (!overlay || !msgEl || !btnOk) {
-			alert(message);
-			onOk?.();
-			return;
-		}
-		msgEl.textContent = message;
-		overlay.classList.add("open");
-		btnOk.onclick = () => {
-			overlay.classList.remove("open");
-			onOk?.();
-		};
 	}
 	// ─── 폴더 트리 유틸 ─────────────────────────────
 	function collectMogrtsFromTree(node, out) {
