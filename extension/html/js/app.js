@@ -466,6 +466,20 @@
 		}
 	}
 	//#endregion
+	//#region src/htmlUtils.ts
+	// innerHTML 템플릿에 외부 문자열을 끼워 넣을 때 쓴다. 대상은 이 코드가
+	// 만들지 않은 값이다 — 파일시스템 폴더명, 사용자가 입력한 저장 라벨,
+	// 호스트 응답과 예외 메시지.
+	// 코드가 만든 정수(개수 등) 보간에는 쓰지 않는다. 불필요하다.
+	function escapeHtml(value) {
+		return String(value == null ? "" : value)
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	}
+	//#endregion
 	//#region src/colorUtils.ts
 	function h2(v) {
 		const s = Math.floor(v).toString(16);
@@ -2030,12 +2044,12 @@ var modalState = {
 				renderModalLayout(modalBody, freshList, mogrtPath);
 			} catch (ex) {
 				clearTimeout(timeoutId);
-				modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파싱 오류: ${ex.message}</p>`;
+				modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파싱 오류: ${escapeHtml(ex.message)}</p>`;
 			}
 		}).catch((err) => {
 			if (timedOut) return;
 			clearTimeout(timeoutId);
-			modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파라미터 로드 실패: ${err.hostRaw || err.message || ""}</p>`;
+			modalBody.innerHTML = `<p style="color:#f44336;font-size:11px;padding:10px 0;">파라미터 로드 실패: ${escapeHtml(err.hostRaw || err.message || "")}</p>`;
 		});
 	}
 	// 캐시 히트 시 또는 호스트 응답 도착 후 공통으로 모달에 파라미터 적용
@@ -3109,7 +3123,7 @@ var modalState = {
 			item.dataset.path = node.path;
 			item.style.paddingLeft = (8 + (depth - 1) * 14) + "px";
 			const directCount = node.mogrts ? node.mogrts.length : 0;
-			item.innerHTML = `<span class='folder-icon'>📂</span><span class='folder-name'>${node.name}</span><span class='folder-count'>${directCount > 0 ? directCount : ""}</span>`;
+			item.innerHTML = `<span class='folder-icon'>📂</span><span class='folder-name'>${escapeHtml(node.name)}</span><span class='folder-count'>${directCount > 0 ? directCount : ""}</span>`;
 			item.addEventListener("click", () => {
 				modalState.selectedFolderPath = node.path;
 				panel.querySelectorAll(".folder-tree-item").forEach((el) => el.classList.remove("selected"));
@@ -4851,7 +4865,7 @@ var modalState = {
 		infoWrap.style.cssText = "display:flex;align-items:center;gap:6px;flex:1;min-width:0;cursor:pointer;";
 		infoWrap.innerHTML =
 			'<span class="hist-time">' + dateStr + ' ' + timeStr + '</span>' +
-			'<span class="hist-label">' + (entry.label || (isManual ? "수동저장" : "자동저장")) + '</span>' +
+			'<span class="hist-label">' + escapeHtml(entry.label || (isManual ? "수동저장" : "자동저장")) + '</span>' +
 			'<span class="hist-count">' + (entry.subtitles ? entry.subtitles.length : 0) + '개</span>';
 		infoWrap.title = "이 시점으로 복원";
 		infoWrap.addEventListener("click", (e) => {
