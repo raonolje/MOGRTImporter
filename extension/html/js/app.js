@@ -190,12 +190,43 @@
 			if (path) _fsWrite(path, data);
 		} catch (_) {}
 	}
+	// ── state.subtitles / state.presets 대입 창구 ──
+	//
+	// 이 둘만 setter를 둔다. 변경 시 파일 저장이 따라붙어야 하는 값이라
+	// 대입 지점을 모아두면 저장 누락과 중복 저장을 한 곳에서 통제할 수 있다.
+	// 나머지 state 필드는 그대로 직접 대입한다(계획서 §4 범위).
+	//
+	// opts.persist  기본 true. 대입 직후 저장한다. 새로 추가되는 대입이
+	//               저장을 잊어도 기본값이 받아준다.
+	//               false로 넘기는 경우는 둘 중 하나다.
+	//                 - 저장소에서 막 읽어온 값을 넣을 때. 되쓰면 의미 없는
+	//                   쓰기이고, 초기화 중이라 저장 경로 키가 아직 확정되지
+	//                   않았을 수도 있다.
+	//                 - 뒤이어 다른 필드까지 고친 뒤 명시적으로 저장하는 흐름.
+	//                   여기서 저장하면 같은 동작에 쓰기가 두 번 생긴다.
+	// opts.reason   추적용 라벨. window._mogrtDebug.traceState = true 일 때만
+	//               콘솔에 남는다. 평소에는 비용이 없다.
+	function _traceState(field, next, reason) {
+		if (!window._mogrtDebug || !window._mogrtDebug.traceState) return;
+		const size = Array.isArray(next) ? next.length + "개" : Object.keys(next || {}).length + "개";
+		console.log("[state] " + field + " \u2190 " + size + (reason ? " (" + reason + ")" : ""));
+	}
+	function setSubtitles(next, opts) {
+		_traceState("subtitles", next, opts && opts.reason);
+		state.subtitles = next;
+		if (!opts || opts.persist !== false) saveSessionToStorage();
+	}
+	function setPresets(next, opts) {
+		_traceState("presets", next, opts && opts.reason);
+		state.presets = next;
+		if (!opts || opts.persist !== false) savePresetsToStorage();
+	}
 	function loadSessionFromStorage() {
 		try {
 			const path = _getSessionPath();
 			const sdata = path ? _fsRead(path) : null;
 			if (sdata) {
-				if (sdata.subtitles) state.subtitles = sdata.subtitles;
+				if (sdata.subtitles) setSubtitles(sdata.subtitles, { reason: "세션 로드", persist: false });
 				if (sdata.rowStates) state.rowStates = sdata.rowStates;
 				if (sdata.trashBin) state.trashBin = sdata.trashBin;
 				if (sdata.nextId) state.nextId = sdata.nextId;
@@ -205,7 +236,7 @@
 				// 저장된 데이터가 없을 때 기존 state를 유지 (자막 소실 방지)
 				// 새 시쿀스로 전환 시에만 초기화 (명시적 플래그로 제어)
 				if (loadSessionFromStorage._clearOnEmpty) {
-					state.subtitles = [];
+					setSubtitles([], { reason: "새 시퀀스 전환", persist: false });
 					state.rowStates = {};
 					state.trashBin = [];
 					state.nextId = 1;
@@ -238,7 +269,7 @@
 				if (data.presets) {
 					const migrated = {};
 					for (const [id, preset] of Object.entries(data.presets)) migrated[id] = migratePreset(preset);
-					state.presets = migrated;
+					setPresets(migrated, { reason: "프리셋 로드", persist: false });
 				}
 				if (data.presetTrash) state.presetTrash = data.presetTrash;
 				if (data.nextPresetId) state.nextPresetId = data.nextPresetId;
@@ -248,7 +279,7 @@
 			const spath = _getSessionPath();
 			const sdata = spath ? _fsRead(spath) : null;
 			if (sdata) {
-				if (sdata.subtitles) state.subtitles = sdata.subtitles;
+				if (sdata.subtitles) setSubtitles(sdata.subtitles, { reason: "전체 로드", persist: false });
 				if (sdata.rowStates) state.rowStates = sdata.rowStates;
 				if (sdata.trashBin) state.trashBin = sdata.trashBin;
 				if (sdata.nextId) state.nextId = sdata.nextId;
@@ -4045,7 +4076,9 @@ var modalState = {
 		reader.onload = (ev) => {
 			const text = ev.target?.result;
 			const parsed = parseSRT(text);
-			state.subtitles = [];
+			// 아래 push 루프와 rowStates 구성이 끝난 뒤 saveSessionToStorage()가
+			// 한 번 돈다. 여기서 저장하면 빈 배열이 먼저 쓰인다.
+			setSubtitles([], { reason: "SRT 로드", persist: false });
 			state.rowStates = {};
 			state.trashBin = [];
 			state.nextId = 1;
@@ -4651,7 +4684,8 @@ var modalState = {
 					const doImport = (clearFirst) => {
 						if (clearFirst) {
 							// 기존 프리셋 전체 삭제
-							state.presets = {};
+							// 아래 가져오기 루프가 끝난 뒤 savePresetsToStorage()가 돈다.
+							setPresets({}, { reason: "프리셋 가져오기 - 기존 삭제", persist: false });
 							state.nextPresetId = 1;
 						}
 						let imported = 0;
@@ -4755,7 +4789,9 @@ var modalState = {
 			try {
 				const data = JSON.parse(ev.target?.result);
 				if (!data.subtitles || !data.rowStates) { showAlert("올바른 작업 파일이 아닙니다."); return; }
-				state.subtitles = data.subtitles;
+				// _sanitizeOrphanPresets()로 rowStates까지 정리한 뒤
+				// saveSessionToStorage()가 돈다.
+				setSubtitles(data.subtitles, { reason: "작업 파일 불러오기", persist: false });
 				state.rowStates = data.rowStates;
 				state.trashBin = data.trashBin || [];
 				state.nextId = data.nextId || 1;
@@ -4917,7 +4953,8 @@ var modalState = {
 				"[" + dateStr + " " + timeStr + "] " + (entry.label || (isManual ? "수동저장" : "자동저장")) + "\n" +
 				(entry.subtitles ? entry.subtitles.length : 0) + "개 자막\n\n이 시점으로 복원하시겠습니까?",
 				() => {
-					state.subtitles = entry.subtitles;
+					// 아래에서 _sanitizeOrphanPresets() 후 saveSessionToStorage()가 돈다.
+					setSubtitles(entry.subtitles, { reason: "히스토리 복원", persist: false });
 					state.rowStates = entry.rowStates;
 					state.trashBin = entry.trashBin || [];
 					state.nextId = entry.nextId || 1;
