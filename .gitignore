@@ -1,0 +1,18 @@
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+
+# 빌드 산출물 / 의존성 (향후 TS 프로젝트 복원 시)
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 로컬 작업물
+*.log
+tmp/
