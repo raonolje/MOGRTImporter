@@ -1689,119 +1689,6 @@
 		});
 	}
 	//#endregion
-	//#region src/ui/fontModal.ts
-	// 싱글톤 폰트 선택 모달. 현재 호출자가 없다.
-	//
-	// 진입점인 _openFontModal을 부르는 코드가 번들 어디에도 없고,
-	// 나머지 셋은 _openFontModal 또는 _ensureFontModal이 붙인 핸들러에서만
-	// 불린다. 즉 이 region 전체가 도달 불가다. 실제 폰트 선택은
-	// ui/paramEditor와 ui/modal이 만드는 <select class="mogrt-font-select">가
-	// 담당한다.
-	//
-	// 지우지 않고 격리만 해둔다. 삭제 여부는 별도 판단이 필요하다.
-// ─── 싱글톤 폰트 모달 (전역 1개) ───────────────────────────────
-var _fontModalEl = null;
-var _fontModalCallback = null;
-var _fontModalCurrentFont = "";
-var _fontModalList = [];
-
-function _ensureFontModal() {
-	if (_fontModalEl) return _fontModalEl;
-	var overlay = document.createElement("div");
-	overlay.className = "mogrt-font-modal-overlay";
-	overlay.style.display = "none";
-	// #presetEditBox에 position:absolute; inset:0으로 붙임 → #presetEditBox 전체를 덮음
-	overlay.style.position = "absolute";
-	overlay.style.top = "0";
-	overlay.style.left = "0";
-	overlay.style.right = "0";
-	overlay.style.bottom = "0";
-	overlay.style.zIndex = "9999";
-	var box = document.createElement("div");
-	box.className = "mogrt-font-modal-box";
-	var header = document.createElement("div");
-	header.className = "mogrt-font-modal-header";
-	var titleSpan = document.createElement("span");
-	titleSpan.textContent = "폰트 선택";
-	var closeBtn = document.createElement("button");
-	closeBtn.type = "button";
-	closeBtn.className = "mogrt-font-modal-close";
-	closeBtn.textContent = "✕";
-	closeBtn.addEventListener("click", function() { _closeFontModal(); });
-	header.appendChild(titleSpan);
-	header.appendChild(closeBtn);
-	var searchInp = document.createElement("input");
-	searchInp.type = "text";
-	searchInp.className = "mogrt-font-search";
-	searchInp.placeholder = "폰트 검색...";
-	searchInp.id = "_gFontSearch";
-	var listEl = document.createElement("ul");
-	listEl.className = "mogrt-font-list";
-	listEl.id = "_gFontList";
-	box.appendChild(header);
-	box.appendChild(searchInp);
-	box.appendChild(listEl);
-	overlay.appendChild(box);
-	overlay.addEventListener("click", function(e) { if (e.target === overlay) _closeFontModal(); });
-	document.addEventListener("keydown", function(e) { if (e.key === "Escape" && overlay.style.display !== "none") _closeFontModal(); });
-	searchInp.addEventListener("input", function() { _renderFontModalItems(searchInp.value); });
-	// #presetEditModal에 붙임 (position:fixed; inset:0; overflow:hidden → 스크롤 없음 → absolute 자식이 모달 전체를 덮음)
-	var editModal = document.getElementById("presetEditModal");
-	if (editModal) {
-		editModal.appendChild(overlay);
-	} else {
-		document.body.appendChild(overlay);
-	}
-	_fontModalEl = overlay;
-	return overlay;
-}
-
-function _renderFontModalItems(filter) {
-	var listEl = document.getElementById("_gFontList");
-	if (!listEl) return;
-	listEl.innerHTML = "";
-	var q = (filter || "").toLowerCase();
-	var filtered = q
-		? _fontModalList.filter(function(f) { return f.display.toLowerCase().indexOf(q) !== -1 || f.postscript.toLowerCase().indexOf(q) !== -1; })
-		: _fontModalList;
-	filtered.forEach(function(f) {
-		var li = document.createElement("li");
-		li.className = "mogrt-font-list-item" + (f.postscript === _fontModalCurrentFont ? " selected" : "");
-		li.textContent = f.display;
-		li.title = f.postscript;
-		(function(fCopy) {
-			li.addEventListener("click", function() {
-				_fontModalCurrentFont = fCopy.postscript;
-				_closeFontModal();
-				if (_fontModalCallback) _fontModalCallback(fCopy.postscript, fCopy.display);
-			});
-		})(f);
-		listEl.appendChild(li);
-	});
-}
-
-function _openFontModal(fontList, currentFont, callback) {
-	_ensureFontModal();
-	_fontModalList = fontList;
-	_fontModalCurrentFont = currentFont;
-	_fontModalCallback = callback;
-	var searchInp = document.getElementById("_gFontSearch");
-	if (searchInp) searchInp.value = "";
-	_renderFontModalItems("");
-	_fontModalEl.style.display = "flex";
-	if (searchInp) searchInp.focus();
-	setTimeout(function() {
-		var sel = document.querySelector("#_gFontList .selected");
-		if (sel) sel.scrollIntoView({ block: "center" });
-	}, 50);
-}
-
-function _closeFontModal() {
-	if (_fontModalEl) _fontModalEl.style.display = "none";
-	var searchInp = document.getElementById("_gFontSearch");
-	if (searchInp) searchInp.value = "";
-}
-	//#endregion
 	//#region src/ui/mogrtPicker.ts
 	// MOGRT 선택기 — 프리셋 모달 좌측 폴더 트리와 우측 카드 그리드.
 	// 폴더 트리 순회, 썸네일 지연 로딩, 선택 라벨 갱신까지 담당한다.
@@ -1962,10 +1849,6 @@ function _closeFontModal() {
 	//
 	// 외부 의존은 host 어댑터뿐이라 ui/modal보다 앞에 둘 수 있다.
 	// 호출 방향은 modal → preview 한쪽이다.
-	//
-	// extractPreviewValues는 호출자가 없다. CSS 기반 프리뷰를 그리려던
-	// 흔적으로 보이고, 실제 프리뷰는 runPreviewCapture가 PP에서 뽑은
-	// 프레임 이미지를 쓴다. ui/fontModal과 같은 이유로 지우지 않고 남겨둔다.
 	function buildPreviewPanel(list, mogrtPath) {
 		const panel = document.createElement("div");
 		panel.className = "modal-preview-panel";
@@ -2108,65 +1991,6 @@ function _closeFontModal() {
 			if (statusEl) { statusEl.textContent = "오류: " + err.message; statusEl.style.color = "#f66"; }
 		}
 		_previewRunning = false;
-	}
-	function extractPreviewValues(list) {
-		// 첫 번째 text 타입 파라미터 (전체 텍스트)
-		const textParam = list.find((p) => p.type === "text");
-		let text = "샘플 자막 텍스트";
-		let fontFamily = "";
-		let fontSize = 60;
-		let isBold = false;
-		let isItalic = false;
-		if (textParam?.rawValue) try {
-			const parsed = JSON.parse(textParam.rawValue);
-			text = parsed.textEditValue || textParam.value || text;
-			// PostScript 폰트명 → CSS font-family 변환 (rawValue 또는 patchParamsFromDefinition이 주입한 fontEditValue)
-			const rawFont = parsed.fontEditValue?.[0] || textParam.fontEditValue?.[0] || "";
-			function toCSS(f) { return f.replace(/TTF-/gi, " ").replace(/OTF-/gi, " ").replace(/-/g, " ").trim() || f; }
-			fontFamily = toCSS(rawFont);
-			fontSize = parsed.fontSizeEditValue?.[0] || 60;
-			isBold = parsed.fontFSBoldValue?.[0] || false;
-			isItalic = parsed.fontFSItalicValue?.[0] || false;
-		} catch (_) {}
-		else if (textParam) {
-			text = textParam.value || text;
-			// patchParamsFromDefinition이 주입한 fontEditValue 사용
-			const rawFont = textParam.fontEditValue?.[0] || "";
-			if (rawFont) fontFamily = rawFont.replace(/TTF-/gi, " ").replace(/OTF-/gi, " ").replace(/-/g, " ").trim() || rawFont;
-		}
-
-		// 색상: 전체 텍스트 그룹 내 첫 번째 color 타입 우선
-		let color = "#ffffff";
-		const textGroupName = textParam?.group || "";
-		const colorParam = textGroupName
-			? list.find((p) => p.type === "color" && p.group === textGroupName)
-			: list.find((p) => p.type === "color");
-		if (colorParam) color = colorParam.colorHex || packedToHex(parsePackedColor(colorParam.rawValue));
-
-		// 자간 (letter-spacing): 전체 텍스트 그룹 내 자간 파라미터
-		let letterSpacing = 0;
-		const spacingParam = list.find((p) => p.type === "number" &&
-			(p.displayName === "자간" || p.displayName === "Tracking" || p.displayName === "Letter Spacing") &&
-			(!textGroupName || p.group === textGroupName));
-		if (spacingParam) letterSpacing = parseFloat(spacingParam.value) || 0;
-
-		// 장평 (scaleX): 전체 텍스트 그룹 내 장평 파라미터
-		let scaleX = 100;
-		const scaleParam = list.find((p) => p.type === "number" &&
-			(p.displayName === "장평" || p.displayName === "Horizontal Scale" || p.displayName === "Scale") &&
-			(!textGroupName || p.group === textGroupName));
-		if (scaleParam) scaleX = parseFloat(scaleParam.value) || 100;
-
-		return {
-			text,
-			color,
-			fontFamily,
-			fontSize,
-			isBold,
-			isItalic,
-			letterSpacing,
-			scaleX
-		};
 	}
 	// 파라미터 변경 시 디바운스 기반 실시간 갱신 트리거 (1초 후 자동 캡처)
 	function updatePreview(list) {
@@ -3267,25 +3091,6 @@ var modalState = {
 		renderModalLayout(modalBody, freshList, mogrtPath);
 	}
 
-	async function applyPreviewToTimeline(paramList) {
-		const trackSel = document.getElementById("trackSel");
-		const trackIndex = parseInt(trackSel.value, 10);
-		_setStatus$1("프리뷰 적용 중...", "info");
-		let res;
-		try {
-			res = await host.previewParamsOnFirstClip({
-				videoTrackIndex: trackIndex,
-				startSec: -1,
-				endSec: 0,
-				params: paramList
-			});
-		} catch (err) {
-			_setStatus$1("프리뷰 적용 실패: " + (err.hostReason || err.message), "err");
-			return;
-		}
-		if (res.startsWith("SUCCESS")) _setStatus$1("프리뷰 적용됨", "ok");
-		else _setStatus$1(res.replace("ERROR:", "").trim(), "err");
-	}
 	function bindModalEvents() {
 		const modal = document.getElementById("defaultModal");
 		const mogrtSel = document.getElementById("defaultMogrtSel");
