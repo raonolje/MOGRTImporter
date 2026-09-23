@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ExtensionManifest Version="11.0"
-    ExtensionBundleId="com.manus.mogrtimporter"
+    ExtensionBundleId="com.raonolje.mogrtimporter"
     ExtensionBundleVersion="1.1.6"
     ExtensionBundleName="MOGRT Subtitle Importer"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
     <ExtensionList>
-        <Extension Id="com.manus.mogrtimporter.panel" Version="1.1.6"/>
+        <Extension Id="com.raonolje.mogrtimporter.panel" Version="1.1.6"/>
     </ExtensionList>
     <ExecutionEnvironment>
         <HostList>
@@ -19,7 +19,7 @@
         </RequiredRuntimeList>
     </ExecutionEnvironment>
     <DispatchInfoList>
-        <Extension Id="com.manus.mogrtimporter.panel">
+        <Extension Id="com.raonolje.mogrtimporter.panel">
             <DispatchInfo>
                 <Resources>
                     <MainPath>./html/index.html</MainPath>

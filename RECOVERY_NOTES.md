@@ -72,6 +72,11 @@ ExtendScript 인코딩에서 깨지지 않는다.
 
 ## 미처리 사항
 
+> **2026-09-23 해결:** 번들 ID를 `com.raonolje.mogrtimporter` /
+> `com.raonolje.mogrtimporter.panel`로 바꿨다(`CSXS/manifest.xml` 3곳,
+> `.debug` 1곳). 아래 내용은 당시 기록으로 남긴다. REFACTORING_PLAN §6은
+> 이 작업이 "이미 완료됨"이라고 적었으나 사실이 아니었다.
+
 번들 ID가 아직 `com.manus.mogrtimporter` / `com.manus.mogrtimporter.panel`이다.
 `CSXS/manifest.xml`과 `.debug` 두 파일에 들어 있고, 바꾸려면 두 곳을 함께
 고쳐야 한다(Premiere가 ID로 매칭하므로 한쪽만 바꾸면 디버그 연결이 끊긴다).
