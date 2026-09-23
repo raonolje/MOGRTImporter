@@ -1,6 +1,10 @@
 /*
- * hostscript.jsx  v26
+ * hostscript.jsx  v27
  * Premiere Pro ExtendScript
+ * - v27 변경사항:
+ *   1. Premiere 네이티브 템플릿 지원. getMGTComponent가 null인 클립은
+ *      AE.ADBE Text 컴포넌트의 "Source Text"를 읽고 쓴다.
+ *      collectNativeTextProps() 추가, getMogrtParams/applyParamsToItem에 분기.
  * - v26 변경사항:
  *   1. 공통 헬퍼로 중복 정리: findPreviewSequence / findWorkSequence /
  *      findSequenceByName / secToTicks / ticksToSec / ensureQE / parsePayload /
@@ -88,6 +92,40 @@ function parsePayloadMaybeEncoded(payloadStr) {
     try { p = JSON.parse(decodeURIComponent(payloadStr)); } catch(e) {}
     if (!p) p = parsePayload(payloadStr);
     return p;
+}
+
+/* ── 네이티브(Premiere 필수 그래픽) 템플릿의 텍스트 속성 수집 ──
+   getMGTComponent()는 After Effects에서 만든 MOGRT(AE.ADBE Capsule 보유)에서만
+   값을 돌려준다. Premiere 필수 그래픽 패널로 만든 템플릿은 삽입 결과가
+   이름 "Graphic"인 일반 그래픽 클립이지만, AE.ADBE Text 컴포넌트의
+   "Source Text" 속성은 읽고 쓸 수 있다(26.5.1 확인: setValue/getValue 둘 다 동작).
+   수집 순서(컴포넌트 순 → 속성 순)를 그대로 파라미터 index로 쓴다.
+   MGT 경로가 props[index]를 쓰는 것과 같은 가정이다. */
+function collectNativeTextProps(trackItem) {
+    var out = [];
+    if (!trackItem) return out;
+    var nc = 0;
+    try { nc = trackItem.components.numItems; } catch(e) { return out; }
+    for (var c = 0; c < nc; c++) {
+        var cp;
+        try { cp = trackItem.components[c]; } catch(e) { continue; }
+        if (!cp) continue;
+        var mn = "";
+        try { mn = String(cp.matchName); } catch(e) { continue; }
+        if (mn.indexOf("Text") === -1) continue;
+        var ps;
+        try { ps = cp.properties; } catch(e) { continue; }
+        var np = 0;
+        try { np = ps.numItems; } catch(e) { continue; }
+        for (var i = 0; i < np; i++) {
+            var pr;
+            try { pr = ps[i]; } catch(e) { continue; }
+            var dn = "";
+            try { dn = String(pr.displayName); } catch(e) {}
+            if (dn === "Source Text") out.push(pr);
+        }
+    }
+    return out;
 }
 
 function setActiveSequence(seq) {
@@ -562,8 +600,35 @@ function getMogrtParams(mogrtPath) {
                 }
             } catch(e) {}
             var looksNative = (!hasCapsule && String(item.name) === "Graphic");
+
+            /* 네이티브 템플릿은 Source Text만 읽고 쓸 수 있다.
+               그것만 텍스트 파라미터로 내어주면 패널은 기존 MOGRT와 똑같이 다룬다. */
+            var ntp = collectNativeTextProps(item);
+            if (ntp.length > 0) {
+                var nres = [];
+                for (var nk = 0; nk < ntp.length; nk++) {
+                    var ncur = "";
+                    try { ncur = String(ntp[nk].getValue()); } catch(e) {}
+                    /* 초기값은 플레이스홀더 한 글자가 들어 있다. 빈 값으로 본다. */
+                    if (ncur.length <= 1) ncur = "";
+                    nres.push({
+                        index: nk,
+                        displayName: "텍스트 " + (nk + 1),
+                        type: "text",
+                        value: ncur,
+                        rawValue: "",
+                        exposedFontFields: [],
+                        fontExposed: false,
+                        nativeText: true
+                    });
+                }
+                try { item.remove(false, false); } catch(e) {}
+                setActiveSequence(originalActiveSeq);
+                return JSON.stringify({ params: nres, mogrtPath: mogrtPath, nativeText: true });
+            }
+
             try { item.remove(false, false); } catch(e) {}
-            if (looksNative) return "ERROR: Premiere 네이티브 템플릿이라 파라미터를 읽을 수 없습니다. After Effects에서 만든 MOGRT를 사용하세요.";
+            if (looksNative) return "ERROR: Premiere 네이티브 템플릿인데 쓸 수 있는 텍스트 속성이 없습니다.";
             return "ERROR: getMGTComponent null";
         }
         if (!comp.properties) { try { item.remove(false, false); } catch(e) {} return "ERROR: comp.properties null"; }
@@ -837,7 +902,21 @@ function debugMogrtStructure(mogrtPath) {
 function applyParamsToItem(trackItem, paramsList) {
     if (!paramsList || paramsList.length === 0) return;
     var comp = trackItem.getMGTComponent();
-    if (!comp || !comp.properties) return;
+    if (!comp || !comp.properties) {
+        /* 네이티브 템플릿: MGT 컴포넌트가 없다. Source Text에 직접 넣는다.
+           수집 순서가 getMogrtParams와 같아 index로 그대로 대응된다. */
+        var ntp2 = collectNativeTextProps(trackItem);
+        if (ntp2.length === 0) return;
+        for (var ni = 0; ni < paramsList.length; ni++) {
+            var npar = paramsList[ni];
+            if (!npar) continue;
+            if (String(npar.type || "").toLowerCase() !== "text") continue;
+            var nidx = (typeof npar.index === "number") ? npar.index : 0;
+            if (nidx < 0 || nidx >= ntp2.length) continue;
+            try { ntp2[nidx].setValue(String(npar.value || ""), true); } catch(e) {}
+        }
+        return;
+    }
 
     var props = comp.properties;
     var n = 0;
