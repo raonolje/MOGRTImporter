@@ -1,6 +1,14 @@
 /*
- * hostscript.jsx  v25
+ * hostscript.jsx  v26
  * Premiere Pro ExtendScript
+ * - v26 변경사항:
+ *   1. 공통 헬퍼로 중복 정리: findPreviewSequence / findWorkSequence /
+ *      findSequenceByName / secToTicks / ticksToSec / ensureQE / parsePayload /
+ *      parsePayloadMaybeEncoded. 같은 루프가 7곳, 파싱이 13곳, enableQE가
+ *      9곳에 복사되어 있었다. setActive처럼 한 곳만 고치고 나머지를
+ *      놓치는 사고를 막는다.
+ *   2. addLegacyTextLayer(): Premiere 26.x에서 제거된 createNewTitle을 판별해
+ *      원인을 담은 예외를 던지고, 호출부가 그 사유를 결과 메시지에 실는다.
  * - v25 변경사항:
  *   1. setActiveSequence(): Premiere 26.x에서 제거된 Sequence.setActive() 대체.
  *      기존 11곳의 seq.setActive() 호출은 try/catch에 감싸서 조용히 실패하고 있었다.
@@ -28,6 +36,60 @@
    조용히 무시되어 활성 시퀀스가 __MOGRT_PREVIEW__에 머무르는 문제가 있었다.
    app.project.activeSequence 대입이 대체로 동작한다(26.5.1 확인).
    구버전 호환을 위해 setActive가 있으면 그쪽을 먼저 쓴다. */
+/* ── 공통 상수 ── */
+var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";   /* 파리별로 7번 선언되던 것을 하나로 모음 */
+var TICKS_PER_SECOND = 254016000000;          /* 네 곳에 상수가 박혀 있던 것을 모음 */
+
+function secToTicks(sec) { return String(Math.round(sec * TICKS_PER_SECOND)); }
+function ticksToSec(ticks) { return parseInt(ticks, 10) / TICKS_PER_SECOND; }
+
+/* 이름으로 시퀀스 찾기. 같은 탐색 루프가 7곳에 복사되어 있었다. */
+function findSequenceByName(name) {
+    var proj = app.project;
+    if (!proj) return null;
+    var n = 0;
+    try { n = proj.sequences.numSequences; } catch(e) { return null; }
+    for (var i = 0; i < n; i++) {
+        var s;
+        try { s = proj.sequences[i]; } catch(e) { continue; }
+        if (s && String(s.name) === String(name)) return s;
+    }
+    return null;
+}
+function findPreviewSequence() { return findSequenceByName(PREVIEW_SEQ_NAME); }
+
+/* 프리뷰가 아닌 첫 시퀀스. 프리뷰가 활성인 채로 남았을 때 작업 시퀀스를 되찾는 용도. */
+function findWorkSequence() {
+    var proj = app.project;
+    if (!proj) return null;
+    var n = 0;
+    try { n = proj.sequences.numSequences; } catch(e) { return null; }
+    for (var i = 0; i < n; i++) {
+        var s;
+        try { s = proj.sequences[i]; } catch(e) { continue; }
+        if (s && String(s.name) !== PREVIEW_SEQ_NAME) return s;
+    }
+    return null;
+}
+
+/* QE DOM 준비. app.enableQE()가 9곳에 흘어져 있었다. */
+function ensureQE() {
+    try { app.enableQE(); } catch(e) { return false; }
+    return (typeof qe !== "undefined" && !!qe);
+}
+
+/* 페이로드 파싱. 13곳이 같은 try/catch를 반복했다. 실패 시 null. */
+function parsePayload(payloadStr) {
+    try { return JSON.parse(payloadStr); } catch(e) { return null; }
+}
+/* 일부 진입점은 encodeURIComponent로 감싼 문자열과 날것을 모두 받는다. */
+function parsePayloadMaybeEncoded(payloadStr) {
+    var p = null;
+    try { p = JSON.parse(decodeURIComponent(payloadStr)); } catch(e) {}
+    if (!p) p = parsePayload(payloadStr);
+    return p;
+}
+
 function setActiveSequence(seq) {
     if (!seq) return false;
     try { if (typeof seq.setActive === "function") { seq.setActive(); return true; } } catch(e) {}
@@ -450,7 +512,7 @@ function detectParamType(val, displayName, hasSubItems, paramObj) {
    5. MOGRT 파라미터 추출 (그룹/코멘트 포함)
 ══════════════════════════════════════════════ */
 function getMogrtParams(mogrtPath) {
-    try { app.enableQE(); } catch (e) {}
+    ensureQE();
 
     var proj = app.project;
     if (!proj) return "ERROR: 프로젝트 없음";
@@ -461,29 +523,13 @@ function getMogrtParams(mogrtPath) {
     if (!originalActiveSeq) return "ERROR: 활성 시퀀스 없음";
 
     // __MOGRT_PREVIEW__ 시퀀스 찾기
-    var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";
-    var previewSeq = null;
-    var seqCount = 0;
-    try { seqCount = proj.sequences.numSequences; } catch(e) {}
-    for (var si = 0; si < seqCount; si++) {
-        var s;
-        try { s = proj.sequences[si]; } catch(e) { continue; }
-        if (s && String(s.name) === PREVIEW_SEQ_NAME) { previewSeq = s; break; }
-    }
+    var previewSeq = findPreviewSequence();
 
     // ★ 핵심: originalActiveSeq가 __MOGRT_PREVIEW__이면 실제 작업 시퀀스로 교정
     // (setupPreviewSequence 후 활성 시퀀스가 복원되지 않은 경우 대비)
     if (String(originalActiveSeq.name) === PREVIEW_SEQ_NAME) {
-        var sc3 = 0;
-        try { sc3 = proj.sequences.numSequences; } catch(e) {}
-        for (var si3 = 0; si3 < sc3; si3++) {
-            var s3;
-            try { s3 = proj.sequences[si3]; } catch(e) { continue; }
-            if (s3 && String(s3.name) !== PREVIEW_SEQ_NAME) {
-                originalActiveSeq = s3;
-                break;
-            }
-        }
+        var workSeq = findWorkSequence();
+        if (workSeq) originalActiveSeq = workSeq;
     }
 
     // 프리뷰 시퀀스가 있으면 setActive 없이 직접 사용 (탭 전환 없이 importMGT 호출 가능)
@@ -732,7 +778,7 @@ function getMogrtParams(mogrtPath) {
 function debugMogrtStructure(mogrtPath) {
     var seq = app.project.activeSequence;
     if (!seq) return "ERROR: 활성 시쿼스 없음";
-    try { app.enableQE(); } catch (e) {}
+    ensureQE();
     var item;
     try { item = seq.importMGT(mogrtPath, "0", 0, 0); } catch (e) { return "ERROR: " + e.message; }
     if (!item) return "ERROR: importMGT 실패";
@@ -974,7 +1020,7 @@ function applyParamsToItem(trackItem, paramsList) {
       파라미터 적용 대상 클립을 찾지 못하는 버그 발생
 ════════════════════════════════════════════ */
 function _importOrInsertMGT(seq, mogrtPath, startTicks, trackIdx, projectItemCache) {
-    var startTimeSec = parseInt(startTicks, 10) / 254016000000;
+    var startTimeSec = ticksToSec(startTicks);
 
     // 캐시에 projectItem이 있으면 overwriteClip으로 즉시 배치
     if (projectItemCache && projectItemCache[mogrtPath]) {
@@ -1020,18 +1066,19 @@ function _importOrInsertMGT(seq, mogrtPath, startTicks, trackIdx, projectItemCac
    (importMGT 반복 호출로 인한 JSX 엔진 블로킹 방지)
 ════════════════════════════════════════════ */
 function applyToTimeline(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch (e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
 
     var seq = app.project.activeSequence;
     if (!seq) return "ERROR: 활성 시퀀스 없음";
     // enableQE는 루프 밖에서 한 번만 호출
-    try { app.enableQE(); } catch (e) {}
+    ensureQE();
 
     var trackIdx  = payload.videoTrackIndex || 2;
     var subs      = payload.subtitles;
     var okCount   = 0;
     var textCount = 0;
+    var failReason = "";
     var failCount = 0;
 
     // 기존 클립 목록 수집 (시작 시간 기준)
@@ -1060,7 +1107,7 @@ function applyToTimeline(payloadStr) {
 
     for (var i = 0; i < subs.length; i++) {
         var sub = subs[i];
-        var startTicks = String(Math.round(sub.startSec * 254016000000));
+        var startTicks = secToTicks(sub.startSec);
         var startKey = String(Math.round(sub.startSec * 100));
 
         if (sub.mogrtPath) {
@@ -1114,12 +1161,15 @@ function applyToTimeline(payloadStr) {
             try {
                 addTextLayer(seq, sub.text, sub.startSec, sub.endSec, trackIdx);
                 textCount++;
-            } catch (e) { failCount++; }
+            } catch (e) {
+                failCount++;
+                if (!failReason) failReason = (e && e.message) ? String(e.message) : String(e);
+            }
         }
     }
 
     return "SUCCESS: MOGRT " + okCount + "개 + 텍스트 레이어 " + textCount + "개 배치 완료" +
-           (failCount > 0 ? " (실패 " + failCount + "개)" : "");
+           (failCount > 0 ? " (실패 " + failCount + "개" + (failReason ? ": " + failReason : "") + ")" : "");
 }
 
 /* ══════════════════════════════════════════════
@@ -1127,12 +1177,12 @@ function applyToTimeline(payloadStr) {
    payloadStr: { videoTrackIndex, startSec, endSec, mogrtPath, params[] }
 ══════════════════════════════════════════════ */
 function updateClipAtTime(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch (e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
 
     var seq = app.project.activeSequence;
     if (!seq) return "ERROR: 활성 시퀀스 없음";
-    try { app.enableQE(); } catch (e) {}
+    ensureQE();
 
     var trackIdx = payload.videoTrackIndex || 2;
     var startSec = payload.startSec;
@@ -1160,7 +1210,7 @@ function updateClipAtTime(payloadStr) {
 
     if (!targetClip) {
         if (!payload.mogrtPath) return "ERROR: 클립 없음 + mogrtPath 미지정";
-        var startTicks = String(Math.round(startSec * 254016000000));
+        var startTicks = secToTicks(startSec);
         // 트랙 내 동일 MOGRT 클립의 projectItem 재사용 시도 (importMGT 회피)
         var cachedProjItem = null;
         var mogrtFileName = payload.mogrtPath.replace(/\\/g, '/').split('/').pop();
@@ -1219,7 +1269,7 @@ function addTextLayer(seq, text, startSec, endSec, trackIdx) {
     try { qeSeq = qe.project.getActiveSequence(); } catch(e) {}
 
     if (qeSeq) {
-        var startTicks = String(Math.round(startSec * 254016000000));
+        var startTicks = secToTicks(startSec);
         try {
             var clip = qeSeq.addTextClip(text, startTicks, trackIdx);
             if (clip) {
@@ -1243,6 +1293,13 @@ function addTextLayer(seq, text, startSec, endSec, trackIdx) {
 }
 
 function addLegacyTextLayer(seq, text, startSec, endSec, trackIdx) {
+    /* 구 Titler API. Premiere 26.5.1에서 app.project.createNewTitle이 제거되었다
+       (typeof 확인: undefined). 프리셋 없이 자막만 얹는 폴백 경로였는데
+       더는 동작하지 않는다. 호출부가 예외를 잡아 failCount로만 세고 있어
+       사용자에게 원인이 드러나지 않았다. 이유를 담아 던진다. */
+    if (typeof app.project.createNewTitle !== "function") {
+        throw new Error("이 Premiere 버전은 구 Titler API(createNewTitle)를 지원하지 않아 프리셋 없는 자막 배치가 불가합니다. 자막에 프리셋을 지정하세요.");
+    }
     var title = app.project.createNewTitle(app.project.rootItem, "SubTitle_" + Math.round(startSec));
     if (!title) return;
     var titleObj = title.getTitle();
@@ -1264,8 +1321,8 @@ function addLegacyTextLayer(seq, text, startSec, endSec, trackIdx) {
    11. 타임라인 이동: 특정 시간으로 CTI 이동
 ══════════════════════════════════════════════ */
 function seekToClip(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch (e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
 
     var seq = app.project.activeSequence;
     if (!seq) return "ERROR: 활성 시퀀스 없음";
@@ -1285,12 +1342,12 @@ function seekToClip(payloadStr) {
    12. 프리뷰: 타임라인 첫 번째 클립에 파라미터 적용
 ══════════════════════════════════════════════ */
 function previewParamsOnFirstClip(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch (e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
 
     var seq = app.project.activeSequence;
     if (!seq) return "ERROR: 활성 시퀀스 없음";
-    try { app.enableQE(); } catch (e) {}
+    ensureQE();
 
     var trackIdx = payload.videoTrackIndex || 2;
     var params   = payload.params || [];
@@ -1317,8 +1374,8 @@ function previewParamsOnFirstClip(payloadStr) {
    반환: [{ startSec, endSec, mogrtName }] JSON
 ══════════════════════════════════════════════ */
 function getTimelineClips(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch (e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
 
     var seq = app.project.activeSequence;
     if (!seq) return "ERROR: 활성 시퀀스 없음";
@@ -1351,8 +1408,8 @@ function getTimelineClips(payloadStr) {
    반환: [ParamDef] JSON (getMogrtParams와 동일 구조)
 ══════════════════════════════════════════════ */
 function syncFromTimeline(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch (e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
 
     var seq = app.project.activeSequence;
     if (!seq) return "ERROR: 활성 시퀀스 없음";
@@ -1496,13 +1553,13 @@ function syncFromTimeline(payloadStr) {
    반환: "SUCCESS" or "ERROR:..."
 ══════════════════════════════════════════════ */
 function setupPreviewSequence(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch(e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
     var mogrtPath = payload.mogrtPath || "";
     var durationSec = payload.durationSec || 5;
     if (!mogrtPath) return "ERROR: mogrtPath 없음";
 
-    try { app.enableQE(); } catch(e) {}
+    ensureQE();
 
     var proj = app.project;
     if (!proj) return "ERROR: 프로젝트 없음";
@@ -1513,19 +1570,8 @@ function setupPreviewSequence(payloadStr) {
     var originalActiveSeq = null;
     try { originalActiveSeq = proj.activeSequence; } catch(e) {}
 
-    var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";
-    var previewSeq = null;
-
     // 기존 프리뷰 시퀀스 찾기
-    var seqCount = 0;
-    try { seqCount = proj.sequences.numSequences; } catch(e) {}
-    for (var si = 0; si < seqCount; si++) {
-        var s;
-        try { s = proj.sequences[si]; } catch(e) { continue; }
-        if (s && String(s.name) === PREVIEW_SEQ_NAME) {
-            previewSeq = s; break;
-        }
-    }
+    var previewSeq = findPreviewSequence();
 
     // 없으면 qe.project.newSequence로 다이얼로그 없이 생성
     if (!previewSeq) {
@@ -1613,7 +1659,7 @@ function setupPreviewSequence(payloadStr) {
 
         // qe.project.newSequence → 다이얼로그 없이 생성
         try {
-            app.enableQE();
+            ensureQE();
             qe.project.newSequence(PREVIEW_SEQ_NAME, sqPresetPath);
         } catch(e) {
             return "ERROR: qe.project.newSequence 실패 - " + e.message;
@@ -1745,24 +1791,14 @@ function setupPreviewSequence(payloadStr) {
    반환: "SUCCESS" or "ERROR:..."
 ══════════════════════════════════════════════ */
 function applyPreviewParams(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch(e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
     var params = payload.params || [];
 
-    var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";
     var proj = app.project;
     if (!proj) return "ERROR: 프로젝트 없음";
 
-    var previewSeq = null;
-    var seqCount = 0;
-    try { seqCount = proj.sequences.numSequences; } catch(e) {}
-    for (var si = 0; si < seqCount; si++) {
-        var s;
-        try { s = proj.sequences[si]; } catch(e) { continue; }
-        if (s && String(s.name) === PREVIEW_SEQ_NAME) {
-            previewSeq = s; break;
-        }
-    }
+    var previewSeq = findPreviewSequence();
     if (!previewSeq) return "ERROR: 프리뷰 시퀀스 없음";
 
     // V2(트랙 1)에서 클립 찾기 (V1은 배경용으로 보존)
@@ -1793,18 +1829,10 @@ function applyPreviewParams(payloadStr) {
    반환: JSON 배열 [{index, displayName, type, rawValue, value}] or "ERROR:..."
 ══════════════════════════════════════════════ */
 function getPreviewClipParams() {
-    var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";
     var proj = app.project;
     if (!proj) return "ERROR: 프로젝트 없음";
 
-    var previewSeq = null;
-    var seqCount = 0;
-    try { seqCount = proj.sequences.numSequences; } catch(e) {}
-    for (var si = 0; si < seqCount; si++) {
-        var s;
-        try { s = proj.sequences[si]; } catch(e) { continue; }
-        if (s && String(s.name) === PREVIEW_SEQ_NAME) { previewSeq = s; break; }
-    }
+    var previewSeq = findPreviewSequence();
     if (!previewSeq) return "ERROR: 프리뷰 시쿀스 없음";
 
     var previewTrack = null;
@@ -1883,12 +1911,11 @@ function getPreviewClipParams() {
    반환: "SUCCESS:경로" or "ERROR:..."
 ══════════════════════════════════════════════ */
 function capturePreviewFrame(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch(e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
     var outputPath = payload.outputPath || "";
     if (!outputPath) return "ERROR: outputPath 없음";
 
-    var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";
     var proj = app.project;
     if (!proj) return "ERROR: 프로젝트 없음";
 
@@ -1902,18 +1929,9 @@ function capturePreviewFrame(payloadStr) {
     } catch(e) {}
 
     // QE DOM 활성화
-    try { app.enableQE(); } catch(e) {}
+    ensureQE();
 
-    var previewSeq = null;
-    var seqCount = 0;
-    try { seqCount = proj.sequences.numSequences; } catch(e) {}
-    for (var si = 0; si < seqCount; si++) {
-        var s;
-        try { s = proj.sequences[si]; } catch(e) { continue; }
-        if (s && String(s.name) === PREVIEW_SEQ_NAME) {
-            previewSeq = s; break;
-        }
-    }
+    var previewSeq = findPreviewSequence();
     if (!previewSeq) return "ERROR: 프리뷰 시퀀스 없음";
 
     // ExtendScript Folder.temp 기반 임시 경로 사용
@@ -1932,7 +1950,7 @@ function capturePreviewFrame(payloadStr) {
     // 파일 생성 대기는 JS 쪽에서 폴링으로 처리 (app.js runPreviewCapture 이미 구현됨)
     var ctiTimecode = "00:00:00:00";
     try {
-        app.enableQE();
+        ensureQE();
         // 프리뷰 시퀀스를 일시 활성화 (캐쳐에 필요)
         setActiveSequence(previewSeq);
         var qeSeq = qe.project.getActiveSequence();
@@ -2126,9 +2144,8 @@ function syncAllClipsFromTimeline(trackIndex) {
 ══════════════════════════════════════════════ */
 function saveTextFile(payloadStr) {
     var payload;
-    try { payload = JSON.parse(decodeURIComponent(payloadStr)); } catch(e) {
-        try { payload = JSON.parse(payloadStr); } catch(e2) { return "ERROR: JSON 파싱 실패"; }
-    }
+    payload = parsePayloadMaybeEncoded(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
     var filePath = payload.path;
     var content = payload.content;
     if (!filePath) return "ERROR: 경로 없음";
@@ -2151,9 +2168,8 @@ function saveTextFile(payloadStr) {
 ══════════════════════════════════════════════ */
 function saveTextFileWithDialog(payloadStr) {
     var payload;
-    try { payload = JSON.parse(decodeURIComponent(payloadStr)); } catch(e) {
-        try { payload = JSON.parse(payloadStr); } catch(e2) { return "ERROR: JSON 파싱 실패"; }
-    }
+    payload = parsePayloadMaybeEncoded(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
     var defaultName = payload.defaultName || "export.json";
     var content = payload.content || "";
     try {
@@ -2519,21 +2535,13 @@ function getSystemFonts() {
    반환: "SUCCESS:JSON" 또는 "ERROR:..."
 ══════════════════════════════════════════════ */
 function debugGetTextParamValue(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch(e) { return "ERROR: JSON \ud30c\uc2f1 \uc2e4\ud328"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON \ud30c\uc2f1 \uc2e4\ud328";
 
-    var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";
     var proj = app.project;
     if (!proj) return "ERROR: \ud504\ub85c\uc81d\ud2b8 \uc5c6\uc74c";
 
-    var previewSeq = null;
-    var seqCount = 0;
-    try { seqCount = proj.sequences.numSequences; } catch(e) {}
-    for (var si = 0; si < seqCount; si++) {
-        var s;
-        try { s = proj.sequences[si]; } catch(e) { continue; }
-        if (s && String(s.name) === PREVIEW_SEQ_NAME) { previewSeq = s; break; }
-    }
+    var previewSeq = findPreviewSequence();
     if (!previewSeq) return "ERROR: \ud504\ub9ac\ubdf0 \uc2dc\ud000\uc2a4 \uc5c6\uc74c";
 
     var previewTrack = null;
@@ -2589,21 +2597,13 @@ function debugGetTextParamValue(payloadStr) {
 }
 
 function debugApplyFont(payloadStr) {
-    var payload;
-    try { payload = JSON.parse(payloadStr); } catch(e) { return "ERROR: JSON 파싱 실패"; }
+    var payload = parsePayload(payloadStr);
+    if (!payload) return "ERROR: JSON 파싱 실패";
 
-    var PREVIEW_SEQ_NAME = "__MOGRT_PREVIEW__";
     var proj = app.project;
     if (!proj) return "ERROR: 프로젝트 없음";
 
-    var previewSeq = null;
-    var seqCount = 0;
-    try { seqCount = proj.sequences.numSequences; } catch(e) {}
-    for (var si = 0; si < seqCount; si++) {
-        var s;
-        try { s = proj.sequences[si]; } catch(e) { continue; }
-        if (s && String(s.name) === PREVIEW_SEQ_NAME) { previewSeq = s; break; }
-    }
+    var previewSeq = findPreviewSequence();
     if (!previewSeq) return "ERROR: 프리뷰 시퀀스 없음";
 
     var previewTrack = null;
