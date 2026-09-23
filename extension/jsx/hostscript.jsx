@@ -1,6 +1,10 @@
 /*
- * hostscript.jsx  v24
+ * hostscript.jsx  v25
  * Premiere Pro ExtendScript
+ * - v25 변경사항:
+ *   1. setActiveSequence(): Premiere 26.x에서 제거된 Sequence.setActive() 대체.
+ *      기존 11곳의 seq.setActive() 호출은 try/catch에 감싸서 조용히 실패하고 있었다.
+ *   2. getMogrtParams(): Premiere 네이티브 템플릿을 판별해 원인을 알려주는 메시지로 교체.
  * - v24 변경사항:
  *   1. detectParamType(): 컬러 감지를 숫자 체크보다 먼저 수행 (64비트 ARGB 범위 체크 추가)
  *   2. getMogrtParams(): 텍스트 파라미터에 fontExposed 플래그 추가
@@ -17,6 +21,19 @@
  *   3. seekToClip(payloadStr): 타임라인을 특정 클립 위치로 이동
  *   4. getClipInfo(payloadStr): 특정 시간의 클립 존재 여부 반환
  */
+
+/* ── 시퀀스 활성화 ──
+   Premiere 26.x에서 Sequence.setActive()가 제거되었다(26.5.1에서 typeof 확인: undefined).
+   기존 코드는 seq.setActive()를 try/catch로 감싸 불렀기 때문에, 실패해도
+   조용히 무시되어 활성 시퀀스가 __MOGRT_PREVIEW__에 머무르는 문제가 있었다.
+   app.project.activeSequence 대입이 대체로 동작한다(26.5.1 확인).
+   구버전 호환을 위해 setActive가 있으면 그쪽을 먼저 쓴다. */
+function setActiveSequence(seq) {
+    if (!seq) return false;
+    try { if (typeof seq.setActive === "function") { seq.setActive(); return true; } } catch(e) {}
+    try { app.project.activeSequence = seq; return true; } catch(e) {}
+    return false;
+}
 
 /* ── JSON Polyfill ── */
 if (typeof JSON === "undefined") { JSON = {}; }
@@ -476,18 +493,33 @@ function getMogrtParams(mogrtPath) {
     var item;
     try { item = seq.importMGT(mogrtPath, "0", 0, 0); } catch (e) {
         // 실패해도 원래 시퀀스 복원
-        try { if (originalActiveSeq) originalActiveSeq.setActive(); } catch(re) {}
+        setActiveSequence(originalActiveSeq);
         return "ERROR: importMGT 실패 - " + e.message;
     }
     if (!item) {
-        try { if (originalActiveSeq) originalActiveSeq.setActive(); } catch(re) {}
+        setActiveSequence(originalActiveSeq);
         return "ERROR: importMGT null 반환";
     }
 
     var result = [];
     try {
         var comp = item.getMGTComponent();
-        if (!comp) { try { item.remove(false, false); } catch(e) {} return "ERROR: getMGTComponent null"; }
+        if (!comp) {
+            /* getMGTComponent는 AE에서 만든 MOGRT(내부에 AE.ADBE Capsule 컴포넌트를 가진다)에서만
+               값을 돌려준다. Premiere 필수 그래픽 패널로 만든 네이티브 템플릿은
+               삽입 결과가 이름 "Graphic"인 일반 그래픽 클립이고 Capsule이 없어 null이 된다.
+               둘을 구별해 원인을 알려준다. */
+            var hasCapsule = false;
+            try {
+                for (var ci = 0; ci < item.components.numItems; ci++) {
+                    if (String(item.components[ci].matchName) === "AE.ADBE Capsule") { hasCapsule = true; break; }
+                }
+            } catch(e) {}
+            var looksNative = (!hasCapsule && String(item.name) === "Graphic");
+            try { item.remove(false, false); } catch(e) {}
+            if (looksNative) return "ERROR: Premiere 네이티브 템플릿이라 파라미터를 읽을 수 없습니다. After Effects에서 만든 MOGRT를 사용하세요.";
+            return "ERROR: getMGTComponent null";
+        }
         if (!comp.properties) { try { item.remove(false, false); } catch(e) {} return "ERROR: comp.properties null"; }
 
         var props = comp.properties;
@@ -681,14 +713,14 @@ function getMogrtParams(mogrtPath) {
     } catch (e) {
         try { item.remove(false, false); } catch(e2) {}
         // 오류 시에도 원래 시퀀스 복원
-        try { if (originalActiveSeq) originalActiveSeq.setActive(); } catch(re) {}
+        setActiveSequence(originalActiveSeq);
         return "ERROR: " + e.message;
     }
 
     try { item.remove(false, false); } catch (e) {}
 
     // importMGT 완료 후 원래 활성 시퀀스로 복원
-    try { if (originalActiveSeq) originalActiveSeq.setActive(); } catch(e) {}
+    setActiveSequence(originalActiveSeq);
 
     // app.js에서 JSZip으로 definition.json을 파싱할 수 있도록 mogrtPath를 메타로 포함
     return JSON.stringify({ params: result, mogrtPath: mogrtPath });
@@ -1640,12 +1672,12 @@ function setupPreviewSequence(payloadStr) {
         newClip = previewSeq.importMGT(mogrtPath, startTicks, 1, 0);
     } catch(e) {
         // importMGT 실패해도 원래 시퀀스 복원
-        try { if (originalActiveSeq) originalActiveSeq.setActive(); } catch(re) {}
+        setActiveSequence(originalActiveSeq);
         return "ERROR: importMGT 실패 - " + e.message;
     }
 
     // importMGT 직후 즉시 원래 시퀀스로 복원
-    try { if (originalActiveSeq) originalActiveSeq.setActive(); } catch(e) {}
+    setActiveSequence(originalActiveSeq);
 
     if (!newClip) return "ERROR: importMGT null";
 
@@ -1685,7 +1717,7 @@ function setupPreviewSequence(payloadStr) {
         // 재배치 시도 (트랙 1 강제) - originalActiveSeq는 함수 시작 시 저장된 값 유지
         try { newClip = previewSeq.importMGT(mogrtPath, startTicks, 1, 0); } catch(e) {}
         // 재배치 후에도 즉시 복원
-        try { if (originalActiveSeq) originalActiveSeq.setActive(); } catch(e) {}
+        setActiveSequence(originalActiveSeq);
         if (!newClip) return "ERROR: V2 재배치 실패";
     }
 
@@ -1902,10 +1934,10 @@ function capturePreviewFrame(payloadStr) {
     try {
         app.enableQE();
         // 프리뷰 시퀀스를 일시 활성화 (캐쳐에 필요)
-        try { previewSeq.setActive(); } catch(e) {}
+        setActiveSequence(previewSeq);
         var qeSeq = qe.project.getActiveSequence();
         if (!qeSeq) {
-            if (originalSeq) { try { originalSeq.setActive(); } catch(e4) {} }
+            setActiveSequence(originalSeq);
             return "ERROR: QE 활성 시퀀스 없음";
         }
         try { ctiTimecode = qeSeq.CTI.timecode; } catch(e2) {}
@@ -1922,13 +1954,13 @@ function capturePreviewFrame(payloadStr) {
         } catch(e) {}
         qeSeq.exportFrameJPEG(ctiTimecode, jpgPath);
         // 원래 시퀀스 즉시 복원 ($.sleep 없이)
-        if (originalSeq) { try { originalSeq.setActive(); } catch(e4) {} }
+        setActiveSequence(originalSeq);
         // 파일 생성 대기 없이 즉시 PENDING 반환 → JS 쪽에서 폴링
         return "PENDING:" + actualJpgPath.replace(/\\/g, "/");
     } catch(e) {
         var seqName2 = "";
         try { seqName2 = (typeof qeSeq !== 'undefined' && qeSeq) ? qeSeq.name : ""; } catch(e3) {}
-        if (originalSeq) { try { originalSeq.setActive(); } catch(e4) {} }
+        setActiveSequence(originalSeq);
         return "ERROR: QE exportFrameJPEG err=[" + (e.message || String(e)) + "] | seqName=[" + seqName2 + "] | cti=[" + ctiTimecode + "] | path=[" + jpgPath + "]";
     }
 }
