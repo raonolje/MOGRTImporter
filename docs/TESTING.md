@@ -1,0 +1,100 @@
+# TESTING
+
+MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시서는 `docs/MULTISPEAKER_PLAN.md` §13이다.
+
+## 1. 한눈에
+
+| 층 | 명령 | 무엇을 | 언제 |
+|---|---|---|---|
+| 단위 | `npm test` | 패널 순수 로직(app.js region), 호스트 순수 블록, 도구 | 커밋마다. 2초 안 |
+| 린트 | `npm run lint:jsx` | hostscript.jsx의 `MI:BEGIN`~`MI:END` 구역이 ES3인지 | JSX를 바꾼 커밋마다 |
+| 하드 | `npm run hard` / `node tests/premiere/run.js …` | DEV 패널(7778)을 CDP로 몰아 Premiere에서 확인 | 커밋의 하드 케이스, JSX 변경 뒤 |
+
+커밋 관문: `npm test` 초록 → (JSX면) `npm run lint:jsx` 초록 → 그 커밋의 하드 케이스와 스모크가 DEV에서 초록 → (JSX면) Premiere 재시작 뒤 단일 화자 골든 케이스.
+
+## 2. 단위 테스트 (node)
+
+- Node 24.14, 의존성 없음. `npm test` = `node --test "tests/unit/**/*.test.js" "tests/compat/**/*.test.js"`.
+- **글롭 인자가 필수다.** `node --test tests/unit`처럼 폴더를 넘기면 Node 24.14는 폴더를 테스트 파일로 실행하다 실패한다.
+- `tests/lib/loadRegions.js`
+  - `loadRegions(["src/srtParser.ts"])`: app.js의 `//#region <이름>` ~ `//#endregion` 블록을 잘라 `node:vm`에서 실행하고 최상위 함수·상수를 돌려준다. 빌드가 없으니 패널이 로드하는 바로 그 파일이다.
+  - vm에는 `console`, `TextDecoder`, `TextEncoder`만 있다.
+  - 순수성 가드: 불러오는 region이 `document`, `window`, `state.`, `host.`, `localStorage`, `cep`, `CSInterface`를 쓰면 예외. 주석·문자열 속 단어는 보지 않는다. 새 순수 로직은 `//#region src/mi/core.ts`에 둔다.
+  - `loadHostPure()`: hostscript.jsx의 `/* MI_PURE_BEGIN */`~`/* MI_PURE_END */`(ES3)를 그대로 node에서 실행한다. S2-1 전에는 `{}`.
+  - `regionHash(name)`: region 본문의 fnv1a32(8자리 hex). 5단계 MCP 드리프트 검사에 쓴다.
+  - vm 객체는 프로토타입이 달라 `assert.deepStrictEqual`이 실패한다. 비교 전에 `plain(v)`를 쓴다.
+- `tests/unit/legacy_parseSRT.test.js`는 v27 골든이다. 깨지면 단일 화자 가져오기가 v27과 달라진 것이다.
+- **픽스처는 합성 텍스트만** 넣는다(`tests/fixtures/`). 저장소에 GitHub 원격이 있다. `tests/fixtures/**`는 `-text`라 CRLF·CR·BOM 바이트가 그대로 커밋된다.
+- `tests/compat/` (S1-5부터): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지).
+
+## 3. ES3 린트
+
+- `npm run lint:jsx` = `node tests/lib/es3lint.js extension/jsx/hostscript.jsx`. v27 코드는 보지 않고 `/* MI:BEGIN v28 */`~`/* MI:END */`만 본다. 구역이 없으면 통과.
+- 금지: `let`, `const`, `=>`, `class`, 템플릿 문자열, `.forEach/.map/.filter/.some/.every/.reduce(`, `Array.isArray`, 배열 `indexOf`, `.trim(`, `Object.keys/create`(와 ES5 Object.*), `.bind(`, `Date.now`, `.normalize(`, get/set 리터럴, 예약어 속성 이름(`x.default`, `{new: …}`), `JSON.*`(→ `MI__json`, `parsePayload`), ES2015+ 문자열·정적 메서드, 전개, `for…of`, 기본 매개변수.
+- `indexOf`는 정적으로 배열/문자열을 구분할 수 없다. 수신자가 문자열 리터럴, `String(…)`, `(x + "")`, 문자열 메서드 결과(`.toLowerCase()`, `.join(…)` 등)일 때만 통과한다. 문자열이면 `String(name).indexOf("[MI:")`처럼 감싸고, 배열 멤버십은 `MI__idx(arr, x)`를 쓴다.
+
+## 4. DEV 사본 (운영과 부딪히지 않게)
+
+| | 운영 | DEV |
+|---|---|---|
+| 폴더 | `%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter` | `…/CEP_MogrtImporter_dev` |
+| 번들 id / 패널 id | `com.raonolje.mogrtimporter` / `….panel` | `com.raonolje.mogrtimporter.dev` / `….dev.panel` |
+| 메뉴 | MOGRT Subtitle Importer | MOGRT Subtitle Importer (DEV) |
+| 디버그 포트 | 7777 | 7778 |
+| 호스트 전역 접두사 | `MI_`, `MI__` | `MID_`, `MID__` (`\bMI_` → `MID_`) |
+| 빌드 스탬프 `@@BUILD@@` | `prod-<sha>` | `dev-<sha>` (작업 트리가 더러우면 `dev-<sha>-d<시각>`) |
+| 캐시 | `<운영 폴더>/cache` | `<DEV 폴더>/cache` (구조상 분리) |
+
+- `tools/install_dev.sh`: 저장소 `extension/`(작업 트리)을 임시 사본으로 만들어 위 변환을 하고(`tools/lib/stamp.js`), 검사한 뒤 DEV 폴더에 **지우지 않고 덮어쓴다**. DEV의 `cache/`는 건드리지 않는다. 설치 전후 운영 폴더의 sha1 목록을 비교해 운영이 그대로인지 알려 준다. 설치한 빌드는 `CEP_MogrtImporter_dev/.mi_build`에 적는다.
+  - `--seed-cache`: 운영 캐시를 DEV 캐시로 복사한다. 운영은 읽기만 하고, 기존 DEV 캐시는 `cache_prev_<시각>`으로 옮겨 둔다.
+  - `--uninstall`: `CEP_MogrtImporter_dev`만 지운다. Premiere가 꺼져 있어야 하고, 폴더의 manifest가 DEV 신원일 때만 지운다.
+  - `MI_CEP_EXT_DIR`: extensions 폴더를 바꿔 모의 설치할 때만 쓴다.
+- 클립 태그 `[MI:`에는 밑줄이 없어서 이름 바꾸기에 걸리지 않는다. 태그 정규식은 DEV에서도 그대로다.
+- 예전 스크래치 도구 `devswap.sh`(운영을 extensions 밖으로 치우고 7788로 설치)는 쓰지 않는다. 운영을 치워 둔 상태라면 먼저 `devswap.sh off`로 되돌린다.
+
+### 규칙
+
+- **DEV로 테스트하는 동안 운영 패널은 닫아 둔다.** 두 패널의 100 ms 폴러가 서로 경쟁한다.
+- **JSX를 바꿨으면 반드시 Premiere를 다시 시작한다.** hostscript.jsx는 재시작 전까지 캐시되고, 모든 CEP 확장이 전역 범위를 같이 쓴다(마지막에 로드된 것이 이긴다, spike #16).
+- app.js·index.html만 바꿨으면 재시작 없이 `node tests/premiere/cdp.js --port 7778 --reload`로 패널만 새로 고친다.
+- 테스트에서 `app.project.closeDocument`를 쓰지 않는다(패널이 내려가 재시작 전까지 돌아오지 않는다).
+
+### JSX 변경 절차
+
+1. `tools/install_dev.sh`
+2. Premiere 종료
+3. Premiere 실행 → **Ctrl+O**로 `C:/Users/RAONOLJE/Documents/MI_test/MI_test.prproj` (명령줄로 여는 것은 한글 경로에서 실패했다)
+4. 창 > 확장 > MOGRT Subtitle Importer (DEV)
+5. `node tests/premiere/run.js --port 7778 --check-build`
+6. `npm run hard`
+
+## 5. 하드 테스트 (CDP)
+
+- `tests/premiere/cdp.js`: CDP 클라이언트. 기본 7778이고 대상 페이지 URL이 `CEP_MogrtImporter_dev`여야 붙는다. 7777은 `--prod`일 때만.
+- `tests/premiere/run.js [--port 7778] [--timeout ms] [--no-guard] [--check-build] [--reload] <file>…`
+  - `.expr.txt`: `---` 줄로 나눈 페이지 표현식. top-level `await` 가능. 예외가 나면 실패.
+  - `.jsx`: 패널의 `CSInterface`로 `$.evalFile`. DEV에서는 `\bMI_`를 `MID_`로 바꾸고 한글은 `\uXXXX`로 바꾼 임시 사본을 쓴다(상대 `#include`는 안 된다). `EvalScript error.`면 실패.
+  - `.case.js`: `module.exports = { run: async ({ panel, host, mi, assert, log, reload, info }) => … }`
+    - `panel(expr)` 페이지에서 평가, `host(jsx)` 호스트에서 평가(문자열), `mi(name, payload)` `MID_<name>("<JSON>")` 호출 후 JSON 파싱. 페이로드는 ASCII 리터럴로 넘겨 U+2028/2029와 한글이 안전하다.
+  - `--check-build`: 설치된 빌드(DEV hostscript의 `MID_BUILD` 또는 `.mi_build`)와 `MID_ping().build`, 패널 `status.build`(있으면)를 비교한다. 호스트에 `MID_ping`이 없으면(S2-1 전) 건너뛴다. 다르면 Premiere를 다시 시작한다.
+  - 종료 코드: 0 통과, 1 실패, 2 연결 실패, 3 가드 거부, 64 사용법.
+- **가드**(`tests/premiere/lib/guard.js`): 열린 프로젝트가 `MI_test.prproj`이고 활성 시퀀스 이름이 `T_`로 시작할 때만 `.jsx`·`.case.js`(와 기본으로 `.expr.txt`)를 실행한다. 확인은 v27 `getActiveSequenceInfo()`로 한다.
+- `npm run hard` (`tests/premiere/suite.js`): 가드 → `smoke.expr.txt` → `cases/*.case.js`(이름순). `npm run hard -- s1_9`처럼 이름 일부로 거른다.
+- 스모크(`tests/premiere/smoke.expr.txt`, 읽기 전용): `window._mogrtDebug`가 object, `getActiveSequenceInfo()`가 seqId를 돌려준다.
+
+### 테스트 프로젝트
+
+- `C:/Users/RAONOLJE/Documents/MI_test/MI_test.prproj` (MOGRT_probe.prproj 사본)
+- 시퀀스: `T_23976`(1920x1080), `T_2997`, `T_25`, `T_5994`, `T_TC1h`(시작 TC 01:00:00:00), `T_BIG`(V1 600클립 + V3 MOGRT 150클립)
+- 각 시퀀스: V1 영상, 빈 V2+, V4에 외부 PNG 하나. 케이스는 템플릿 시퀀스를 복제하거나 V2+를 스스로 비운다.
+
+## 6. 운영 배포
+
+- `tools/deploy_prod.sh` — Premiere가 **꺼진** 상태에서만.
+  1. 운영 캐시와 코드를 `%APPDATA%/MOGRT_Importer_backup/<시각>/{cache,code}`(extensions/ 밖)로 백업하고 파일 수·바이트(캐시는 sha1까지)를 검증한다.
+  2. `git archive HEAD`로 만든 임시 사본에 `prod-<sha>`를 찍어 CSXS·html·jsx·README.md·.debug를 **지우지 않고 덮어쓴다**. cache/는 대상이 아니다. extension/에 커밋 안 된 변경이 있으면 거부한다.
+  3. 복사한 파일을 하나씩 비교하고 캐시 sha1 목록이 배포 전과 같은지 확인한다.
+- `--dry-run`: 바뀔 파일만 보여 주고, 운영 캐시의 파일 수·바이트·최신 mtime·sha1이 그대로인지 확인한다. 운영·백업 폴더에 쓰지 않는다.
+- `--rollback <ref>`: 같은 절차로 `<ref>`의 extension/을 배포한다. 롤백 기준 태그는 `v27`(0aa8b82, 로컬 태그).
+- `installer_v1.1.6.exe`로 업그레이드·롤백하지 않는다(캐시가 설치 폴더 안에 있다).
+- 배포 뒤 Premiere를 열고 읽기 전용 스모크: `node tests/premiere/run.js --prod --port 7777 tests/premiere/smoke.expr.txt` (`--prod`는 `.expr.txt`만 받는다).

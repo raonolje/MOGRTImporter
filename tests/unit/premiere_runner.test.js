@@ -1,0 +1,195 @@
+"use strict";
+// S0-2: CDP 실행기(tests/premiere)의 순수 부분. Premiere·CDP 포트에는 붙지 않는다.
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { checkGuard, guard, GuardError } = require("../premiere/lib/guard");
+const { Cdp, checkPort, pickTarget } = require("../premiere/cdp");
+const R = require("../premiere/run");
+const { caseFiles } = require("../premiere/suite");
+
+const TEST_PROJ = "C:\\Users\\RAONOLJE\\Documents\\MI_test\\MI_test.prproj";
+
+test("guard: MI_test.prproj의 T_ 시퀀스만 통과", () => {
+	assert.deepEqual(checkGuard({ projPath: TEST_PROJ, seqName: "T_23976" }), { ok: true });
+	assert.deepEqual(checkGuard({ projPath: "C:/x/MI_test.prproj", seqName: "T_TC1h" }), { ok: true });
+	const refuse = (info, re) => {
+		const r = checkGuard(info);
+		assert.equal(r.ok, false);
+		assert.match(r.reason, re);
+	};
+	refuse({ projPath: "C:\\Users\\RAONOLJE\\Documents\\EP12\\EP12.prproj", seqName: "T_23976" }, /테스트 프로젝트가 아니다/);
+	refuse({ projPath: "C:/x/MI_test.prproj.bak", seqName: "T_1" }, /테스트 프로젝트가 아니다/);
+	refuse({ projPath: "C:/x/NOT_MI_test.prproj", seqName: "T_1" }, /테스트 프로젝트가 아니다/);
+	refuse({ projPath: TEST_PROJ, seqName: "EP12 편집" }, /테스트 시퀀스가 아니다/);
+	refuse({ projPath: TEST_PROJ, seqName: "" }, /활성 시퀀스가 없다/);
+	refuse({ projPath: "", seqName: "T_1" }, /경로/);
+	refuse(null, /경로/);
+});
+
+test("guard(host): MI_test 밖에서는 GuardError, 안에서는 정보를 돌려준다", async () => {
+	const hostOf = (obj) => async (jsx) => {
+		assert.equal(jsx, "getActiveSequenceInfo()");
+		return typeof obj === "string" ? obj : JSON.stringify(obj);
+	};
+	await assert.rejects(guard(hostOf({ seqId: "a", seqName: "EP12", projPath: "D:/work/EP12.prproj" })), GuardError);
+	await assert.rejects(guard(hostOf("EvalScript error.")), /읽지 못했다/);
+	const info = await guard(hostOf({ seqId: "abc", seqName: "T_25", projPath: TEST_PROJ }));
+	assert.equal(info.seqId, "abc");
+});
+
+test("checkPort: 7777은 --prod일 때만, --prod는 7777에서만", () => {
+	assert.equal(checkPort(7778), 7778);
+	assert.equal(checkPort("7778"), 7778);
+	assert.throws(() => checkPort(7777), /운영 패널/);
+	assert.equal(checkPort(7777, { prod: true }), 7777);
+	assert.throws(() => checkPort(7778, { prod: true }), /--prod/);
+	assert.throws(() => checkPort("abc"), /포트/);
+});
+
+test("pickTarget: DEV는 CEP_MogrtImporter_dev 페이지만, 운영은 운영 페이지만", () => {
+	const dev = { type: "page", url: "file:///C:/Users/R/AppData/Roaming/Adobe/CEP/extensions/CEP_MogrtImporter_dev/html/index.html", webSocketDebuggerUrl: "ws://dev" };
+	const prod = { type: "page", url: "file:///C:/Users/R/AppData/Roaming/Adobe/CEP/extensions/CEP_MogrtImporter/html/index.html", webSocketDebuggerUrl: "ws://prod" };
+	const other = { type: "page", url: "file:///C:/x/MCPBridgeCEP/index.html", webSocketDebuggerUrl: "ws://o" };
+	assert.equal(pickTarget([other, dev]).webSocketDebuggerUrl, "ws://dev");
+	assert.throws(() => pickTarget([prod, other]), /DEV\(CEP_MogrtImporter_dev\)/);
+	assert.equal(pickTarget([dev, prod], { prod: true }).webSocketDebuggerUrl, "ws://prod");
+	assert.throws(() => pickTarget([dev], { prod: true }), /운영/);
+	assert.throws(() => pickTarget([{ type: "service_worker", url: "x" }]), /페이지 대상이 없다/);
+	const broken = { ...dev, url: dev.url.replace("index.html", "index%E0%A4.html") };
+	assert.equal(pickTarget([broken]).webSocketDebuggerUrl, "ws://dev");
+});
+
+test("splitExprs: '---' 줄로 나누고 CRLF·빈 조각을 정리한다", () => {
+	const ex = R.splitExprs("// a\n1 + 1\r\n---\r\n\n// b\n2\n---\n\n---  \n");
+	assert.deepEqual(ex.map((e) => e.label), ["// a", "// b"]);
+	assert.equal(ex[0].code, "// a\n1 + 1");
+	assert.deepEqual(R.splitExprs("a --- b"), [{ label: "a --- b", code: "a --- b" }]);
+	assert.deepEqual(R.splitExprs("---\n1\n---\n2\n---").map((e) => e.code), ["1", "2"]);
+});
+
+test("smoke.expr.txt: 두 표현식이 있고 문법이 맞다", () => {
+	const file = path.join(__dirname, "..", "premiere", "smoke.expr.txt");
+	const ex = R.splitExprs(fs.readFileSync(file, "utf8"));
+	assert.equal(ex.length, 2);
+	assert.match(ex[0].code, /_mogrtDebug/);
+	assert.match(ex[1].code, /getActiveSequenceInfo\(\)/);
+	const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+	for (const e of ex) assert.doesNotThrow(() => new AsyncFunction(e.code), e.label);
+});
+
+test("jsxString: ASCII만 쓰고, 값은 그대로 되돌아온다", () => {
+	const samples = ["", "a\"b'c\\d", "줄\n바꿈\r\t탭", "\u2028\u2029", "철수 [MI:ab12-1.1]", "😀 이모지", "\u0000\u001f\u007f"];
+	for (const s of samples) {
+		const lit = R.jsxString(s);
+		assert.match(lit, /^[\x20-\x7e]*$/, "ASCII 출력");
+		assert.equal(eval(lit), s);
+	}
+});
+
+test("hostCallSource: payload JSON을 ASCII 리터럴로 넘긴다 (U+2028 안전)", () => {
+	const payload = { seqId: "8f1c", text: "앞\u2028뒤 \"따옴표\"", n: 3 };
+	const src = R.hostCallSource("MID_ping", payload);
+	assert.match(src, /^MID_ping\("[\x20-\x7e]*"\)$/);
+	const got = new Function("MID_ping", "return " + src)((s) => s);
+	assert.deepEqual(JSON.parse(got), payload);
+	assert.equal(R.hostCallSource("MID_ping"), "MID_ping()");
+	assert.throws(() => R.hostCallSource("x); evil(", {}), /함수 이름/);
+});
+
+test("asciiJsx / evalScriptExpr: 비ASCII는 \\u 이스케이프, 뜻은 그대로", () => {
+	const src = "var s = \"가\u2028나\"; // 주석 한글\nvar r = /철수/.test(\"철수\"); s + r";
+	const a = R.asciiJsx(src);
+	assert.match(a, /^[\x00-\x7f]*$/);
+	assert.equal(eval(a), eval(src.replace("\u2028", "\\u2028")));
+	assert.match(R.evalScriptExpr(src), /^[\x00-\x7f]*$/);
+	assert.match(R.evalScriptExpr("getActiveSequenceInfo()"), /new CSInterface\(\)\.evalScript\("getActiveSequenceInfo\(\)"/);
+});
+
+test("rewriteMiForDev: spike .jsx의 MI_ 호출을 MID_로", () => {
+	assert.equal(R.rewriteMiForDev("MI_ping(); MI__json(1); '[MI:a-1.1]'"), "MID_ping(); MID__json(1); '[MI:a-1.1]'");
+});
+
+test("runFile: --prod는 .expr.txt만, --no-guard는 .expr.txt에만", async () => {
+	const client = {}; // 종류 검사에서 먼저 거부되므로 쓰이지 않는다
+	await assert.rejects(R.runFile(client, "x.jsx", { prod: true }), /--prod에서는/);
+	await assert.rejects(R.runFile(client, "x.case.js", { prod: true }), /--prod에서는/);
+	await assert.rejects(R.runFile(client, "x.case.js", { guard: false }), /--no-guard/);
+	await assert.rejects(R.runFile(client, "x.txt", {}), /모르는 파일 종류/);
+});
+
+test("parseArgs: 기본 7778, 7777은 --prod 필요", () => {
+	assert.equal(R.parseArgs(["a.expr.txt"]).port, 7778);
+	assert.throws(() => R.parseArgs(["--port", "7777", "a.expr.txt"]), /운영 패널/);
+	assert.equal(R.parseArgs(["--prod", "--port", "7777", "a.expr.txt"]).prod, true);
+	assert.equal(R.parseArgs(["--check-build"]).checkBuild, true);
+	assert.throws(() => R.parseArgs([]), /파일이 없다/);
+});
+
+test("expectedBuild: 설치본 hostscript의 MID_BUILD, 없으면 .mi_build", () => {
+	const ext = fs.mkdtempSync(path.join(os.tmpdir(), "mi_ext_"));
+	try {
+		const dev = path.join(ext, "CEP_MogrtImporter_dev");
+		fs.mkdirSync(path.join(dev, "jsx"), { recursive: true });
+		fs.writeFileSync(path.join(dev, "jsx", "hostscript.jsx"), "function a() {}\n");
+		fs.writeFileSync(path.join(dev, ".mi_build"), "dev-0aa8b82\ninstalled …\n");
+		assert.equal(R.expectedBuild({ extDir: ext }).build, "dev-0aa8b82");
+		fs.writeFileSync(path.join(dev, "jsx", "hostscript.jsx"), "var MID_VERSION = 28, MID_BUILD = 'dev-1234567-d1';\n");
+		assert.equal(R.expectedBuild({ extDir: ext }).build, "dev-1234567-d1");
+		assert.equal(R.expectedBuild({ extDir: ext, prod: true }).build, null);
+	} finally { fs.rmSync(ext, { recursive: true, force: true }); }
+});
+
+test("suite: cases 폴더가 없거나 비면 빈 목록, 필터는 이름 부분 일치", () => {
+	assert.ok(Array.isArray(caseFiles([])));
+	assert.deepEqual(caseFiles(["__없는_케이스__"]), []);
+});
+
+// 가짜 WebSocket으로 Cdp의 요청·응답·예외·이벤트 처리를 확인한다
+function fakeWs(handler) {
+	const ws = {
+		sent: [],
+		send(txt) {
+			const msg = JSON.parse(txt);
+			ws.sent.push(msg);
+			setImmediate(() => handler(msg, (obj) => ws.onmessage({ data: JSON.stringify(obj) })));
+		},
+		close() {}
+	};
+	return ws;
+}
+
+test("Cdp.evaluate: 값, 예외, 오류 응답", async () => {
+	const ws = fakeWs((msg, reply) => {
+		const expr = msg.params.expression;
+		if (expr === "ok") reply({ id: msg.id, result: { result: { type: "string", value: "v" } } });
+		else if (expr === "undef") reply({ id: msg.id, result: { result: { type: "undefined" } } });
+		else if (expr === "throw") reply({ id: msg.id, result: { result: {}, exceptionDetails: { exception: { description: "Error: 터짐\n    at x" } } } });
+		else reply({ id: msg.id, error: { message: "bad" } });
+	});
+	const c = new Cdp(ws, { url: "x" }, { timeoutMs: 1000 });
+	assert.equal(await c.evaluate("ok"), "v");
+	assert.equal(await c.evaluate("undef"), undefined);
+	await assert.rejects(c.evaluate("throw"), /Error: 터짐$/);
+	await assert.rejects(c.evaluate("?"), /bad/);
+	assert.equal(ws.sent[0].params.awaitPromise, true);
+	assert.equal(ws.sent[0].params.replMode, true);
+});
+
+test("Cdp.reload: load 이벤트를 기다리고 그동안의 콘솔을 돌려준다", async () => {
+	const ws = fakeWs((msg, reply) => {
+		reply({ id: msg.id, result: {} });
+		if (msg.method === "Page.reload") {
+			setImmediate(() => {
+				reply({ method: "Runtime.consoleAPICalled", params: { type: "log", args: [{ type: "string", value: "부팅" }] } });
+				reply({ method: "Runtime.exceptionThrown", params: { exceptionDetails: { exception: { description: "TypeError: x" } } } });
+				reply({ method: "Page.loadEventFired", params: {} });
+			});
+		}
+	});
+	const c = new Cdp(ws, { url: "x" }, { timeoutMs: 1000 });
+	const logs = await c.reload({ settleMs: 0 });
+	assert.deepEqual(logs, ["[log] \"부팅\"", "[EXCEPTION] TypeError: x"]);
+});

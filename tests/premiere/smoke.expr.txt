@@ -1,0 +1,15 @@
+// 스모크 1: 패널 디버그 훅 (읽기 전용)
+(() => {
+	if (typeof window._mogrtDebug !== "object" || !window._mogrtDebug) throw new Error("window._mogrtDebug가 object가 아니다: " + typeof window._mogrtDebug);
+	return "window._mogrtDebug: object";
+})()
+---
+// 스모크 2: 호스트 getActiveSequenceInfo가 seqId를 돌려준다 (읽기 전용)
+await new Promise((resolve, reject) => {
+	new CSInterface().evalScript("getActiveSequenceInfo()", (v) => {
+		let o;
+		try { o = JSON.parse(v); } catch (e) { reject(new Error("JSON이 아니다: " + v)); return; }
+		if (!o.seqId) reject(new Error("seqId가 없다: " + v));
+		else resolve("seqId " + o.seqId + " / " + o.seqName);
+	});
+})
