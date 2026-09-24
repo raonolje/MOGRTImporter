@@ -2,3 +2,5 @@
 *.exe binary
 *.min.js -diff linguist-vendored
 CSInterface.js -diff linguist-vendored
+# 테스트 픽스처는 바이트 그대로 (CRLF·CR·BOM 골든)
+tests/fixtures/** -text
