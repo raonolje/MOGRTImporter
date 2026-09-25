@@ -12,12 +12,12 @@ const ROOT = process.env.MI_REAL_CACHE || "";
 const skip = !ROOT || !fs.existsSync(ROOT) ? "MI_REAL_CACHE가 없다" : false;
 const REF = /"presetId"\s*:\s*"preset_(\d+)"/g;
 
-// 앱의 _scanDiskPresetRefs와 같은 규칙: <projKey>/*/{session,history_auto,history_manual,history_safety}.json의 가장 큰 번호
-function diskRefMax(projDir) {
+// 앱의 _scanDiskPresetRefs와 같은 규칙: <projKey>/*/PRESET_REF_FILES의 가장 큰 번호 (파일 목록은 앱의 상수를 그대로 쓴다)
+function diskRefMax(projDir, files) {
 	let max = 0;
 	for (const e of fs.readdirSync(projDir, { withFileTypes: true })) {
 		if (!e.isDirectory()) continue;
-		for (const f of ["session.json", "history_auto.json", "history_manual.json", "history_safety.json"]) {
+		for (const f of files) {
 			const p = path.join(projDir, e.name, f);
 			if (!fs.existsSync(p)) continue;
 			const text = fs.readFileSync(p, "utf8");
@@ -30,13 +30,14 @@ function diskRefMax(projDir) {
 }
 
 test("운영 캐시: 새 프리셋 id는 살아 있는 id·휴지통 id·디스크의 모든 참조보다 크다", { skip }, (t) => {
-	const { nextFreePresetId, presetNum } = loadRegions(["src/mi/core.ts"]);
+	const { nextFreePresetId, presetNum, PRESET_REF_FILES } = loadRegions(["src/mi/core.ts"]);
+	assert.ok(Array.from(PRESET_REF_FILES).includes("cast.json"), "앱이 훑는 파일 목록");
 	const projects = fs.readdirSync(ROOT, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
 	let checked = 0;
 	for (const pk of projects) {
 		const projDir = path.join(ROOT, pk);
 		const presetsPath = path.join(projDir, "presets.json");
-		const disk = diskRefMax(projDir);
+		const disk = diskRefMax(projDir, Array.from(PRESET_REF_FILES));
 		if (!fs.existsSync(presetsPath)) {
 			t.diagnostic(pk + ": presets.json 없음, 디스크 최대 참조 " + disk);
 			continue;

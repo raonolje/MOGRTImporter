@@ -73,6 +73,9 @@ test("safeNextId: max(복원 nextId, hwm+1, 현재 nextId, 최대 id+1)", () => 
 	assert.equal(core.safeNextId({ nextId: 30, subtitles: [], trashBin: [] }, 0), 30);
 	assert.equal(core.safeNextId({}), 1);
 	assert.equal(core.safeNextId(null, null, null), 1);
+	// 타입이 틀린 파일(배열이 아닌 subtitles·trashBin)에서 던지지 않는다
+	assert.equal(core.safeNextId({ nextId: 7, subtitles: {}, trashBin: {} }, 64), 65);
+	assert.equal(core.safeNextId({ nextId: 7, subtitles: "x", trashBin: 3 }), 7);
 });
 
 test("remapIds: 줄 id와 rowStates 키가 함께 바뀌고 휴지통도 새 id를 받는다", () => {

@@ -270,3 +270,47 @@ test("네이티브: definition을 읽지 못한 캐시로 기존 프리셋을 �
 	assert.deepEqual(h.snapshot().presets.preset_9.params.map((p) => p.displayName), ["Insert Name Here", "ADD TITLE HERE"]);
 	noErrors(h);
 });
+
+test("네이티브: '텍스트 N'으로 저장된 프리셋은 definition을 읽을 수 있어도 첫 번째·두 번째 열기의 이름이 같고(프리셋 이름), 저장해도 바뀌지 않는다", async () => {
+	const { NATIVE } = build();
+	const p9 = { id: "preset_9", name: "v27 네이티브", mogrtPath: nativePath, params: clone(NATIVE), exposedIndices: [0, 1], textParamIndex: 0, exposedFontFields: {}, thumbnailData: null };
+	const h = await boot({ mogrts: [{ name: "Classic", path: nativePath }], params: { [nativePath]: clone(NATIVE) }, files: { [nativePath]: "ZmFrZQ==", [P.presets(PROJ)]: presetsFile([p9]) } });
+	const calls = { n: 0 };
+	withJsZip(h, nativeDef(2), calls);
+	const labels = () => h.$("defaultModalBody").querySelectorAll(".modal-text-block-header .modal-mogrt-label").map((x) => x.textContent);
+	await openEdit(h);
+	assert.equal(calls.n, 1, "첫 번째 열기는 캐시가 없어 definition을 읽었다");
+	assert.deepEqual(labels(), ["텍스트 1", "텍스트 2"], "열기 1 (캐시 없음)");
+	assert.deepEqual(h.snapshot().mogrtOriginals[nativePath].map((p) => p.displayName), ["Insert Name Here", "ADD TITLE HERE"], "캐시는 definition 이름");
+	h.$("btnSaveDefault").click();
+	if (h.$("confirmModal").classList.contains("open")) h.$("confirmYes").click();
+	assert.deepEqual(h.snapshot().presets.preset_9.params.map((p) => p.displayName), ["텍스트 1", "텍스트 2"], "저장해도 프리셋 이름 그대로");
+	await openEdit(h);
+	assert.equal(calls.n, 1, "두 번째는 캐시");
+	assert.deepEqual(labels(), ["텍스트 1", "텍스트 2"], "열기 2 (캐시)");
+	noErrors(h);
+});
+
+test("네이티브: 편집 중인 프리셋과 다른 MOGRT를 고르면 그 템플릿의 이름을 쓴다 (프리셋 이름을 옮겨 붙이지 않는다)", async () => {
+	const { NATIVE } = build();
+	const otherPath = "D:/MOGRT/Other Native.mogrt";
+	const named = clone(NATIVE);
+	named[0].displayName = "옛 이름 A";
+	named[1].displayName = "옛 이름 B";
+	const p9 = { id: "preset_9", name: "네이티브 저장본", mogrtPath: nativePath, params: named, exposedIndices: [0, 1], textParamIndex: 0, exposedFontFields: {}, thumbnailData: null };
+	const h = await boot({
+		mogrts: [{ name: "Classic", path: nativePath }, { name: "Other", path: otherPath }],
+		params: { [nativePath]: clone(NATIVE), [otherPath]: clone(NATIVE) },
+		files: { [nativePath]: "ZmFrZQ==", [otherPath]: "ZmFrZQ==", [P.presets(PROJ)]: presetsFile([p9]) }
+	});
+	withJsZip(h, nativeDef(2));
+	const labels = () => h.$("defaultModalBody").querySelectorAll(".modal-text-block-header .modal-mogrt-label").map((x) => x.textContent);
+	await openEdit(h);
+	assert.deepEqual(labels(), ["옛 이름 A", "옛 이름 B"]);
+	h.$("defaultMogrtSel").value = otherPath;
+	h.change(h.$("defaultMogrtSel"));
+	await h.flush();
+	await h.advance(10);
+	assert.deepEqual(labels(), ["Insert Name Here", "ADD TITLE HERE"]);
+	noErrors(h);
+});

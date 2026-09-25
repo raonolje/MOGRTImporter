@@ -380,8 +380,11 @@
 		setSubtitles(Array.isArray(sdata.subtitles) ? sdata.subtitles : [], { reason: failed ? reason + " (읽기 실패)" : r.exists ? reason : reason + " (파일 없음)", persist: false });
 		state.rowStates = sdata.rowStates && typeof sdata.rowStates === "object" ? sdata.rowStates : {};
 		state.trashBin = Array.isArray(sdata.trashBin) ? sdata.trashBin : [];
-		state.nextId = r.exists ? safeNextId(sdata) : 1;
+		// mi를 먼저 넣는다: 아래에서 예외가 나도 이전 시퀀스의 salt·화자 표가 이 키에 남지 않는다.
+		// nextId는 hwm 위로 (cast.json에서 되살린 hwm이 파일의 nextId보다 클 수 있다: v27 복원·작업 불러오기가
+		// nextId를 내리고 mi 없이 저장한 경우). 줄·휴지통은 위에서 거른 배열로 본다 (파일의 타입이 틀려도 던지지 않게)
 		state.mi = _miForLoadedSession(r.data || null);
+		state.nextId = r.exists ? safeNextId({ nextId: sdata.nextId, subtitles: state.subtitles, trashBin: state.trashBin }, state.mi.hwm) : 1;
 	}
 	function loadSessionFromStorage() {
 		try {
@@ -409,6 +412,30 @@
 		const usedPresets = new Set(Object.values(state.rowStates).map((rs) => rs.presetId).filter(Boolean));
 		usedPresets.forEach((pid) => _getPresetColorIndex(pid));
 	}
+	// 안전 지점 복원용: 복원한 줄(rowStates)이 가리키는데 살아 있지 않은 프리셋을 프리셋 휴지통에서 되살린다.
+	// 프리셋 가져오기(교체)·프리셋 삭제가 줄의 연결을 끊으며 휴지통에 보낸 프리셋이다. 프리셋 id는 다시 주지 않으므로
+	// 휴지통의 같은 id가 바로 그 프리셋이다 (같은 id가 여럿이면 가장 나중에 버린 것).
+	// 휴지통에도 없으면(비웠다) 그대로 둔다 → 뒤따르는 _sanitizeOrphanPresets()가 연결을 끊는다.
+	// → 되살린 프리셋 수. 호출한 쪽이 savePresetsToStorage()와 프리셋 목록·휴지통 다시 그리기를 한다
+	function _revivePresetsForRows(rowStates) {
+		const want = {};
+		Object.values(rowStates || {}).forEach((rs) => {
+			if (rs && rs.presetId && !state.presets[rs.presetId]) want[rs.presetId] = true;
+		});
+		let n = 0;
+		Object.keys(want).forEach((id) => {
+			for (let i = state.presetTrash.length - 1; i >= 0; i--) {
+				const t = state.presetTrash[i];
+				if (t && t.preset && t.preset.id === id) {
+					state.presetTrash.splice(i, 1);
+					state.presets[id] = migratePreset(t.preset);
+					n++;
+					return;
+				}
+			}
+		});
+		return n;
+	}
 	// ── 프리셋 id 참조 (메모리 밖) ──
 	// 메모리(프리셋·휴지통·지금 시퀀스의 행)에 없는데 id를 가리키는 곳: 이 프로젝트의 다른 시퀀스
 	// session.json과 히스토리, 불러온 작업 파일. v27 가져오기가 카운터를 1로 되돌리고 프리셋을
@@ -424,7 +451,7 @@
 		const e = _presetRefEntry();
 		if (n > e.max) e.max = n;
 	}
-	// cache/<projKey>/*/{session,history_auto,history_manual,history_safety,cast}.json의 "presetId":"preset_N" 중 가장 큰 N.
+	// cache/<projKey>/*/PRESET_REF_FILES({session,history_auto,history_manual,history_safety,cast}.json)의 "presetId":"preset_N" 중 가장 큰 N.
 	// 파싱하지 않고 글자로만 찾는다 (깨진 파일도 본다). 프로젝트 키마다 한 번 (처음 id를 줄 때).
 	// 그 뒤로 디스크에 새로 생기는 참조는 살아 있거나 휴지통에 있던 프리셋의 것이라 카운터가 덮는다.
 	function _scanDiskPresetRefs() {
@@ -440,7 +467,7 @@
 			if (!ls || ls.err !== 0 || !Array.isArray(ls.data)) return;
 			const re = /"presetId"\s*:\s*"preset_(\d+)"/g;
 			ls.data.forEach((name) => {
-				["session.json", "history_auto.json", "history_manual.json", "history_safety.json", "cast.json"].forEach((f) => {
+				PRESET_REF_FILES.forEach((f) => {
 					const r = fsx.readFile(dir + "/" + name + "/" + f);
 					if (!r || r.err !== 0 || !r.data) return;
 					let m;
@@ -938,6 +965,8 @@
 	//   2) 아니면 아직 쓰이지 않은 줄 텍스트 필드 중 같은 이름의 첫 번째 → "name"
 	//   3) 그래도 없으면 빠진다 (그 ID로는 쓰지 않는다)
 	// presetParams가 없으면 줄 자신의 서수로만 매긴다.
+	// 둘 다 네이티브 목록이면 이름을 보지 않고 서수로만 짝짓는다 (이름은 표시용이고 호스트는 서수로 쓴다:
+	// '텍스트 N'으로 저장된 줄과 definition 문구로 이름이 붙은 프리셋도 같은 필드다).
 	function resolveFields(rowParams, presetParams) {
 		const rowT = textFields(rowParams);
 		const out = {};
@@ -947,6 +976,10 @@
 			return out;
 		}
 		const preT = textFields(presetParams);
+		if (isNativeList(rowParams) && isNativeList(presetParams)) {
+			preT.forEach((pt, k) => { if (rowT[k]) out[pt.fid] = mk(rowT[k], pt.fid, "ordinal"); });
+			return out;
+		}
 		const used = {};
 		preT.forEach((pt, k) => {
 			const rt = rowT[k];
@@ -1125,6 +1158,8 @@
 
 	// ── id ──
 
+	// 시퀀스 폴더에서 "presetId":"preset_N" 참조를 글자로 훑는 파일 (_scanDiskPresetRefs와 운영 캐시 호환 테스트가 함께 쓴다)
+	const PRESET_REF_FILES = ["session.json", "history_auto.json", "history_manual.json", "history_safety.json", "cast.json"];
 	// "preset_12" → 12, 형식이 아니면 0
 	function presetNum(id) {
 		const m = /^preset_(\d+)$/.exec(String(id == null ? "" : id));
@@ -1194,6 +1229,7 @@
 		return { subtitles, rowStates: rsOut, trashBin, nextId: next, map };
 	}
 	// 복원 뒤의 nextId: max(복원한 nextId, hwm + 1, 현재 nextId, 복원한 줄·휴지통의 최대 id + 1)
+	// 배열이 아닌 subtitles·trashBin은 비어 있는 것으로 본다 (타입이 틀린 파일에서 던지지 않는다)
 	function safeNextId(data, hwm, curNext) {
 		let n = Math.max(1, parseInt(data && data.nextId, 10) || 1);
 		const h = parseInt(hwm, 10);
@@ -1201,8 +1237,9 @@
 		const c = parseInt(curNext, 10);
 		if (c > n) n = c;
 		const see = (id) => { const v = parseInt(id, 10); if (v >= n) n = v + 1; };
-		((data && data.subtitles) || []).forEach((s) => { if (s) see(s.id); });
-		((data && data.trashBin) || []).forEach((t) => { if (t && t.sub) see(t.sub.id); });
+		const arr = (x) => (Array.isArray(x) ? x : []);
+		arr(data && data.subtitles).forEach((s) => { if (s) see(s.id); });
+		arr(data && data.trashBin).forEach((t) => { if (t && t.sub) see(t.sub.id); });
 		return n;
 	}
 	// sequenceKey의 GUID 부분 ("proj_x_seq_<GUID>" → GUID). 이름 기반 키·기본 키는 null
@@ -2397,6 +2434,8 @@
 	}
 	function bindTrashEvents() {
 		document.getElementById("btnEmptyTrash")?.addEventListener("click", () => {
+			// 휴지통의 줄은 비우면 되돌릴 수 없다 → 먼저 안전 지점을 남긴다
+			if (state.trashBin.length > 0) _saveSafety("휴지통 비우기 전");
 			state.trashBin = [];
 			renderTrash();
 			saveSessionToStorage();
@@ -2587,6 +2626,9 @@
 		showConfirm(msg, () => doDeletePreset(pid));
 	}
 	function doDeletePreset(pid) {
+		// 줄의 프리셋 설정(후반 작업 값 포함)을 비우기 전에 안전 지점을 남긴다.
+		// 그 안전 지점을 복원하면 프리셋도 휴지통에서 함께 되살아난다 (_revivePresetsForRows)
+		if (state.subtitles.some((sub) => state.rowStates[sub.id]?.presetId === pid)) _saveSafety("프리셋 삭제 전: " + (state.presets[pid].name || pid));
 		state.presetTrash.push({
 			preset: JSON.parse(JSON.stringify(state.presets[pid])),
 			deletedAt: (/* @__PURE__ */ new Date()).toISOString()
@@ -3938,6 +3980,18 @@ var modalState = {
 		return "";
 	}
 
+	// 네이티브 목록의 필드 이름은 기존 프리셋 것이 이긴다. 캐시가 없을 때(definition 패치 뒤)와 캐시가 있을 때
+	// 같은 규칙이라 두 번 열어도 이름이 같다. v27에서 '텍스트 N'으로 저장한 프리셋도 그 이름을 지킨다
+	// (저장하며 이름이 바뀌면 다른 시퀀스·히스토리의 줄에 남은 옛 이름과 어긋난다). 이름은 표시용이다 (호스트는 서수로 쓴다).
+	// 프리셋이 같은 MOGRT의 네이티브 목록일 때만 (모달에서 다른 MOGRT를 고르면 그 템플릿의 이름을 쓴다)
+	function _carryNativeNames(list, preset, mogrtPath) {
+		if (!preset || !isNativeList(list) || !isNativeList(preset.params)) return;
+		if (String(preset.mogrtPath || "") !== String(mogrtPath || "")) return;
+		list.forEach((p) => {
+			const ep = p ? preset.params.find((x) => x && x.index === p.index) : null;
+			if (ep && ep.displayName) p.displayName = ep.displayName;
+		});
+	}
 	// 모달 파라미터 읽기 요청 번호 (프리뷰 시퀀스를 준비하는 사이 다른 MOGRT를 고르면 이전 요청은 버린다)
 	let _modalLoadSeq = 0;
 	function loadMogrtForModal(mogrtPath, presetId) {
@@ -3992,17 +4046,15 @@ var modalState = {
 					if (!state.mogrtOriginals[mogrtPath]) state.mogrtOriginals[mogrtPath] = pristine;
 				};
 				const existingPreset = presetId ? state.presets[presetId] : null;
-				const nativeList = isNativeList(freshList);
 				if (existingPreset) freshList.forEach((p) => {
 					const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
 					if (ep) {
 						p.value = ep.value;
 						if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
 						if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
-						// 네이티브는 필드 이름도 프리셋 것 (아래 definition 패치가 이름을 읽으면 그것으로 바뀐다)
-						if (nativeList && ep.displayName) p.displayName = ep.displayName;
 					}
 				});
+				_carryNativeNames(freshList, existingPreset, mogrtPath);
 				modalState.paramList = freshList;
 				modalState.mogrtPath = mogrtPath;
 				modalState.presetId = presetId;
@@ -4054,6 +4106,8 @@ var modalState = {
 									const def = JSON.parse(defStr);
 									patchParamsFromDefinition(freshList, def);
 									patchParamsFromDefinition(pristine, def);
+									// 패치가 네이티브 이름을 definition 문구로 바꿨다 → 기존 프리셋의 이름을 다시 얹는다 (캐시 히트와 같은 규칙)
+									_carryNativeNames(freshList, existingPreset, mogrtPath);
 								} catch(_) {}
 								cacheOriginals();
 								// patchParamsFromDefinition 이후 신규 프리셋이면 fontExposed 기반으로 exposedFontFields 재계산
@@ -4099,17 +4153,15 @@ var modalState = {
 		// 깊은 복사로 원본 캐시 보호
 		const freshList = JSON.parse(JSON.stringify(cachedList));
 		const existingPreset = presetId ? state.presets[presetId] : null;
-		const nativeList = isNativeList(freshList);
 		if (existingPreset) freshList.forEach((p) => {
 			const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
 			if (ep) {
 				p.value = ep.value;
 				if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
 				if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
-				// 네이티브는 필드 이름도 프리셋 것 (definition을 못 읽은 캐시로 열어 다시 저장해도 이름이 '텍스트 N'으로 돌아가지 않게)
-				if (nativeList && ep.displayName) p.displayName = ep.displayName;
 			}
 		});
+		_carryNativeNames(freshList, existingPreset, mogrtPath);
 		modalState.paramList = freshList;
 		modalState.mogrtPath = mogrtPath;
 		modalState.presetId = presetId;
@@ -4558,6 +4610,12 @@ var modalState = {
 			const newPid = sel.value;
 			const checkedIds = Object.entries(state.rowStates).filter(([, rs]) => rs.checked).map(([id]) => parseInt(id, 10));
 			if (checkedIds.length > 0 && checkedIds.includes(sub.id)) {
+				// 여러 줄의 속성(후반 작업 값 포함)을 한꺼번에 새로 채우거나 비운다 → 잃을 값이 있으면 먼저 안전 지점
+				const losesValues = checkedIds.length > 1 && checkedIds.some((tid) => {
+					const trs = state.rowStates[tid];
+					return !!trs && ((trs._allParams || []).length > 0 || (trs.params || []).length > 0);
+				});
+				if (losesValues) _saveSafety("프리셋 일괄 적용 전");
 				checkedIds.forEach((tid) => {
 					const tsub = state.subtitles.find((s) => s.id === tid);
 					if (!tsub) return;
@@ -5873,10 +5931,12 @@ var modalState = {
 						}
 						const plan = matchImportedPresets(accepted.map((a) => ({ id: a.pid, name: a.p.name, mogrtPath: a.p.mogrtPath })), live);
 						let lostRows = 0;
+						let safeSaved = false;
 						if (clearFirst) {
 							lostRows = Object.values(state.rowStates).filter((rs) => rs && rs.presetId && plan.dropped.indexOf(rs.presetId) !== -1).length;
-							// 줄의 프리셋 연결이 끊기기 전에 안전 지점을 남긴다 (프리셋은 프리셋 휴지통에 남는다)
-							if (lostRows > 0) _saveSafety("프리셋 가져오기 전");
+							// 줄의 프리셋 연결이 끊기기 전에 안전 지점을 남긴다 (프리셋은 프리셋 휴지통에 남고,
+							// 그 안전 지점을 복원하면 휴지통에서 함께 되살아난다: _revivePresetsForRows)
+							if (lostRows > 0) safeSaved = _saveSafety("프리셋 가져오기 전");
 							const deletedAt = new Date().toISOString();
 							plan.dropped.forEach((id) => {
 								state.presetTrash.push({ preset: JSON.parse(JSON.stringify(live[id])), deletedAt, why: "import" });
@@ -5914,8 +5974,10 @@ var modalState = {
 						updatePresetTabCount();
 						let msg = "프리셋 불러오기: " + imported + "개 " + (clearFirst ? "교체" : "추가");
 						if (kept > 0) msg += " (ID 유지 " + kept + "개" + (moved > 0 ? ", 그중 MOGRT 경로가 바뀐 프리셋 " + moved + "개" : "") + ")";
-						// 끊긴 줄은 '프리셋 없음'으로 저장된다. 프리셋을 휴지통에서 복구해도 줄은 다시 이어지지 않는다
-						const lostMsg = lostRows > 0 ? lostRows + "개 줄의 프리셋 연결이 끊어졌습니다 (이전 프리셋은 프리셋 휴지통에 있습니다. 줄에는 다시 지정해야 합니다)" : "";
+						// 끊긴 줄은 '프리셋 없음'으로 저장된다. 프리셋을 휴지통에서 복구해도 줄은 다시 이어지지 않는다.
+						// 안전 지점을 복원하면 줄의 연결과 프리셋이 함께 돌아온다
+						const lostMsg = lostRows > 0 ? lostRows + "개 줄의 프리셋 연결이 끊어졌습니다 (이전 프리셋은 프리셋 휴지통에 있습니다. " +
+							(safeSaved ? "히스토리의 안전 지점 '프리셋 가져오기 전'을 복원하면 줄과 프리셋이 함께 돌아옵니다" : "줄에는 다시 지정해야 합니다") + ")" : "";
 						if (lostMsg) msg += " · " + lostMsg;
 						if (skipped > 0) {
 							msg += ", " + skipped + "개 스킵";
@@ -6192,7 +6254,7 @@ var modalState = {
 			safetySection.style.cssText = "border-bottom:1px solid #333;padding:5px 10px 6px;";
 			const safetyHeader = document.createElement("div");
 			safetyHeader.style.cssText = "font-size:10px;color:#888;margin-bottom:4px;";
-			safetyHeader.title = "SRT 가져오기·히스토리 복원·작업 불러오기·프리셋 저장·프리셋 가져오기 직전의 상태 (자동저장이 밀어내지 않습니다)";
+			safetyHeader.title = "SRT 가져오기·히스토리 복원·작업 불러오기·프리셋 저장·프리셋 가져오기·프리셋 삭제·프리셋 일괄 적용·휴지통 비우기 직전의 상태 (자동저장이 밀어내지 않습니다)";
 			safetyHeader.innerHTML = '안전 지점 <span style="color:#555;">' + safetyList.length + '/' + SAFETY_MAX + '</span>';
 			safetySection.appendChild(safetyHeader);
 			if (safetyList.length === 0) {
@@ -6271,6 +6333,21 @@ var modalState = {
 							_saveTrackToStorage(); // 복원한 트랙도 settings.json에 (다시 열어도 그대로)
 						}
 					}
+					// 안전 지점: 줄이 가리키던 프리셋이 그 뒤 프리셋 휴지통으로 갔으면(프리셋 가져오기·삭제) 함께 되살린다.
+					// 되살리지 못한 연결은 아래 정리가 끊는다. 자동·수동 항목은 v27처럼 연결만 끊는다
+					let note = "";
+					if (kind === "safety") {
+						const revived = _revivePresetsForRows(state.rowStates);
+						if (revived > 0) {
+							savePresetsToStorage();
+							renderPresetList();
+							renderPresetTrash();
+							updatePresetTabCount();
+							note += " · 프리셋 " + revived + "개를 프리셋 휴지통에서 되살렸습니다";
+						}
+						const lost = Object.values(state.rowStates || {}).filter((rs) => rs && rs.presetId && !state.presets[rs.presetId]).length;
+						if (lost > 0) note += " · 프리셋이 없어 " + lost + "개 줄의 연결을 끊었습니다";
+					}
 					_sanitizeOrphanPresets();
 					renderAll();
 					renderTrash();
@@ -6278,7 +6355,7 @@ var modalState = {
 					saveSessionToStorage();
 					const dd = document.getElementById("historyDropdown");
 					if (dd) dd.classList.remove("open");
-					setStatus("히스토리 복원: " + (entry.subtitles ? entry.subtitles.length : 0) + "개", "ok");
+					setStatus("히스토리 복원: " + (entry.subtitles ? entry.subtitles.length : 0) + "개" + note, "ok");
 				}
 			);
 		});
@@ -6292,9 +6369,14 @@ var modalState = {
 			e.stopPropagation();
 			try {
 				const list2 = _loadHistoryList(kind);
-				// 드롭다운을 연 뒤 목록이 바뀌었을 수 있다(자동저장·안전 지점) → 시각·이름이 같은 항목을 지운다
-				let at = list2.findIndex((x) => x && x.ts === entry.ts && x.label === entry.label);
-				if (at === -1) at = idx;
+				// 드롭다운을 연 뒤 목록이 바뀌었을 수 있다(자동저장·안전 지점) → 시각·이름이 같은 항목을 지운다.
+				// 그 사이 밀려나 이미 없으면 아무것도 지우지 않는다 (그 자리의 다른 항목을 지우지 않게)
+				const at = list2.findIndex((x) => x && x.ts === entry.ts && x.label === entry.label);
+				if (at === -1) {
+					_buildHistoryDropdown();
+					setStatus("이미 없는 항목입니다 (목록을 새로 그렸습니다)", "err");
+					return;
+				}
 				list2.splice(at, 1);
 				_saveHistoryList(list2, kind);
 				_updateHistoryBtn();

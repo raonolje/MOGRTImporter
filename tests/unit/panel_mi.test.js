@@ -152,6 +152,42 @@ test("v27이 mi를 버리고 저장한 세션 + cast.json: spk 줄 id ≤ hwm이
 	noErrors(h);
 });
 
+test("cast.json에서 되살린 hwm이 파일의 nextId보다 크면 nextId를 hwm 위로 올린다 (다음 SRT가 쓴 id를 다시 받지 않는다)", async () => {
+	// v27 복원·작업 불러오기가 nextId를 내리고 mi 없이 저장한 모양: spk 줄 57·58, nextId 59, cast.json hwm 64
+	const v27 = session([sub(57, 1, "철수 하나", "C1"), sub(58, 2, "영희 하나", "C2")], { nextId: 59 });
+	const side = Object.assign({ v: 1, savedAt: "2026-09-25T00:00:00Z" }, clone(miBlock()));
+	delete side.applied;
+	delete side.remapped;
+	const h = await boot({ files: { [P.session(PROJ, A.seqId)]: v27, [P.cast(PROJ, A.seqId)]: side } });
+	let s = h.snapshot();
+	assert.deepEqual([s.mi.salt, s.mi.hwm, s.nextId], ["k7q2", 64, 65]);
+	await h.dropSrt("새.srt", "1\n00:00:01,000 --> 00:00:02,000\n가\n");
+	s = h.snapshot();
+	assert.ok(s.subtitles.every((x) => x.id > 64), "새 id " + JSON.stringify(s.subtitles.map((x) => x.id)));
+	noErrors(h);
+});
+
+test("타입이 틀린 session.json(trashBin·subtitles가 객체)으로 가도 이전 시퀀스의 mi·nextId가 새지 않는다", async () => {
+	const bSess = session([sub(1, 1, "B 줄")]);
+	bSess.trashBin = {};
+	const cSess = { subtitles: {}, rowStates: {}, trashBin: [], nextId: 4 };
+	const h = await boot({ files: { [P.session(PROJ, A.seqId)]: castSession(), [P.session(PROJ, B.seqId)]: clone(bSess), [P.session(PROJ, C.seqId)]: clone(cSess) } });
+	assert.equal(h.snapshot().mi.salt, "k7q2");
+	await switchTo(h, B);
+	let s = h.snapshot();
+	assert.deepEqual(s.mi, DEFAULT_MI);
+	assert.deepEqual([s.subtitles.length, s.trashBin, s.nextId], [1, [], 2]);
+	h.win._mogrtDebug.saveSession();
+	const bFile = h.fs.readJson(P.session(PROJ, B.seqId));
+	assert.equal(bFile.mi, undefined, "B에 A의 mi를 쓰지 않는다");
+	assert.equal(h.fs.files.has(P.cast(PROJ, B.seqId)), false, "B의 cast.json을 만들지 않는다");
+	await switchTo(h, A);
+	await switchTo(h, C);
+	s = h.snapshot();
+	assert.deepEqual([s.mi, s.subtitles, s.nextId], [DEFAULT_MI, [], 4]);
+	noErrors(h);
+});
+
 // ── 히스토리 ──
 
 test("히스토리: 화자 표가 있으면 항목에 mi 스냅숏(salt·hwm·applied 제외), 복원은 salt를 지키고 nextId를 내리지 않는다", async () => {

@@ -101,8 +101,8 @@ test("preset_3이 다른 MOGRT인 파일: 옛 preset_3은 휴지통(why import),
 	assert.equal(fresh.mogrtPath, "D:/MOGRT/다른 템플릿.mogrt");
 	assert.deepEqual([1, 2, 3].map((i) => s.rowStates[i].presetId), ["preset_1", "", ""]);
 	assert.deepEqual([1, 2, 3].map((i) => h.$("sel-" + i).value), ["preset_1", "", ""], "행 select도 프리셋 없음");
-	// 휴지통 복구로 줄이 다시 이어지지는 않는다 → 복구 가능하다고 말하지 않는다
-	assert.match(h.status().text, /2개 줄의 프리셋 연결이 끊어졌습니다 \(이전 프리셋은 프리셋 휴지통에 있습니다\. 줄에는 다시 지정해야 합니다\)/);
+	// 휴지통 복구만으로는 줄이 다시 이어지지 않는다 → 줄과 프리셋을 함께 되돌리는 안전 지점을 알린다
+	assert.match(h.status().text, /2개 줄의 프리셋 연결이 끊어졌습니다 \(이전 프리셋은 프리셋 휴지통에 있습니다\. 히스토리의 안전 지점 '프리셋 가져오기 전'을 복원하면 줄과 프리셋이 함께 돌아옵니다\)/);
 	assert.match(h.$("presetTrashWrap").textContent, /가져오기로 교체됨/);
 	const saved = h.fs.readJson(P.presets(PROJ));
 	assert.equal(saved.nextPresetId, 10);

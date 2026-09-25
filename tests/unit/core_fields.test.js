@@ -57,6 +57,22 @@ test("resolveFid: 텍스트 순서가 바뀌면 이름으로, 이름도 없으�
 	assert.deepEqual([all.T1.how, all.T2.how, all.T3.how], ["name", "ordinal", "name"]);
 });
 
+test("resolveFields: 둘 다 네이티브면 이름이 달라도 서수로 짝짓는다 ('텍스트 N' 줄 ↔ definition 이름 프리셋)", () => {
+	const nat = (names) => names.map((n, i) => ({ index: i, displayName: n, type: "text", value: "v" + i, rawValue: "", nativeText: true }));
+	const row = nat(["텍스트 1", "텍스트 2"]);
+	const pre = nat(["Insert Name Here", "ADD TITLE HERE"]);
+	const all = core.resolveFields(row, pre);
+	assert.deepEqual(Object.keys(all), ["T1", "T2"]);
+	assert.deepEqual([all.T1.index, all.T1.how, all.T2.index, all.T2.how], [0, "ordinal", 1, "ordinal"]);
+	assert.equal(all.T2.param, row[1], "param은 줄 목록의 바로 그 객체");
+	assert.equal(core.layoutMismatch(row, pre), false, "네이티브는 텍스트 개수만 본다");
+	// 줄의 텍스트 필드가 모자라면 그 ID만 빠진다
+	assert.deepEqual(Object.keys(core.resolveFields(nat(["텍스트 1"]), pre)), ["T1"]);
+	// 한쪽만 네이티브면 이름 규칙 그대로
+	const { helpers } = build();
+	assert.deepEqual(Object.keys(core.resolveFields([helpers.T(0, "텍스트 1", ""), helpers.T(1, "본문", "")], pre)), []);
+});
+
 test("preset_2·3·6·8·4: 필드 ID와 캡션", () => {
 	const { presets } = build();
 	assert.deepEqual(plain(core.fieldIdMap(presets.preset_2.params, 0)).map((f) => [f.fid, f.index, !!f.caption]),

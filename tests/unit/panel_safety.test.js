@@ -291,6 +291,103 @@ test("프리셋 가져오기가 줄의 연결을 끊을 때만 '프리셋 가져
 	assert.deepEqual(pick(list[0]), before, "끊기기 전 presetId");
 	assert.equal(list[0].rowStates[2].presetId, "preset_3");
 	assert.equal(h.snapshot().rowStates[2].presetId, "");
+	const imported3 = Object.keys(h.snapshot().presets).find((id) => h.snapshot().presets[id].mogrtPath === "D:/MOGRT/다른.mogrt");
+	// 그 안전 지점을 복원하면 옛 preset_3이 프리셋 휴지통에서 되살아나고 줄 2가 다시 이어진다
+	openHistory(h);
+	restoreFrom(h, h.$("historySafety"), 0);
+	const s = h.snapshot();
+	assert.equal(s.rowStates[2].presetId, "preset_3");
+	assert.equal(s.presets.preset_3.mogrtPath, file.presets.preset_3.mogrtPath, "옛 MOGRT의 preset_3");
+	assert.ok(s.presets[imported3], "가져온 프리셋은 그대로");
+	assert.equal(s.presetTrash.some((t) => t.preset.id === "preset_3"), false, "휴지통에서 빠졌다");
+	assert.equal(h.$("sel-2").value, "preset_3", "행 select");
+	assert.equal(h.fs.readJson(P.session(PROJ, A.seqId)).rowStates[2].presetId, "preset_3", "session.json");
+	assert.ok(h.fs.readJson(P.presets(PROJ)).presets.preset_3, "presets.json");
+	assert.match(h.status().text, /히스토리 복원: 3개 · 프리셋 1개를 프리셋 휴지통에서 되살렸습니다/);
+	noErrors(h);
+});
+
+test("프리셋 삭제는 그 프리셋을 쓰는 줄이 있을 때 '프리셋 삭제 전: 이름'을 남기고, 복원하면 줄의 값과 프리셋이 돌아온다", async () => {
+	const { presets } = build();
+	const p3 = presets.preset_3;
+	const p6 = presets.preset_6;
+	const sess = session(3);
+	[1, 2].forEach((i) => {
+		const all = clone(p3.params);
+		all[2].value = "후반 작업 " + i;
+		sess.rowStates[i] = { presetId: "preset_3", params: [clone(all[1]), clone(all[2])], _allParams: all, open: false, checked: false };
+	});
+	const h = await boot({ files: { [P.presets(PROJ)]: { presets: { preset_3: p3, preset_6: p6 }, presetTrash: [], nextPresetId: 7 }, [P.session(PROJ, A.seqId)]: sess } });
+	const delOf = (name) => {
+		const btn = h.$("presetList").querySelectorAll("button").filter((b) => b.textContent === "삭제")
+			.find((b) => { let el = b; while (el && el.textContent.indexOf(name) === -1) el = el.parentNode; return !!el && el !== h.$("presetList"); });
+		assert.ok(btn, "삭제 버튼 " + name);
+		btn.click();
+		h.$("confirmYes").click();
+	};
+	// 쓰는 줄이 없는 프리셋 → 안전 지점 없음
+	delOf(p6.name);
+	assert.equal(h.fs.files.has(P.historySafety(PROJ, A.seqId)), false);
+	const before = pick(h.snapshot());
+	delOf(p3.name);
+	assert.equal(h.snapshot().rowStates[1]._allParams.length, 0, "삭제가 줄의 값을 비웠다");
+	assert.deepEqual(safetyList(h).map((e) => e.label), ["프리셋 삭제 전: " + p3.name]);
+	assert.deepEqual(pick(safetyList(h)[0]), before);
+	openHistory(h);
+	restoreFrom(h, h.$("historySafety"), 0);
+	const s = h.snapshot();
+	assert.deepEqual(pick(s), before, "줄의 프리셋·후반 작업 값이 돌아왔다");
+	assert.ok(s.presets.preset_3, "preset_3이 휴지통에서 되살아났다");
+	assert.equal(s.presets.preset_6, undefined, "쓰지 않는 프리셋은 휴지통에 그대로");
+	assert.deepEqual(s.presetTrash.map((t) => t.preset.id), ["preset_6"]);
+	noErrors(h);
+});
+
+test("휴지통 비우기는 먼저 '휴지통 비우기 전'을 남기고, 복원하면 휴지통의 줄이 돌아온다", async () => {
+	const h = await boot({ files: { [P.session(PROJ, A.seqId)]: session(3) } });
+	// 빈 휴지통을 비우면 남기지 않는다
+	h.$("btnEmptyTrash").click();
+	assert.equal(h.fs.files.has(P.historySafety(PROJ, A.seqId)), false);
+	rowButton(h, 2, "삭제 (휴지통으로)").click();
+	const before = pick(h.snapshot());
+	assert.equal(before.trashBin.length, 1);
+	h.$("btnEmptyTrash").click();
+	assert.equal(h.snapshot().trashBin.length, 0);
+	assert.deepEqual(safetyList(h).map((e) => e.label), ["휴지통 비우기 전"]);
+	openHistory(h);
+	restoreFrom(h, h.$("historySafety"), 0);
+	assert.deepEqual(pick(h.snapshot()), before);
+	noErrors(h);
+});
+
+test("체크한 여러 줄의 프리셋을 한꺼번에 바꾸면 '프리셋 일괄 적용 전'을 남긴다 (잃을 값이 있을 때만)", async () => {
+	const { presets } = build();
+	const p3 = presets.preset_3;
+	const p6 = presets.preset_6;
+	const sess = session(3);
+	[1, 2].forEach((i) => {
+		const all = clone(p3.params);
+		all[2].value = "후반 작업 " + i;
+		sess.rowStates[i] = { presetId: "preset_3", params: [clone(all[1]), clone(all[2])], _allParams: all, open: false, checked: true };
+	});
+	const h = await boot({ files: { [P.presets(PROJ)]: { presets: { preset_3: p3, preset_6: p6 }, presetTrash: [], nextPresetId: 7 }, [P.session(PROJ, A.seqId)]: sess } });
+	// 체크하지 않은 줄 하나만 바꾸면 남기지 않는다 (한 줄 선택은 v27 그대로)
+	h.$("sel-3").value = "preset_6";
+	h.change(h.$("sel-3"));
+	await h.flush();
+	assert.equal(h.fs.files.has(P.historySafety(PROJ, A.seqId)), false);
+	const before = pick(h.snapshot());
+	h.$("sel-1").value = "preset_6";
+	h.change(h.$("sel-1"));
+	await h.flush();
+	const s = h.snapshot();
+	assert.deepEqual([s.rowStates[1].presetId, s.rowStates[2].presetId], ["preset_6", "preset_6"]);
+	assert.equal(JSON.stringify(s.rowStates).indexOf("후반 작업"), -1, "일괄 적용이 후반 작업 값을 덮었다");
+	assert.deepEqual(safetyList(h).map((e) => e.label), ["프리셋 일괄 적용 전"]);
+	assert.deepEqual(pick(safetyList(h)[0]), before);
+	openHistory(h);
+	restoreFrom(h, h.$("historySafety"), 0);
+	assert.deepEqual(pick(h.snapshot()), before, "후반 작업 값이 돌아왔다");
 	noErrors(h);
 });
 
@@ -310,6 +407,34 @@ test("안전 지점 섹션: 비어 있으면 '안전 지점 없음', × 삭제�
 	items[1].querySelectorAll("button").find((b) => b.textContent === "×").click();
 	assert.deepEqual(safetyList(h).map((e) => e.label), ["SRT 가져오기 전: b.srt"]);
 	assert.deepEqual(autoList(h).map((e) => e.label), ["SRT 로드: b.srt", "SRT 로드: a.srt"], "자동저장은 그대로");
+	noErrors(h);
+});
+
+test("드롭다운을 연 사이 밀려나 이미 없는 항목의 ×는 아무것도 지우지 않는다 (그 자리의 다른 항목을 지우지 않는다)", async () => {
+	const auto = [];
+	for (let i = 0; i < 20; i++) {
+		const e = session(1, "v" + i + " ");
+		auto.push(Object.assign({ ts: 1000 + (20 - i), label: "E" + i, isManual: false, sequenceKey: "x", trackValue: "2" }, e));
+	}
+	const h = await boot({ files: { [P.session(PROJ, A.seqId)]: session(1), [P.historyAuto(PROJ, A.seqId)]: auto } });
+	openHistory(h);
+	const items = h.$("historyDropdown").childNodes[2].querySelectorAll(".history-item");
+	assert.equal(items.length, 20);
+	// 드롭다운이 열린 채 5분 무작업 자동저장이 E19를 밀어낸다
+	const fwd = freezeNow(h);
+	fwd(6 * MIN);
+	h.win._mogrtDebug.idleAutosaveTick();
+	const labels = () => autoList(h).map((e) => e.label);
+	assert.deepEqual(labels().slice(-2), ["E17", "E18"]);
+	// 낡은 E19 항목의 ×
+	items[19].querySelectorAll("button").find((b) => b.textContent === "×").click();
+	assert.deepEqual(labels().slice(-2), ["E17", "E18"], "E18을 지우지 않았다");
+	assert.equal(autoList(h).length, 20);
+	assert.match(h.status().text, /이미 없는 항목입니다/);
+	// 새로 그린 목록에서는 그대로 지워진다
+	const fresh = h.$("historyDropdown").childNodes[2].querySelectorAll(".history-item");
+	fresh[20 - 1].querySelectorAll("button").find((b) => b.textContent === "×").click();
+	assert.deepEqual(labels().slice(-2), ["E16", "E17"]);
 	noErrors(h);
 });
 
