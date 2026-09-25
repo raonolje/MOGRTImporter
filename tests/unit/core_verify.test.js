@@ -68,7 +68,7 @@ test("지움·자름(끝)·자르기(razor)·문장 고침·Motion 키 → 정�
 	// 4: 문장 고침
 	x.details.n4 = detail(["Premiere에서 고친 문장", ""]);
 	// 5: Motion 키
-	x.details.n5 = detail(["문장 5", ""], { deco: { comps: 3, keyed: ["Motion"] } });
+	x.details.n5 = detail(["문장 5", ""], { deco: { comps: 3, keyed: ["AE.ADBE Motion"] } });
 	const rep = run(x);
 	assert.deepEqual(cats(rep), [["missing", 1], ["moved", 2], ["dup", 3], ["edited", 4], ["decorated", 5]]);
 	assert.deepEqual([rep.counts.ok, rep.counts.missing, rep.counts.moved, rep.counts.dup, rep.counts.edited, rep.counts.decorated, rep.counts.unapplied], [5, 1, 1, 1, 1, 1, 0]);

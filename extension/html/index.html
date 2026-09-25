@@ -1179,6 +1179,27 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 /* 경고·제안 줄만 보기 (_markFilter) */
 .sub-row.mark-filter-hidden { display: none !important; }
 
+/* ── 타임라인 검수 (#btnVerify·#verifyModal)와 화자 파일 다시 가져오기(.cast-reimport)·바뀜 알림(#castToast), S3-3 ── */
+#btnVerify { padding: 6px 10px; font-size: 11px; background: #1a2a1a; border: 1px solid #2a5a2a; color: #a5d6a7; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+#btnVerify:hover { background: #2a3a2a; }
+.custom-modal-box.vf-box { width: 560px; max-width: 94%; max-height: 88vh; display: flex; flex-direction: column; gap: 6px; }
+.vf-summary { font-size: 11px; color: #e0e0e0; line-height: 1.5; }
+.vf-note { font-size: 10px; color: #888; }
+.vf-list { flex: 1; min-height: 60px; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; border-top: 1px solid #333; padding-top: 4px; }
+.vf-cat { font-size: 11px; font-weight: 700; color: #ffb74d; padding: 4px 2px 2px; }
+.vf-cat[data-cat="orphan"], .vf-cat[data-cat="stale"], .vf-cat[data-cat="dup"] { color: #ef9a9a; }
+.vf-cat[data-cat="unapplied"] { color: #90caf9; }
+.vf-item { display: flex; gap: 8px; font-size: 10px; color: #ccc; padding: 2px 6px; border-radius: 3px; cursor: pointer; }
+.vf-item:hover { background: #2a3a4a; }
+.vf-item .vf-label { flex-shrink: 0; min-width: 44px; color: #90caf9; }
+.vf-item .vf-detail { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub-row.vf-hit { outline: 1px solid #ffb74d; }
+.cast-reimport { font-size: 11px; line-height: 1; padding: 1px 5px; background: none; border: 1px solid #3a3a3a; color: #90caf9; border-radius: 3px; cursor: pointer; }
+.cast-reimport:hover { background: #2a3a4a; }
+#castToast { flex-shrink: 0; display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #2a2210; border-bottom: 1px solid #6a5a20; font-size: 11px; color: #ffe0b2; }
+#castToastText { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#castToast .btn { font-size: 10px; padding: 2px 8px; }
+
 /* ── 화자 표 (#castBar)와 화자 칩 (#speakerChips), S2-3 ── */
 #castBar { flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; padding: 3px 8px 4px; background: #1e1e1e; border-bottom: 1px solid #2e2e2e; max-height: 170px; overflow-y: auto; }
 #castHead { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888; }
@@ -1320,6 +1341,12 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
       </div>
       <div id="castRows"></div>
     </div>
+    <!-- 화자 SRT 파일이 바뀜 (S3-3): 스스로 병합하지 않는다 -->
+    <div id="castToast" style="display:none;">
+      <span id="castToastText"></span>
+      <button id="castToastMerge" class="btn">병합 미리보기</button>
+      <button id="castToastClose" class="btn">닫기</button>
+    </div>
 
     <!-- 자막 목록 -->
     <div id="listWrap">
@@ -1346,6 +1373,8 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
       </select>
       <!-- 다화자: 화자 → 트랙 미리보기 "C1→V3 · C2→V4 (새)" (S2-4) -->
       <span id="castTrackSummary" style="display:none;"></span>
+      <!-- 타임라인 검수 (다화자, S3-3): 읽기만 한다 -->
+      <button id="btnVerify" title="타임라인을 읽기만 해서 목록과 맞는지 확인 (아무것도 바꾸지 않음)" style="display:none;">검수</button>
       <button id="btnApply">▶ 타임라인에 적용</button>
       <button id="btnApplyStop" title="안전하게 적용을 줄 사이에서 멈춤" style="display:none;">중지</button>
     </div>
@@ -1523,6 +1552,20 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
     <div class="custom-modal-btns">
       <button id="pfOk" class="btn primary">적용</button>
       <button id="pfCancel" class="btn">취소</button>
+    </div>
+  </div>
+</div>
+
+<!-- 타임라인 검수 (다화자, S3-3): 읽기만 한다. 줄을 누르면 목록의 그 줄로 가고 재생 헤드를 옮긴다 -->
+<div id="verifyModal" class="custom-modal-overlay">
+  <div class="custom-modal-box vf-box">
+    <p class="imp-title">타임라인 검수</p>
+    <p id="vfSummary" class="vf-summary"></p>
+    <p id="vfNote" class="vf-note"></p>
+    <div id="vfList" class="vf-list"></div>
+    <div class="custom-modal-btns">
+      <button id="vfRerun" class="btn">다시 검수</button>
+      <button id="vfClose" class="btn primary">닫기</button>
     </div>
   </div>
 </div>

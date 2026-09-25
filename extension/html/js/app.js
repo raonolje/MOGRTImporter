@@ -4781,7 +4781,7 @@
 					if (kind === "ae" && preset && !tChanged && preset.mogrtLs && Array.isArray(d.lay) && clipLs(d.lay) !== preset.mogrtLs) add("oldVersion", Object.assign({}, at, { detail: "MOGRT를 다시 저장하기 전 구조" }));
 					if (decoratedOf(d, preset)) {
 						const k = d.deco && Array.isArray(d.deco.keyed) ? d.deco.keyed : [];
-						add("decorated", Object.assign({}, at, { detail: (k.length ? "키: " + k.join(", ") : "효과 " + ((d.deco && d.deco.comps) || 0) + "개") }));
+						add("decorated", Object.assign({}, at, { detail: (k.length ? "키: " + k.map((x) => String(x).replace(/^AE\.ADBE /, "")).join(", ") : "효과 " + ((d.deco && d.deco.comps) || 0) + "개") }));
 					}
 					const hNow = plan && plan.intentOf ? plan.intentOf[sub.id] : undefined;
 					let why = "";
@@ -8112,9 +8112,13 @@ var modalState = {
 		const order = _castKeys();
 		_closeCastMenu();
 		box.innerHTML = "";
+		// 검수 버튼은 화자 표가 있을 때만 (S3-3). 단일 화자 적용 바는 v27 그대로
+		const vb = document.getElementById("btnVerify");
+		if (vb) vb.style.display = order.length ? "" : "none";
 		if (!order.length) {
 			bar.style.display = "none";
 			_renderCastTrackSummary(null);
+			if (_castToastKey) _hideCastToast(false);
 			return;
 		}
 		bar.style.display = "";
@@ -8231,6 +8235,15 @@ var modalState = {
 		const cnt = document.createElement("span");
 		cnt.className = "cast-count";
 		cnt.textContent = count + "줄";
+		// ⟳ 다시 가져오기 (S3-3): 기억한 파일 경로에서 읽어 가져오기 창을 병합으로 연다 (경로를 모르면 파일을 고른다)
+		const re = document.createElement("button");
+		re.className = "cast-reimport";
+		re.textContent = "⟳";
+		re.title = c.path ? "다시 가져오기 (병합): " + c.path : "다시 가져오기 (병합) — 파일을 고릅니다";
+		re.addEventListener("click", (e) => {
+			e.stopPropagation();
+			_castReimport(K);
+		});
 		const more = document.createElement("button");
 		more.className = "cast-more";
 		more.textContent = "⋯";
@@ -8239,7 +8252,7 @@ var modalState = {
 			e.stopPropagation();
 			_openCastMenu(row, K);
 		});
-		[dot, key, name, track, preset, cnt, more].forEach((el) => row.appendChild(el));
+		[dot, key, name, track, preset, cnt, re, more].forEach((el) => row.appendChild(el));
 		return row;
 	}
 	// 트랙 선택지: "자동 (V4)" + V2..V10 (다른 화자가 쓰는 트랙은 "(철수)", 아직 없는 트랙은 "(새로 만듦)")
@@ -8515,6 +8528,114 @@ var modalState = {
 			setStatus("화자 " + K + " " + nm + " 삭제 — 줄 " + n + "개는 휴지통에 있습니다", "ok");
 		}, null, { yes: "화자 삭제" });
 	}
+	// ── 화자 파일 다시 가져오기(⟳)와 바뀜 알림 (S3-3) ──
+	// ⟳: 화자 표에 기억한 파일 경로(cast[K].path, 가져올 때 CEP File.path·명령 {path})에서 SRT를 다시 읽어 'SRT 가져오기' 창을
+	// 그 화자(키)의 병합으로 연다. 창에서 통계를 보고 [가져오기]를 눌러야 병합한다. 경로가 없거나 읽지 못하면 파일 대화상자(#srtInput)를
+	// 연다 — 고른 파일 이름에 C번호가 없으면 그 화자로 본다 (2분 안, _castReimportKey).
+	// 바뀜 알림: 3초마다 경로를 stat해 크기·수정 시각이 가져올 때와 다르면 #castToast "영희(C2) 파일이 바뀌었습니다 [병합 미리보기] [닫기]".
+	// 적용 중·가져오기 창이 열렸을 때·패널이 숨었을 때·시퀀스 확인 전에는 쉰다. 스스로 병합하지 않고, 같은 바뀜은 한 번만 알린다.
+	const CAST_WATCH_MS = 3000;
+	// 수정 시각 비교 여유 (File.lastModified는 ms 정수, stat은 소수 ms)
+	const CAST_MTIME_TOL = 1000;
+	const CAST_REIMPORT_TTL = 120000;
+	var _castReimportKey = null; // {K, at}: ⟳에서 연 파일 대화상자
+	var _castToastKey = null; // 알림 중인 {K, sig}
+	var _castWatchSeen = {}; // 알렸거나 닫은 바뀜 {sig: true}
+	function _castReimport(K) {
+		const c = state.mi && state.mi.cast ? state.mi.cast[K] : null;
+		if (!c) return;
+		if (!_keysResolved) {
+			setStatus(GATE_NOSEQ_MSG, "err");
+			return;
+		}
+		if (_miBusy || _legacyRun) {
+			setStatus("타임라인 적용 중에는 SRT를 열 수 없습니다", "err");
+			return;
+		}
+		if (c.path) {
+			const r = _readSrtPath(c.path);
+			if (!r.error) {
+				_openReimport(K, r.file);
+				return;
+			}
+			setStatus(K + " " + _castName(K) + ": " + r.error + " — 파일을 고르세요", "err");
+		} else setStatus(K + " " + _castName(K) + ": 파일 위치를 모릅니다 — 파일을 고르세요", "");
+		_castReimportKey = { K, at: Date.now() };
+		const input = document.getElementById("srtInput");
+		if (input && typeof input.click === "function") input.click();
+	}
+	// 파일 하나를 화자 K의 병합으로 가져오기 창에 연다 (파일 이름에 C번호가 없거나 다르면 K로 본다 — ⟳는 그 화자의 파일이다)
+	function _openReimport(K, file) {
+		const an = _analyzeSrt(file);
+		if (an.capKey.key !== K) an.capKey = { key: K, ambiguous: false, nums: [castKeyNum(K)] };
+		_hideCastToast(true);
+		_openImportModal([an], false, _importSeqToken());
+		return { route: "modal", key: K };
+	}
+	// #srtInput 처리기가 부른다: ⟳에서 연 대화상자(2분 안)에서 파일 하나를 골랐고 그 이름에 C번호가 없으면 → 그 화자의 병합으로 연다 (처리했으면 true)
+	function _castReimportChosen(read) {
+		const p = _castReimportKey;
+		_castReimportKey = null;
+		if (!p || Date.now() - p.at > CAST_REIMPORT_TTL || !read || read.length !== 1 || !state.mi.cast[p.K]) return false;
+		if (parseCaptionKey(read[0].name).key) return false;
+		_openReimport(p.K, read[0]);
+		return true;
+	}
+	// 파일 경로의 {size, mtime} (Node fs). 없거나 읽지 못하면 null
+	function _castStat(path) {
+		const fs = _nodeRequire("fs");
+		if (!fs || !path) return null;
+		try {
+			const st = fs.statSync(String(path));
+			return { size: Number(st.size), mtime: Math.floor(Number(st.mtimeMs) || 0) };
+		} catch (_) {
+			return null;
+		}
+	}
+	function _castWatchTick() {
+		if (!_keysResolved || _miBusy || _legacyRun || _imp || (typeof document !== "undefined" && document.hidden)) return;
+		if (_castToastKey) return;
+		const seq = _importSeqToken();
+		for (const K of _castKeys()) {
+			const c = state.mi.cast[K];
+			if (!c || !c.path) continue;
+			const st = _castStat(c.path);
+			if (!st) continue;
+			const changed = (typeof c.size === "number" && st.size !== c.size) || (typeof c.mtime === "number" && Math.abs(st.mtime - c.mtime) > CAST_MTIME_TOL);
+			if (!changed) continue;
+			const sig = seq + "|" + K + "|" + st.size + "|" + st.mtime;
+			if (_castWatchSeen[sig]) continue;
+			_showCastToast(K, sig);
+			return;
+		}
+	}
+	setInterval(_castWatchTick, CAST_WATCH_MS);
+	function _showCastToast(K, sig) {
+		const el = document.getElementById("castToast");
+		const txt = document.getElementById("castToastText");
+		if (!el || !txt) return;
+		_castToastKey = { K, sig };
+		txt.textContent = _castName(K) + "(" + K + ") 파일이 바뀌었습니다";
+		txt.title = (state.mi.cast[K] && state.mi.cast[K].path) || "";
+		el.style.display = "";
+	}
+	// 알림을 닫는다. seen이면 그 바뀜은 다시 알리지 않는다
+	function _hideCastToast(seen) {
+		const el = document.getElementById("castToast");
+		if (_castToastKey && seen) _castWatchSeen[_castToastKey.sig] = true;
+		_castToastKey = null;
+		if (el) el.style.display = "none";
+	}
+	document.getElementById("castToastMerge")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		const t = _castToastKey;
+		_hideCastToast(true);
+		if (t) _castReimport(t.K);
+	});
+	document.getElementById("castToastClose")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		_hideCastToast(true);
+	});
 	// 휴지통에서 되살린 화자 줄의 화자가 화자 표에 없으면 다시 만든다 (이름·프리셋·색은 cast_defaults, 없으면 키)
 	function _ensureCastEntry(K) {
 		const mi = state.mi;
@@ -9660,6 +9781,8 @@ var modalState = {
 			setStatus("SRT 읽기 실패", "err");
 			return null;
 		}
+		// 화자 표 ⟳에서 연 대화상자면 그 화자의 병합으로 (S3-3)
+		if (_castReimportChosen(read)) return { route: "modal", files: read.map((f) => ({ name: f.name })) };
 		return _routeSrtImport(read);
 	}
 	// 읽은 파일들 → 경로를 정해 처리를 시작한다 (확인창·가져오기 창은 열기만 하고 돌아온다)
@@ -12675,6 +12798,125 @@ var modalState = {
 		const key = nativeBakeKey(preset.mogrtPath, mtime, nativeRowTexts(rowSendParams(rs), preset.params, preset.textParamIndex, sub.text));
 		return { path: _bakedPath(key), key, durSec: 0 };
 	}
+	// ── #verifyModal '타임라인 검수' (S3-3) ──
+	// #btnVerify(다화자 적용 바) → _miVerify → 요약 "정상 118 · 타임라인에 없음 1 · …"과 분류별 목록. 줄을 누르면 목록의 그 줄로 가고
+	// (필터를 풀지는 않는다) Premiere 재생 헤드를 그 클립(없으면 줄) 시작으로 옮긴다 (v27 seekToClip — 타임라인은 바꾸지 않는다).
+	var _vfReport = null;
+	function _verifySecOf(item, report) {
+		const ft = Number(report && report.frameTicks) || 0;
+		if (typeof item.sf === "number" && ft > 0) return (item.sf * ft) / TICKS_PER_SEC;
+		const sub = state.subtitles.find((s) => s.id === item.id);
+		return sub ? sub.startSec : null;
+	}
+	function _openVerifyModal(report) {
+		const modal = document.getElementById("verifyModal");
+		const list = document.getElementById("vfList");
+		if (!modal || !list) return;
+		_vfReport = report;
+		document.getElementById("vfSummary").textContent = report.text;
+		const notes = ["읽기만 했습니다 — 타임라인은 바뀌지 않았습니다."];
+		if (report.legacyRows) notes.push("화자 없는 줄 " + report.legacyRows + "개는 검수하지 않았습니다.");
+		if (report.counts && report.counts.native) notes.push("네이티브 템플릿 클립은 문장을 읽을 수 없어 자리·효과만 봅니다.");
+		document.getElementById("vfNote").textContent = notes.join(" ");
+		list.innerHTML = "";
+		const byCat = {};
+		(report.items || []).forEach((it) => { (byCat[it.cat] = byCat[it.cat] || []).push(it); });
+		VERIFY_CATS.forEach(([cat, label]) => {
+			const items = byCat[cat];
+			if (!items || !items.length) return;
+			const head = document.createElement("div");
+			head.className = "vf-cat";
+			head.dataset.cat = cat;
+			head.textContent = label + " " + items.length;
+			list.appendChild(head);
+			items.forEach((it) => {
+				const row = document.createElement("div");
+				row.className = "vf-item";
+				row.dataset.cat = cat;
+				if (typeof it.id === "number") row.dataset.id = String(it.id);
+				const lab = document.createElement("span");
+				lab.className = "vf-label";
+				lab.textContent = it.label || (it.uid ? "(목록에 없음)" : "");
+				const det = document.createElement("span");
+				det.className = "vf-detail";
+				det.textContent = it.detail || "";
+				det.title = (it.name ? it.name + "\n" : "") + (it.detail || "");
+				row.appendChild(lab);
+				row.appendChild(det);
+				row.addEventListener("click", (e) => {
+					e.stopPropagation();
+					_verifyGo(it);
+				});
+				list.appendChild(row);
+			});
+		});
+		if (!list.childNodes.length) {
+			const ok = document.createElement("div");
+			ok.className = "vf-note";
+			ok.textContent = "문제 없음";
+			list.appendChild(ok);
+		}
+		modal.classList.add("open");
+	}
+	function _closeVerifyModal() {
+		const modal = document.getElementById("verifyModal");
+		if (modal) modal.classList.remove("open");
+		_vfReport = null;
+	}
+	// 검수 목록의 한 줄로: 목록의 그 줄을 보이게 하고 재생 헤드를 옮긴다 → seekToClip 결과 | null
+	async function _verifyGo(item) {
+		const sub = typeof item.id === "number" ? state.subtitles.find((s) => s.id === item.id) : null;
+		if (sub) {
+			document.querySelectorAll(".sub-row.vf-hit").forEach((el) => el.classList.remove("vf-hit"));
+			const row = document.getElementById("row-" + sub.id);
+			if (row) {
+				row.classList.add("vf-hit");
+				if (typeof row.scrollIntoView === "function") row.scrollIntoView({ block: "center" });
+			}
+		}
+		const sec = _verifySecOf(item, _vfReport);
+		if (sec === null) return null;
+		let res;
+		try {
+			res = await host.seekToClip({ startSec: sec });
+		} catch (err) {
+			setStatus("이동 실패: " + (err.hostReason || err.message), "err");
+			return null;
+		}
+		if (String(res).indexOf("SUCCESS") === 0) setStatus("검수: " + (item.label || item.name || "") + " — " + sec.toFixed(2) + "초로 이동", "ok");
+		else setStatus(res || "이동 실패", "err");
+		return res;
+	}
+	async function _runVerifyUi() {
+		if (_miBusy || _legacyRun) {
+			setStatus("타임라인 적용이 실행 중입니다", "err");
+			return null;
+		}
+		setStatus("검수: 타임라인 읽는 중…", "info");
+		const r = await _miVerify();
+		if (!r || r.ok !== true) {
+			const why = { "no-host": MI_HOST_STALE_MSG, "build-mismatch": MI_HOST_STALE_MSG, "no-rows": "검수는 화자 줄이 있는 목록에서만 합니다", "preview-active": "프리뷰 시퀀스가 활성입니다 — 작업 시퀀스를 연 뒤 다시 검수하세요",
+				"seq-mismatch": "Premiere의 활성 시퀀스가 패널의 시퀀스와 다릅니다", busy: "타임라인 적용이 실행 중입니다" };
+			setStatus("검수 못 함: " + (why[r && r.error] || (r && (r.detail || r.error)) || "알 수 없음"), "err");
+			return r;
+		}
+		_openVerifyModal(r.report);
+		setStatus("검수: " + r.report.text, "ok");
+		return r;
+	}
+	document.getElementById("btnVerify")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		_runVerifyUi();
+	});
+	document.getElementById("vfRerun")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		_closeVerifyModal();
+		_runVerifyUi();
+	});
+	document.getElementById("vfClose")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		_closeVerifyModal();
+	});
 	// 계획 요약 (명령 plan·테스트)
 	function _miPlanSummary(plan) {
 		const count = {};
@@ -13620,6 +13862,9 @@ var modalState = {
 				const isSameProject = newProjKey === state.currentProjectKey;
 				// 이전 시퀀스의 목록으로 연 SRT 가져오기 창·확인창은 닫는다 (바뀐 시퀀스에 넣지 않게)
 				const importClosed = _closeImportUi();
+				// 검수 창·화자 파일 바뀜 알림도 이전 시퀀스의 것이다 (S3-3)
+				_closeVerifyModal();
+				_hideCastToast(false);
 				saveSessionToStorage();
 				state.currentProjectKey = newProjKey;
 				state.currentSequenceKey = newSeqKey;
