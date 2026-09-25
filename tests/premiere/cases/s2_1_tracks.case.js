@@ -40,7 +40,7 @@ function jsxPlaceNamed(mogrtPath, ti, sf, ef, name, capIdx, capText) {
 /** 트랙 잠금 (스크래치만) → "true"/"false" */
 function jsxSetLocked(ti, on) {
 	return "(function(){var seq=app.project.activeSequence;if(String(seq.name).indexOf('" + H.SCRATCH_PREFIX + "')!==0)return 'not-scratch';" +
-		"var t=seq.videoTracks[" + Number(ti) + "];t.setLocked(" + (on ? "true" : "false") + ");return String(t.isLocked());})()";
+		"var t=seq.videoTracks[" + Number(ti) + "];t.setLocked(" + (on ? "1" : "0") + ");return String(t.isLocked());})()";
 }
 /** 활성 시퀀스 직접 읽기 → JSON {numTracks, frameTicks, name} */
 const JSX_SEQ_FACTS = "(function(){var s=app.project.activeSequence;return JSON.stringify({numTracks:s.videoTracks.numTracks,frameTicks:String(s.getSettings().videoFrameRate.ticks),name:String(s.name)});})()";

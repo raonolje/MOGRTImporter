@@ -51,10 +51,10 @@ const bigTicks = (frame, ft) => String(BigInt(frame) * BigInt(ft));
 function jsxClipsFull(ti) {
 	return "(function(){var seq=app.project.activeSequence;if(String(seq.name).indexOf('" + SCR + "')!==0)return MID__json({error:'not-scratch'});" +
 		"var t=seq.videoTracks[" + Number(ti) + "];if(!t)return MID__json({error:'no-track'});var out=[];" +
-		"for(var k=0;k<t.clips.numItems;k++){var c=t.clips[k];var o={s:String(c.start.ticks),e:String(c.end.ticks),inT:String(c.inPoint.ticks),nodeId:String(c.nodeId),name:String(c.name),comps:c.components.numItems,props:[],native:[],motionKeyed:false};" +
+		"for(var k=0;k<t.clips.numItems;k++){var c=t.clips[k];var o={s:String(c.start.ticks),e:String(c.end.ticks),inT:String(c.inPoint.ticks),nodeId:String(c.nodeId),name:String(c.name),comps:c.components.numItems,props:[],natTexts:[],motionKeyed:false};" +
 		"var mg=null;try{mg=c.getMGTComponent();}catch(e0){}" +
-		"if(mg){for(var j=0;j<mg.properties.numItems;j++){var p=mg.properties[j];var v='';try{v=String(p.getValue());}catch(e1){v='?';}var tv=false;try{tv=p.isTimeVarying()===true;}catch(e2){}o.props.push([String(p.displayName),v,tv]);}}" +
-		"else{var nt=collectNativeTextProps(c);for(var q=0;q<nt.length;q++){var nv='';try{nv=String(nt[q].getValue());}catch(e3){}o.native.push(nv);}}" +
+		"if(mg){for(var j=0;j<mg.properties.numItems;j++){var p=mg.properties[j];var v='';try{v=String(p.getValue());}catch(e1){v='?';}var tv=false;try{tv=p.isTimeVarying()===true;}catch(e2){}var cv='';try{var ca=p.getColorValue();if(ca&&ca.length>=4)cv=ca.join(',');}catch(e5){}o.props.push([String(p.displayName),v,tv,cv]);}}" +
+		"else{var nt=collectNativeTextProps(c);for(var q=0;q<nt.length;q++){var nv='';try{nv=String(nt[q].getValue());}catch(e3){}o.natTexts.push(nv);}}" +
 		"for(var ci=0;ci<c.components.numItems;ci++){var cp=c.components[ci];if(String(cp.matchName)==='AE.ADBE Motion'){try{o.motionKeyed=cp.properties[0].isTimeVarying()===true;}catch(e4){}}}" +
 		"out.push(o);}return MID__json(out);})()";
 }
@@ -69,7 +69,7 @@ function jsxPlaceNamed(mogrtPath, ti, sf, ef, name) {
 }
 function jsxSetLocked(ti, on) {
 	return "(function(){var seq=app.project.activeSequence;if(String(seq.name).indexOf('" + SCR + "')!==0)return 'not-scratch';" +
-		"var t=seq.videoTracks[" + Number(ti) + "];t.setLocked(" + (on ? "true" : "false") + ");return String(t.isLocked());})()";
+		"var t=seq.videoTracks[" + Number(ti) + "];t.setLocked(" + (on ? "1" : "0") + ");return String(t.isLocked());})()";
 }
 function jsxRazor(ti, frame) {
 	return "(function(){var seq=app.project.activeSequence;if(String(seq.name).indexOf('" + SCR + "')!==0)return 'not-scratch';" +
@@ -203,8 +203,9 @@ async function steps(env) {
 	assert.deepEqual(r.results.map((x) => x.status), ["updated", "updated", "updated"], JSON.stringify(r.results.map((x) => [x.status, x.skipped, x.keyed])));
 	live = await clips(NT);
 	live.forEach((c, i) => {
-		const diff = c.props.map((p, k) => (p[1] === snapA[i][k][1] ? null : p[0] + ": " + snapA[i][k][1].slice(0, 80) + " → " + p[1].slice(0, 80))).filter(Boolean);
-		assert.deepEqual(diff, [], "클립 " + i + " 모든 속성 raw 값이 update 전과 같다");
+		// 64비트 색상은 스크립트로 raw를 정확히 쓸 수 없다(setColorValue는 8비트) → 색은 getColorValue [a,r,g,b]로 비교
+		const diff = c.props.map((p, k) => (p[1] === snapA[i][k][1] || (p[3] && p[3] === snapA[i][k][3]) ? null : p[0] + ": " + snapA[i][k][1].slice(0, 80) + " → " + p[1].slice(0, 80))).filter(Boolean);
+		assert.deepEqual(diff, [], "클립 " + i + " 모든 속성이 update 전과 같다 (색은 ARGB 8비트)");
 	});
 	log("T2 update 3개 nodeId 그대로, before 다시 쓰기로 속성 " + snapA[0].length + "개 × 3 정확히 복원");
 	// 네이티브
@@ -216,8 +217,8 @@ async function steps(env) {
 	r = await chunk([Object.assign(item(20, "update", NT, 3000, 3060, { own: ownOf(n20, NT), params: rt.results[0].params, name: tag(20, 1) }))]);
 	assert.deepEqual([r.results[0].status, r.results[0].skipped], ["updated", []]);
 	const nClip1 = (await clips(NT)).find((c) => c.nodeId === n20.nodeId);
-	assert.deepEqual(nClip1.native, nClip0.native, "네이티브 Source Text raw 값 그대로");
-	log("T2 네이티브 before 다시 쓰기: updated, Source Text " + nClip1.native.length + "개 그대로");
+	assert.deepEqual(nClip1.natTexts, nClip0.natTexts, "네이티브 Source Text raw 값 그대로");
+	log("T2 네이티브 before 다시 쓰기: updated, Source Text " + nClip1.natTexts.length + "개 그대로");
 
 	// ── T3: 안쪽에서 시작하는 guard 이웃 → 끝 맞춤 ──
 	const nb3 = await hostJson(host, jsxPlaceNamed(P.mogrtPath, NT, 5050, 5400, tag(50, 1)), "T3 이웃");

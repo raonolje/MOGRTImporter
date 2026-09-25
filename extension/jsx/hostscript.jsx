@@ -3217,6 +3217,12 @@ function MI__readParams(c, kind) {
             var ty = detectParamType(val, dn, sub > 0, pr);
             var raw = String(val);
             if (ty === "group" && String(raw).indexOf("\"textEditValue\"") !== -1) ty = "text";
+            /* 64비트 ARGB 색상은 2^56 이상이다. v27 detectParamType은 이름(한글이 분해형이면 못 찾는다)이나
+               알파 1 범위(2^56 ~ 2^56+2^48)로만 알아봐서, v27이 알파 255로 쓴 색은 number가 된다(2026-09-25 실측) */
+            if (ty === "number" || ty === "angle") {
+                var numv = parseFloat(raw);
+                if (!isNaN(numv) && numv >= 72057594037927936) ty = "color";
+            }
             var value = raw;
             if (ty === "text") {
                 var tx = MI__textOf(raw);
@@ -3226,7 +3232,16 @@ function MI__readParams(c, kind) {
             } else if (ty === "group") {
                 value = "";
             }
-            out.push({ index: i, type: ty, displayName: dn, value: value, rawValue: raw });
+            var entry = { index: i, type: ty, displayName: dn, value: value, rawValue: raw };
+            /* 색상: 64비트 raw는 double로 읽혀 정밀도가 깎이고, 그 값을 다시 쓰면 0이 된다(2026-09-25 실측).
+               getColorValue()의 [a, r, g, b]를 함께 두고 되쓸 때 setColorValue로 정확히 되돌린다 */
+            if (ty === "color") {
+                try {
+                    var ca = pr.getColorValue();
+                    if (ca && ca.length >= 4) entry.colorArgb = [Number(ca[0]), Number(ca[1]), Number(ca[2]), Number(ca[3])];
+                } catch (e6) {}
+            }
+            out.push(entry);
         }
     } else if (kind === "native") {
         var nt = collectNativeTextProps(c);
@@ -3562,6 +3577,7 @@ function MI__applyParamsSafe(c, kind, params, fresh) {
         }
         var used = {};
         var list = [];
+        var directWritten = 0;
         for (i = 0; i < params.length; i++) {
             p = params[i];
             if (!p || typeof p !== "object") continue;
@@ -3594,6 +3610,16 @@ function MI__applyParamsSafe(c, kind, params, fresh) {
                 continue;
             }
             used["i" + idx] = true;
+            /* 되읽은 색상(colorArgb, MI__readParams)은 setColorValue로 알파까지 그대로 되쓴다.
+               v27은 colorHex(알파 255) 또는 raw double을 쓰는데, 64비트 raw는 0이 된다 */
+            if (ty === "color" && MI__isArr(p.colorArgb) && p.colorArgb.length >= 4) {
+                var cw = false;
+                try { info[idx].pr.setColorValue(Number(p.colorArgb[0]), Number(p.colorArgb[1]), Number(p.colorArgb[2]), Number(p.colorArgb[3]), 1); cw = true; } catch (e5) {}
+                if (!cw) {
+                    try { info[idx].pr.setColorValue(Number(p.colorArgb[0]), Number(p.colorArgb[1]), Number(p.colorArgb[2]), Number(p.colorArgb[3])); cw = true; } catch (e6) {}
+                }
+                if (cw) { directWritten++; continue; }
+            }
             var q = {};
             for (var f in p) {
                 if (Object.prototype.hasOwnProperty.call(p, f)) q[f] = p[f];
@@ -3604,7 +3630,7 @@ function MI__applyParamsSafe(c, kind, params, fresh) {
         if (list.length) {
             try { applyParamsToItem(c, list); } catch (e4) { res.error = MI__errText(e4); }
         }
-        res.written = list.length;
+        res.written = list.length + directWritten;
     } else if (kind === "native") {
         var nt = collectNativeTextProps(c);
         for (i = 0; i < params.length; i++) {

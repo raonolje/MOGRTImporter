@@ -240,7 +240,8 @@ function createSim(opts = {}) {
 			id: i,
 			name: "Video " + (i + 1),
 			isLocked: () => !!tr.locked,
-			setLocked: (b) => { tr.locked = !!b; return true; },
+			// 실제 Premiere 26.5.1: 불리언은 'Illegal Parameter type', 숫자 0/1만 받는다
+			setLocked: (b) => { if (typeof b !== "number") throw new Error("Illegal Parameter type"); tr.locked = !!b; return true; },
 			get clips() { return coll(tr.clips.map(wrapClip)); }
 		};
 	}
