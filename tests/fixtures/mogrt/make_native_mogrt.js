@@ -111,6 +111,8 @@ function definitionJson(texts, opts) {
 		clientControls: controls,
 		sourceInfoLocalized: { en_US: { audiosamplerate: { ticksperframe: "__INT64__" }, framerate: { ticksperframe: 10594584000 }, scale: "__ONE__" } }
 	};
+	// 템플릿 길이 (opts.durationSec, 설치된 템플릿처럼 {scale, value})
+	if (o.durationSec) def.sourceInfoLocalized.en_US.duration = { scale: 1000, value: Math.round(o.durationSec * 1000) };
 	return JSON.stringify(def, null, 0).replace(/,/g, ", ").replace(/":/g, "\": ")
 		.replace("\"__INT64__\"", INT64_MAX).replace("\"__ONE__\"", "1.0");
 }

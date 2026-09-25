@@ -80,7 +80,7 @@ async function rowsWith(h, presetIds, cues) {
 async function apply(h) {
 	const n = h.host.calls.filter((c) => c.fn === "applyToTimeline").length;
 	h.$("btnApply").click();
-	await until(h, () => h.host.calls.filter((c) => c.fn === "applyToTimeline").length > n || /놓을 줄이 없습니다|멈췄습니다/.test(h.status().text), "▶ 끝");
+	await until(h, () => h.host.calls.filter((c) => c.fn === "applyToTimeline").length > n || /놓을 줄이 없습니다|멈췄습니다|취소했습니다/.test(h.status().text), "▶ 끝");
 	await h.flush();
 }
 const keyOf = (texts) => core.nativeBakeKey(SRC, MTIME, texts);
@@ -219,21 +219,28 @@ test("전에 네이티브로 놓은 줄을 AE 프리셋으로 바꾸면 그 네�
 	h.$("confirmAlt").click();
 	await until(h, () => calls(h, "applyToTimeline").length === 2, "전체 적용");
 	await h.flush();
-	assert.deepEqual(calls(h, "removeNativeClipsAt")[1], { t: 2, s: [1] });
+	// v27이 1초에 AE 템플릿을 새로 놓는다(약 5초 창 [1, 6.6)) → 4초 네이티브 줄도 연쇄로 지우고 다시 놓는다 (머리 잘림 방지)
+	assert.deepEqual(calls(h, "removeNativeClipsAt")[1], { t: 2, s: [1, 4] });
 	const sent = calls(h, "applyToTimeline")[1];
 	assert.equal(sent.subtitles[0].mogrtPath, h.snapshot().presets.preset_1.mogrtPath);
 	assert.equal(sent.subtitles[1].mogrtPath, BAKED + keyOf([CUES[1][2], ""]) + ".mogrt", "그대로인 네이티브 줄은 같은 사본");
 	assert.equal(h.snapshot().rowStates[ids[0]].ap.nk, undefined, "AE로 놓았다");
-	// ↑: 둘째 줄도 AE로 바꾸고 ↑ → 그 네이티브 클립을 지운 뒤 v27 updateClipAtTime (새로 놓는다)
+	assert.equal(h.status().cls, "ok", h.status().text);
+	// ↑: 둘째 줄도 AE로 바꾸고 ↑ → 그 네이티브 클립을 지운 뒤 v27 applyToTimeline 한 줄 (updateClipAtTime은 ±0.5초 안의
+	// 다른 클립을 잡거나 insertClip으로 뒤 클립을 밀 수 있다)
 	setSel(h, h.$("sel-" + ids[1]), "preset_1");
 	await h.flush();
-	h.host.handlers.updateClipAtTime = () => "SUCCESS: 새 클립 배치 완료";
 	h.$("row-" + ids[1]).querySelector(".btn-update").click();
-	await until(h, () => calls(h, "updateClipAtTime").length === 1, "↑");
+	await until(h, () => calls(h, "applyToTimeline").length === 3, "↑");
 	await h.flush();
 	assert.deepEqual(calls(h, "removeNativeClipsAt")[2], { t: 2, s: [4] });
-	assert.equal(calls(h, "updateClipAtTime")[0].mogrtPath, h.snapshot().presets.preset_1.mogrtPath);
-	assert.equal(h.snapshot().rowStates[ids[1]].ap.nk, undefined);
+	const s = h.snapshot();
+	// 속성은 ↑가 보내던 그대로 (구조가 바뀐 줄 → 이름으로: namedParams)
+	assert.deepEqual(calls(h, "applyToTimeline")[2], { videoTrackIndex: 2, subtitles: [{ mogrtPath: s.presets.preset_1.mogrtPath, startSec: 4, endSec: 6, text: CUES[1][2], params: clone(core.namedParams(s.rowStates[ids[1]]._allParams)) }] });
+	assert.equal(calls(h, "updateClipAtTime").length, 0);
+	assert.equal(s.rowStates[ids[1]].ap.nk, undefined);
+	assert.equal(s.rowStates[ids[1]].ap.s, 4);
+	assert.equal(h.status().text, "[2] 네이티브 클립을 AE 템플릿으로 교체 완료");
 	noErrors(h);
 });
 
@@ -264,14 +271,22 @@ test("굽지 못하면 놓지 않고 줄에 까닭을 적는다: Node 없음, �
 	await apply(h);
 	assert.match(resOf(h, ids[0]), /^네이티브 굽기 실패: 텍스트 필드 수가 템플릿과 다름 \(TextLayer 3 · 필드 2\)$/);
 	noErrors(h);
-	// 지우기 실패
+	// 지우기 실패 (활성 시퀀스 없음)
 	h = await boot();
 	await rowsWith(h, ["preset_9"]);
-	h.host.handlers.removeNativeClipsAt = () => "ERROR: no-track";
+	h.host.handlers.removeNativeClipsAt = () => "ERROR: no-seq";
 	await apply(h);
 	assert.equal(calls(h, "applyToTimeline").length, 0);
-	assert.equal(h.status().text, "네이티브 클립을 지우지 못해 적용을 멈췄습니다: no-track");
+	assert.equal(h.status().text, "네이티브 클립을 지우지 못해 적용을 멈췄습니다: no-seq");
 	assert.equal(h.$("btnApply").disabled, false);
+	noErrors(h);
+	// 활성 시퀀스가 작업 시퀀스가 아니다 (적용 중에 바꿨다): 지우지 않았고 놓지도 않는다
+	h = await boot();
+	await rowsWith(h, ["preset_9"]);
+	h.host.handlers.removeNativeClipsAt = () => "ERROR: seq-changed";
+	await apply(h);
+	assert.equal(calls(h, "applyToTimeline").length, 0);
+	assert.equal(h.status().text, "시퀀스가 바뀌어 적용을 취소했습니다");
 	noErrors(h);
 });
 
@@ -333,7 +348,8 @@ test("removeNativeClipsAt 식(ExtendScript): 시작이 반 프레임 안이고 M
 	let script = "";
 	h.win.CSInterface.prototype.evalScript = (s, cb) => { script = s; Promise.resolve().then(() => cb("SUCCESS: 0")); };
 	await h.win._mogrtDebug.removeNativeClipsAt({ t: 2, s: [2.002, 6.006] });
-	assert.match(script, /^\/\*host:removeNativeClipsAt \{"t":2,"s":\[2\.002,6\.006\]\}\*\/\(function\(t,s\)\{/);
+	assert.match(script, /^\/\*host:removeNativeClipsAt \{"t":2,"s":\[2\.002,6\.006\]\}\*\/\(function\(t,s,id\)\{/);
+	assert.match(script, /\)\(2,\[2\.002,6\.006\],decodeURIComponent\("natv-0001"\)\)$/, "작업 시퀀스 식별자를 넘긴다");
 	assert.match(script, /^[\x20-\x7e]*$/, "ASCII만");
 	// 모의 Premiere 객체로 식을 돌린다
 	const removed = [];
@@ -352,11 +368,17 @@ test("removeNativeClipsAt 식(ExtendScript): 시작이 반 프레임 안이고 M
 		clip("네이티브 둘째", 6.0, { comps: G })
 	];
 	clips.numItems = clips.length;
-	const seq = { videoTracks: [null, null, { clips }], getSettings: () => ({ videoFrameRate: { seconds: 1001 / 24000 } }) };
-	const res = new Function("app", "return " + script.replace(/^\/\*[^*]*\*\//, ""))({ project: { activeSequence: seq } });
-	assert.equal(res, "SUCCESS: 2");
+	const seq = { sequenceID: "natv-0001", name: "T_NAT", videoTracks: [null, null, { clips }], getSettings: () => ({ videoFrameRate: { seconds: 1001 / 24000 } }) };
+	const run = (active) => new Function("app", "return " + script.replace(/^\/\*[^*]*\*\//, ""))({ project: { activeSequence: active } });
+	assert.equal(run(seq), "SUCCESS: 2");
 	assert.deepEqual(removed.sort(), ["네이티브 둘째", "네이티브 맞음"]);
-	assert.equal(new Function("app", "return " + script.replace(/^\/\*[^*]*\*\//, ""))({ project: { activeSequence: null } }), "ERROR: no-seq");
+	assert.equal(run(null), "ERROR: no-seq");
+	// 다른 시퀀스가 활성이면 지우지 않는다 (적용 중에 시퀀스를 바꿨다)
+	removed.length = 0;
+	assert.equal(run(Object.assign({}, seq, { sequenceID: "other-0002" })), "ERROR: seq-changed");
+	assert.deepEqual(removed, []);
+	// 트랙이 없으면 지울 것이 없다 → 성공 0 (v27은 그 번호로도 놓는다: 전체 적용을 멈추지 않는다)
+	assert.equal(run(Object.assign({}, seq, { videoTracks: [null, null] })), "SUCCESS: 0");
 	noErrors(h);
 });
 
@@ -408,21 +430,136 @@ test("연쇄 ↑: 대상 밖 뒤 네이티브 줄은 마지막 적용 그대로(
 	h.nodeFs.files.delete(BAKED + keys[2] + ".mogrt");
 	setSel(h, h.$("sel-" + ids[1]), "preset_1");
 	await h.flush();
-	h.host.handlers.updateClipAtTime = () => "SUCCESS: 새 클립 배치 완료";
 	h.$("row-" + ids[1]).querySelector(".btn-update").click();
-	await until(h, () => calls(h, "updateClipAtTime").length === 1, "AE ↑");
+	await until(h, () => calls(h, "applyToTimeline").length === 3, "AE ↑");
 	await h.flush();
+	// 둘째 AE 클립의 창 [3, 8.6) 안의 셋째는 사본이 없어 다시 놓지 못한다 → 위험
+	assert.deepEqual(calls(h, "removeNativeClipsAt").slice(-1)[0], { t: 2, s: [3] });
+	assert.deepEqual(calls(h, "applyToTimeline")[2].subtitles.map((x) => x.startSec), [3]);
+	assert.equal(h.status().text, "[2] 네이티브 클립을 AE 템플릿으로 교체 완료 — 뒤 줄 1개는 새로 놓은 클립(약 5초)에 앞부분이 잘렸을 수 있습니다 (줄에 표시)");
+	assert.equal(resOf(h, ids[2]), "앞부분이 잘렸을 수 있음 (앞 줄 네이티브 교체)");
 	assert.equal(h.snapshot().rowStates[ids[1]].ap.nk, undefined, "둘째는 AE로 놓았다 (ap 있음)");
 	typeField(h, ids[0], "T2", "첫째 후반 다시 합성");
 	h.$("row-" + ids[0]).querySelector(".btn-update").click();
-	await until(h, () => calls(h, "applyToTimeline").length === 3, "↑ 2");
+	await until(h, () => calls(h, "applyToTimeline").length === 4, "↑ 2");
 	await h.flush();
 	assert.deepEqual(calls(h, "removeNativeClipsAt").slice(-1)[0], { t: 2, s: [1] }, "위험한 줄은 지우지 않는다");
-	assert.equal(calls(h, "applyToTimeline")[2].subtitles.length, 1);
+	assert.equal(calls(h, "applyToTimeline")[3].subtitles.length, 1);
 	assert.equal(resOf(h, ids[1]), "앞부분이 잘렸을 수 있음 (앞 줄 네이티브 교체)");
 	assert.equal(resOf(h, ids[2]), "앞부분이 잘렸을 수 있음 (앞 줄 네이티브 교체)");
 	assert.equal(h.status().text, "[1] 네이티브 클립 교체 완료 — 뒤 줄 2개는 새로 놓은 클립(약 5초)에 앞부분이 잘렸을 수 있습니다 (줄에 표시)");
 	assert.equal(h.status().cls, "err");
 	s = h.snapshot();
 	noErrors(h);
+});
+
+// ── 리뷰 반영 (S1-11) ──
+const RISK = "앞부분이 잘렸을 수 있음 (앞 줄 네이티브 교체)";
+// ▶ 확인창이 뜨면 '지금 방식으로 전체 적용'을 누른다
+async function applyAll(h) {
+	const n = calls(h, "applyToTimeline").length;
+	h.$("btnApply").click();
+	await h.flush();
+	if (h.$("confirmModal").classList.contains("open")) h.$("confirmAlt").click();
+	await until(h, () => calls(h, "applyToTimeline").length > n || /놓을 줄이 없습니다|멈췄습니다|취소했습니다/.test(h.status().text), "▶ 끝");
+	await h.flush();
+}
+
+test("▶ 위험 표시는 남는다: 새 네이티브 클립 창 안의 AE 대상 줄(ap 있음)은 ap를 다시 적지 않고 표시를 지우지 않는다", async () => {
+	const h = await boot();
+	const ids = await rowsWith(h, ["preset_9"], CLOSE);
+	await apply(h);
+	setSel(h, h.$("sel-" + ids[1]), "preset_1");
+	await h.flush();
+	await applyAll(h);
+	const before = clone(h.snapshot().rowStates[ids[1]].ap);
+	assert.ok(before && !before.nk, "둘째는 AE로 놓았다 (ap 있음, nk 없음)");
+	typeField(h, ids[0], "T1", "가까운 첫째 위험 합성");
+	await apply(h);
+	assert.deepEqual(calls(h, "removeNativeClipsAt").slice(-1)[0], { t: 2, s: [1, 5] }, "AE 줄(3초)은 지우지 않고, 5초 네이티브는 연쇄");
+	const s = h.snapshot();
+	assert.equal(resOf(h, ids[1]), RISK, "▶가 끝난 뒤에도 표시가 남는다");
+	assert.deepEqual(s.rowStates[ids[1]].ap, before, "머리가 잘렸을 수 있는 클립을 검증된 적용으로 적지 않는다");
+	assert.equal(s.rowStates[ids[0]].ap.nk, keyOf(["가까운 첫째 위험 합성", ""]));
+	assert.equal(h.status().cls, "err");
+	assert.match(h.status().text, /뒤 줄 1개는 새로 놓은 클립\(약 5초\)에 앞부분이 잘렸을 수 있습니다/);
+	noErrors(h);
+});
+
+test("▶ ap가 없는 AE 줄: 트랙에 그 줄 클립이 있으면(getTimelineClips) 창 안에서 위험, 아직 놓지 않았으면 표시하지 않는다", async () => {
+	const h = await boot();
+	const ids = await rowsWith(h, ["preset_9", "preset_1", "preset_9"], CLOSE);
+	// 처음 ▶: 트랙이 비어 있다 → AE 줄은 v27이 네이티브 뒤에 새로 놓는다 (위험 아님)
+	await apply(h);
+	assert.equal(calls(h, "getTimelineClips").length, 1, "새로 놓는 네이티브 줄이 있어 트랙을 읽는다");
+	assert.deepEqual(calls(h, "getTimelineClips")[0], { videoTrackIndex: 2 });
+	assert.equal(resOf(h, ids[1]), null);
+	assert.equal(h.status().cls, "ok", h.status().text);
+	// 그대로 다시 ▶: 새로 놓는 줄이 없으면 읽지 않는다
+	await apply(h);
+	assert.equal(calls(h, "getTimelineClips").length, 1);
+	// 첫째 문구를 고치고 ▶: 3초 AE 클립(프레임 스냅 12ms)이 첫째 창 [1, 6.6) 안에 있다
+	h.host.handlers.getTimelineClips = () => JSON.stringify([1, 2.988, 5].map((s) => ({ startSec: s, endSec: s + 1.5, name: "x" })));
+	typeField(h, ids[0], "T1", "가까운 첫째 섞인 합성");
+	await apply(h);
+	assert.deepEqual(calls(h, "removeNativeClipsAt").slice(-1)[0], { t: 2, s: [1, 5] });
+	assert.equal(resOf(h, ids[1]), RISK);
+	assert.equal(h.snapshot().rowStates[ids[1]].ap, undefined, "v27 AE 줄은 ap를 적지 않는다");
+	assert.equal(h.status().cls, "err");
+	// 트랙을 읽지 못하면 ap가 없는 줄은 모르는 채로 (전과 같다: 위험으로 세지 않는다)
+	h.host.handlers.getTimelineClips = () => "ERROR: 트랙 접근 실패";
+	typeField(h, ids[0], "T1", "가까운 첫째 섞인 합성 둘");
+	await apply(h);
+	assert.equal(h.status().cls, "ok", h.status().text);
+	assert.doesNotMatch(h.status().text, /잘렸을/);
+	noErrors(h);
+});
+
+test("↑ 네이티브 → AE: AE 템플릿 길이(definition 10초) 창 안의 뒤 네이티브 줄도 연쇄로 다시 놓는다", async () => {
+	const { presets } = build();
+	const AE = presets.preset_1.mogrtPath;
+	const cues = [[1, 2.5, "긴 AE 첫째 합성"], [8, 9.5, "긴 AE 둘째 합성"]];
+	const h = await boot({ nodeFiles: { [AE]: { data: N.buildNativeMogrt({ durationSec: 10 }), mtimeMs: MTIME } } });
+	const ids = await rowsWith(h, ["preset_9"], cues);
+	await apply(h);
+	const k2 = keyOf([cues[1][2], ""]);
+	setSel(h, h.$("sel-" + ids[0]), "preset_1");
+	await h.flush();
+	h.$("row-" + ids[0]).querySelector(".btn-update").click();
+	await until(h, () => calls(h, "applyToTimeline").length === 2, "↑");
+	await h.flush();
+	assert.deepEqual(calls(h, "removeNativeClipsAt").slice(-1)[0], { t: 2, s: [1, 8] }, "창 [1, 11.6) → 8초 줄");
+	assert.deepEqual(calls(h, "applyToTimeline")[1].subtitles.map((x) => [x.startSec, x.mogrtPath]), [[1, AE], [8, BAKED + k2 + ".mogrt"]]);
+	assert.equal(h.status().text, "[1] 네이티브 클립을 AE 템플릿으로 교체 완료 — 바로 뒤 네이티브 줄 1개도 그대로 다시 놓았습니다");
+	assert.equal(calls(h, "updateClipAtTime").length, 0);
+	noErrors(h);
+});
+
+test("패널을 다시 연 뒤 다시 쓰는 사본·대상 밖 줄도 템플릿 길이(definition 9초)로 연쇄 창을 잡는다", async () => {
+	const cues = [[1, 2.5, "다시 연 첫째 합성"], [8, 9.5, "다시 연 둘째 합성"], [15.5, 16.5, "다시 연 셋째 합성"]];
+	const mogrt = { durationSec: 9 };
+	const h = await boot({ mogrt });
+	const ids = await rowsWith(h, ["preset_9"], cues);
+	await apply(h);
+	typeField(h, ids[0], "T1", "다시 연 첫째 고침 합성");
+	await apply(h);
+	assert.deepEqual(calls(h, "removeNativeClipsAt").slice(-1)[0], { t: 2, s: [1, 8, 15.5] }, "9초 창의 연쇄 (새로 구운 사본)");
+	const kA = keyOf([cues[0][2], ""]);
+	assert.ok(bakedFile(h, kA), "처음 문구의 사본이 남아 있다");
+	// 패널을 다시 연다 (길이 기억이 비었다): 같은 캐시·세션·사본
+	const nodeFiles = {};
+	h.nodeFs.files.forEach((v, k) => { if (k !== SRC) nodeFiles[k] = { data: v.data, mtimeMs: v.mtimeMs }; });
+	const h2 = await boot({ mogrt, nodeFiles, files: { [P.session(PROJ, A.seqId)]: h.fs.readJson(P.session(PROJ, A.seqId)) } });
+	assert.deepEqual(h2.snapshot().subtitles.map((s) => s.id), ids);
+	h2.$("row-" + ids[0]).querySelector(".sub-header").click();
+	await h2.flush();
+	typeField(h2, ids[0], "T1", cues[0][2]);
+	h2.$("row-" + ids[0]).querySelector(".btn-update").click();
+	await until(h2, () => calls(h2, "applyToTimeline").length === 1, "↑");
+	await h2.flush();
+	assert.equal(h2.nodeFs.writes.filter((p) => /\.mogrt$/.test(p)).length, 0, "굽지 않고 다시 쓴다");
+	assert.deepEqual(calls(h2, "removeNativeClipsAt"), [{ t: 2, s: [1, 8, 15.5] }], "첫째 창 [1, 10.5) → 둘째(대상 밖) 창 [8, 17.5) → 셋째");
+	assert.deepEqual(calls(h2, "applyToTimeline")[0].subtitles.map((x) => [x.startSec, x.mogrtPath]),
+		[[1, BAKED + kA + ".mogrt"], [8, BAKED + keyOf([cues[1][2], ""]) + ".mogrt"], [15.5, BAKED + keyOf([cues[2][2], ""]) + ".mogrt"]]);
+	noErrors(h2);
 });

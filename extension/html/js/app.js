@@ -671,11 +671,14 @@
 	}
 
 	// 네이티브 그래픽 클립 지우기 (S1-11, host.removeNativeClipsAt). v27 호스트 함수를 바꾸지 않으려고 ExtendScript 식으로 보낸다.
-	// function(t, s): 활성 시퀀스 비디오 트랙 t에서 시작이 s[k]와 반 프레임 안이고, MGT 컴포넌트가 없고 Text 컴포넌트가 있는
-	// 클립(Premiere 네이티브 그래픽)만 지운다. AE MOGRT·영상 클립은 건드리지 않는다 → "SUCCESS: 지운 수" | "ERROR: no-seq|no-track"
-	// ES3·ASCII만 쓴다 (evalScript 인코딩)
-	const JSX_REMOVE_NATIVE = "function(t,s){var seq=app.project.activeSequence;if(!seq)return 'ERROR: no-seq';" +
-		"var tr=null;try{tr=seq.videoTracks[t];}catch(e){}if(!tr)return 'ERROR: no-track';" +
+	// function(t, s, id): 활성 시퀀스 비디오 트랙 t에서 시작이 s[k]와 반 프레임 안이고, MGT 컴포넌트가 없고 Text 컴포넌트가 있는
+	// 클립(Premiere 네이티브 그래픽)만 지운다. AE MOGRT·영상 클립은 건드리지 않는다 → "SUCCESS: 지운 수" | "ERROR: no-seq|seq-changed"
+	//   id: 패널의 작업 시퀀스 식별자(sequenceID, 없으면 이름 = state.currentSequenceId). 활성 시퀀스가 다르면 지우지 않는다
+	//   (적용 중에 사용자가 시퀀스를 바꿨다). 트랙 t가 없으면 지울 것이 없다 → "SUCCESS: 0" (v27은 그 번호로도 놓는다: §0.4 #14)
+	// ES3·ASCII만 쓴다 (evalScript 인코딩. id는 decodeURIComponent로 넘긴다)
+	const JSX_REMOVE_NATIVE = "function(t,s,id){var seq=app.project.activeSequence;if(!seq)return 'ERROR: no-seq';" +
+		"if(id){var sid='';try{sid=String(seq.sequenceID||'')||String(seq.name||'');}catch(e){}if(sid&&sid!==id)return 'ERROR: seq-changed';}" +
+		"var tr=null;try{tr=seq.videoTracks[t];}catch(e){}if(!tr)return 'SUCCESS: 0';" +
 		"var fd=0;try{fd=seq.getSettings().videoFrameRate.seconds;}catch(e){}var tol=(fd>0?fd/2:0.02)+0.001;var n=0;" +
 		"for(var i=tr.clips.numItems-1;i>=0;i--){var c=null;try{c=tr.clips[i];}catch(e){}if(!c)continue;" +
 		"var st=0;try{st=c.start.seconds;}catch(e){continue;}var hit=false;" +
@@ -724,13 +727,17 @@
 		},
 
 		// 네이티브 그래픽 클립 지우기 (JSX_REMOVE_NATIVE, S1-11). payload {t: 트랙, s: [시작 초…]} → "SUCCESS: n" | "ERROR: …".
-		// 맨 앞 주석은 이름과 인자를 적은 표시다 (ExtendScript는 무시한다. 테스트 하네스가 읽는다)
+		// payload.seqId(적용을 시작할 때의 작업 시퀀스 식별자, 없으면 지금 state.currentSequenceId)가 활성일 때만 지운다.
+		// 맨 앞 주석은 이름과 인자 {t, s}를 적은 표시다 (ExtendScript는 무시한다. 테스트 하네스가 읽는다. 시퀀스 확인 인자는 적지 않는다)
 		removeNativeClipsAt: (payload) => {
 			const t = Math.max(0, Math.floor(Number(payload && payload.t) || 0));
 			const s = ((payload && payload.s) || []).map(Number).filter((x) => isFinite(x));
+			const id = payload && payload.seqId != null ? String(payload.seqId) : state.currentSequenceId || "";
 			const args = JSON.stringify({ t, s });
-			return _invoke("removeNativeClipsAt", "/*host:removeNativeClipsAt " + args + "*/(" + JSX_REMOVE_NATIVE + ")(" + t + "," + JSON.stringify(s) + ")");
+			return _invoke("removeNativeClipsAt", "/*host:removeNativeClipsAt " + args + "*/(" + JSX_REMOVE_NATIVE + ")(" + t + "," + JSON.stringify(s) + "," + _encodeArg(id) + ")");
 		},
+		// 트랙의 클립 목록 (v27 getTimelineClips, 읽기만) → JSON 글자 [{startSec, endSec, name}] | "ERROR: …" (S1-11 연쇄 계획)
+		getTimelineClips: (payload) => _callWithPayload("getTimelineClips", payload),
 
 		// 호스트 함수가 아니라 ExtendScript 식이다. 프리뷰 캡처 임시 경로용으로,
 		// 실패해도 진행에 지장이 없어 여기서만 예외를 삼키고 기본값을 준다.
@@ -2284,7 +2291,9 @@
 		return rs._allParams && rs._allParams.length > 0 ? rs._allParams : rs.params || [];
 	}
 	// 적용 뒤 기록(ap)을 적을 줄인가: 병합 표시(mm)가 있거나, v27에 위험하거나, 이미 ap가 있다.
-	// 그 밖의 줄(병합한 적 없는 v27 목록)은 적지 않는다 → session.json 모양이 v27 그대로
+	// 그 밖의 줄(병합한 적 없는 v27 목록)은 적지 않는다 → session.json 모양이 v27 그대로.
+	// 예외 (S1-11, 일부러): 네이티브 프리셋 줄은 ▶·↑로 놓을 때마다 이 함수와 상관없이 ap(nk 포함)를 적는다 — 단일 화자 목록도.
+	// 교체할지(문구·자리가 마지막 적용과 같은지)와 연쇄 자리를 ap로만 알 수 있다. 키를 더할 뿐이라 v27은 읽고 무시한다
 	function needsApplyBook(rs, unsafe) {
 		return !!rs && (!!rs.mm || !!unsafe || !!rs.ap);
 	}
@@ -2860,8 +2869,13 @@
 			else c.value = { strDB: [{ localeString: "en_US", str: t }] };
 			patched++;
 		});
+		return { json: jsonStringifyKeepNumbers(def), textLayers: layers, patched, durSec: mogrtDefDurSec(def) };
+	}
+	// definition.json(읽은 객체, jsonParseKeepNumbers의 표시 문자열 허용) → 템플릿 길이(초):
+	// sourceInfoLocalized의 로캘별 duration(value/scale) 중 가장 긴 것, 없으면 0. AE·네이티브 템플릿 모두 이 자리에 있다
+	function mogrtDefDurSec(def) {
 		let durSec = 0;
-		const info = def.sourceInfoLocalized;
+		const info = def && typeof def === "object" ? def.sourceInfoLocalized : null;
 		if (info && typeof info === "object") {
 			Object.keys(info).forEach((k) => {
 				const d = info[k] && info[k].duration;
@@ -2869,7 +2883,7 @@
 				if (isFinite(v) && v > durSec) durSec = v;
 			});
 		}
-		return { json: jsonStringifyKeepNumbers(def), textLayers: layers, patched, durSec };
+		return durSec;
 	}
 	// 네이티브 적용 전에 지울 클립 자리 → [{t, s}] (같은 자리는 한 번). rows: [{sub, rs, track, nk}],
 	// nk = 네이티브 줄의 굽기 키 (AE 줄은 null. 굽지 못한 네이티브 줄은 넣지 않는다).
@@ -2880,6 +2894,7 @@
 	//     새 클립을 옛 클립 위에 덮어 놓는다
 	//     아니면 지금 자리(track, 시작)와, ap 자리가 다르면 그 자리도 (옛 클립이 남지 않게)
 	//   AE 줄인데 ap.nk가 있다(전에 네이티브로 놓았다): ap 자리와 지금 자리 (v27이 네이티브 클립에 AE 속성을 쓰지 않게)
+	// (교체 규칙의 기준. 패널 ▶·↑는 이 규칙에 연쇄를 더한 nativeApplyPlan을 쓴다)
 	// 네이티브 클립이 '같은 자리'인 시작 차이 (초)
 	const NATIVE_SAME_SEC = 0.0005;
 	function nativeReplaceSpots(rows) {
@@ -2911,27 +2926,43 @@
 	// 네이티브 템플릿이 처음 놓이는 길이(초)의 기본값 (definition 길이를 모를 때. 설치된 템플릿은 5.005~5.09초)과 창 여유
 	const NATIVE_PLACE_SEC = 5.1;
 	const NATIVE_PLACE_MARGIN = 0.5;
+	// ap가 없는 줄의 클립을 트랙의 클립 시작(clipStarts)에서 찾는 허용 차이 (초). 프레임 스냅(§0.4 #11)보다 넉넉하고 줄 간격보다 작다
+	const NATIVE_CLIP_MATCH_SEC = 0.05;
 	// 네이티브 적용 계획 (▶·↑): nativeReplaceSpots의 교체 규칙에 연쇄를 더한다.
 	// v27은 새 클립을 템플릿 길이(약 5초)로 먼저 놓고 나서 끝을 줄인다 → 그 창 안에 이미 있던 뒤 클립은 머리가 잘리거나
 	// 통째로 지워진다 (§0.4 importMGT 기본 길이, S0-3 q). 그래서 새로 놓는 줄의 창 [시작, 시작 + 길이 + 여유) 안에서 시작하는
 	// 네이티브 클립의 줄은 함께 지우고 다시 놓는다 (연쇄. 시작 순서로 놓으면 놓자마자 끝을 줄여 다음 클립을 건드리지 않는다).
+	// 새로 놓는 줄: 바뀐(또는 처음 놓는) 네이티브 대상 줄과, 전에 네이티브로 놓았던 AE 대상 줄(ap.nk: 그 네이티브 클립을 지우면
+	// v27이 AE 템플릿을 새로 놓는다 → 그 줄도 창을 차지한다)
 	// rows: 목록 전체 [{sub, rs, target, native, nk, durSec}] (목록 순서)
 	//   target  이번에 적용하는 줄 (▶ 대상, ↑ 한 줄)
 	//   native  네이티브 프리셋 줄
 	//   nk      놓을 구운 사본 키. target 줄은 이번 굽기 결과(굽지 못했으면 null), target이 아닌 줄은 ap.nk(그 사본 파일이 있을 때, 없으면 null)
-	//   durSec  템플릿 길이 (모르면 0 → NATIVE_PLACE_SEC)
-	// 클립 자리는 검증된 적용 기록(ap)으로만 본다. ap가 없는 줄(v27 AE 줄 대부분, 아직 놓지 않은 줄)은 자리를 몰라 연쇄·위험에서 뺀다.
-	// → {spots: [{t, s}] 먼저 지울 자리, place: {id: 놓을 시작 초} 다시 놓는 네이티브 줄,
+	//   durSec  템플릿 길이 (모르면 0 → NATIVE_PLACE_SEC. AE 줄은 그 AE 템플릿 길이)
+	// clipStarts: 적용 전에 읽은 지금 트랙(track)의 클립 시작 초 [초] (선택)
+	// 클립 자리: 검증된 적용 기록(ap)이 있으면 그 자리. ap가 없는 줄은 clipStarts에 그 줄 시작(NATIVE_CLIP_MATCH_SEC 안)의 클립이
+	// 있으면 {track, 그 시작} (v27이 Math.round(시작×100)으로 찾는 자리. v27이 놓은 AE 줄 대부분), 없거나 clipStarts를 모르면
+	// 자리를 몰라 연쇄·위험에서 뺀다 (아직 놓지 않은 줄은 v27이 시작 순서로 새로 놓는다).
+	// → {spots: [{t, s}] 먼저 지울 자리, place: {id: 놓을 시작 초} 새로 놓는 줄(네이티브 줄, 전에 네이티브로 놓았던 AE 대상 줄),
 	//    extra: [id] target이 아닌데 연쇄로 다시 놓는 줄 (마지막 검증 적용 그대로: ap.nk 사본을 ap.s~ap.e에),
-	//    risk: [id] 창 안에 클립이 있는데 다시 놓을 수 없는 줄 (AE 줄, 굽지 못했거나 사본이 없는 줄, 다른 트랙: 앞부분이 잘릴 수 있다)}
-	function nativeApplyPlan(rows, track) {
+	//    risk: [id] 창 안에 클립이 있는데 다시 놓을 수 없는 줄 (AE 줄, 굽지 못했거나 사본이 없는 줄, 다른 트랙: 앞부분이 잘리거나
+	//    통째로 지워질 수 있다. v27은 적용 전에 모은 옛 클립 참조에 써서 성공으로 센다 → 호출부는 이 줄을 검증된 적용으로 적지 않는다)}
+	function nativeApplyPlan(rows, track, clipStarts) {
 		const list = (rows || []).filter((r) => r && r.sub);
 		const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 		const apOf = (r) => (r.rs && r.rs.ap && typeof r.rs.ap.s === "number" ? r.rs.ap : null);
 		const apTrack = (ap) => (typeof ap.t === "number" ? ap.t : track);
+		const starts = Array.isArray(clipStarts) ? clipStarts.filter((x) => typeof x === "number" && isFinite(x)) : null;
 		const clipAt = (r) => {
 			const ap = apOf(r);
-			return ap ? { t: apTrack(ap), s: ap.s } : null;
+			if (ap) return { t: apTrack(ap), s: ap.s };
+			if (!starts) return null;
+			let best = null;
+			starts.forEach((x) => {
+				const d = Math.abs(x - r.sub.startSec);
+				if (d <= NATIVE_CLIP_MATCH_SEC && (best === null || d < Math.abs(best - r.sub.startSec))) best = x;
+			});
+			return best === null ? null : { t: track, s: best };
 		};
 		const place = {};
 		const extra = [];
@@ -2942,8 +2973,13 @@
 			queue.push(r);
 		};
 		list.forEach((r) => {
-			if (!r.target || !r.native || typeof r.nk !== "string") return;
+			if (!r.target) return;
 			const ap = apOf(r);
+			if (!r.native) {
+				if (ap && ap.nk) put(r, r.sub.startSec);
+				return;
+			}
+			if (typeof r.nk !== "string") return;
 			if (ap && ap.nk === r.nk && apTrack(ap) === track && Math.abs(ap.s - r.sub.startSec) <= NATIVE_SAME_SEC) return;
 			put(r, r.sub.startSec);
 		});
@@ -2973,13 +3009,9 @@
 		};
 		list.forEach((r) => {
 			const ap = apOf(r);
-			if (has(place, r.sub.id)) {
-				add(track, place[r.sub.id]);
-				if (ap && (apTrack(ap) !== track || Math.abs(ap.s - place[r.sub.id]) > NATIVE_SAME_SEC)) add(apTrack(ap), ap.s);
-			} else if (r.target && !r.native && ap && ap.nk) {
-				add(apTrack(ap), ap.s);
-				add(track, r.sub.startSec);
-			}
+			if (!has(place, r.sub.id)) return;
+			add(track, place[r.sub.id]);
+			if (ap && (apTrack(ap) !== track || Math.abs(ap.s - place[r.sub.id]) > NATIVE_SAME_SEC)) add(apTrack(ap), ap.s);
 		});
 		return { spots, place, extra, risk: list.filter((r) => risk[r.sub.id]).map((r) => r.sub.id) };
 	}
@@ -6770,17 +6802,12 @@ var modalState = {
 		const unsafe = isV27Unsafe(rs, preset);
 		const timeChanged = rowTimeChanged(rs, sub);
 		const params = unsafe || timeChanged ? namedParams(rowSendParams(rs)) : rs._allParams.length > 0 ? rs._allParams : rs.params;
+		// 전에 네이티브로 놓은 줄(ap.nk)을 AE 프리셋으로 바꿨다: 그 네이티브 클립을 지우고 AE 템플릿을 새로 놓는 교체다.
+		// 남겨 두면 updateClipAtTime이 그 클립을 찾아 AE 속성을 쓰려 하고(네이티브 분기, 아무것도 안 됨) 성공으로 끝난다.
+		// 새 클립은 템플릿 길이 창을 차지하므로 네이티브 줄과 같은 계획(연쇄·위험 표시)으로 놓는다 (S1-11, src/mi/apply.ts)
+		if (rs.ap && rs.ap.nk) return _nativeUpdateAe(sub, rs, preset, params);
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
-		// 전에 네이티브로 놓은 줄(ap.nk)을 AE 프리셋으로 바꿨다: 그 네이티브 클립을 먼저 지운다. 남아 있으면
-		// updateClipAtTime이 그 클립을 찾아 AE 속성을 쓰려 하고(네이티브 분기, 아무것도 안 됨) 성공으로 끝난다 (S1-11)
-		if (rs.ap && rs.ap.nk) {
-			const rm = await _removeNativeSpots(nativeReplaceSpots([{ sub, rs, track: trackIndex, nk: null }]));
-			if (!rm.ok) {
-				_setStatus("[" + sub.index + "] 네이티브 클립을 지우지 못했습니다: " + rm.error, "err");
-				return;
-			}
-		}
 		_setStatus("클립 업데이트 중...", "info");
 		const seq = _importSeqToken();
 		let res;
@@ -8011,7 +8038,8 @@ var modalState = {
 	// v27 ▶ 본문 (doApplyToTimeline v27). 달라진 것은 셋이다:
 	//   v27에 위험한 줄은 namedParams를 보낸다 (나머지 줄은 v27과 같은 바이트)
 	//   결과에 "(실패"가 없을 때만 mm·위험·ap가 있는 줄에 ap를 적고 병합 표시를 지운다
-	//   네이티브 프리셋 줄은 구운 사본을 텍스트 params 없이 보낸다 (_nativePrepare, S1-11. 네이티브 줄이 없으면 하지 않는다)
+	//   네이티브 프리셋 줄은 구운 사본을 텍스트 params 없이 보낸다 (_nativePrepare, S1-11. 네이티브 줄이 없으면 하지 않는다).
+	//   새로 놓는 네이티브 클립 창 안의 위험한 줄(nat.risk)은 ap를 적지 않고 줄에 표시한다
 	async function _legacyApply(targetSubs) {
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
@@ -8019,6 +8047,9 @@ var modalState = {
 		// 네이티브 줄이 없는 목록은 기다리지 않고 v27 그대로 (굽기·지우기 없음)
 		const nat = _hasNativeWork(targetSubs) ? await _nativePrepare(targetSubs, trackIndex, seq) : null;
 		if (nat === false) return;
+		// 새로 놓는 네이티브 클립 창 안에 클립이 있어 앞부분이 잘리거나 지워질 수 있는 줄: v27은 적용 전에 모은 옛 클립 참조에 써서
+		// 성공으로 센다 → 검증된 적용(ap)을 적지 않고 병합 표시도 남긴다. 놓은 뒤 줄에 위험을 표시한다
+		const risky = nat ? _idSet(nat.risk) : {};
 		const books = [];
 		const items = [];
 		(nat ? _nativeOrder(targetSubs, nat) : targetSubs).forEach((sub) => {
@@ -8033,13 +8064,13 @@ var modalState = {
 			if (bk) {
 				// 굽지 못한 네이티브 줄은 놓지 않는다 (기본 문구·빈 글자로 놓이지 않게. 줄에 까닭이 적혀 있다)
 				if (!bk.ok) return;
-				books.push({ sub, rs, preset, nk: bk.key });
+				if (!risky[sub.id]) books.push({ sub, rs, preset, nk: bk.key });
 				items.push({ mogrtPath: bk.path, startSec: sub.startSec, endSec: sub.endSec, text: sub.text, params: [] });
 				return;
 			}
 			const unsafe = isV27Unsafe(rs, preset);
 			const params = unsafe ? namedParams(rowSendParams(rs)) : rs._allParams.length > 0 ? rs._allParams : rs.params;
-			if (needsApplyBook(rs, unsafe)) books.push({ sub, rs, preset });
+			if (needsApplyBook(rs, unsafe) && !risky[sub.id]) books.push({ sub, rs, preset });
 			items.push({
 				mogrtPath: preset ? preset.mogrtPath : "",
 				startSec: sub.startSec,
@@ -8070,6 +8101,7 @@ var modalState = {
 			return;
 		}
 		btnApply.disabled = false;
+		if (nat && seq === _importSeqToken()) _markNativeRisk(nat.risk);
 		if (res.startsWith("SUCCESS")) {
 			const ok = v27ResultOk(res);
 			// 그 사이 시퀀스가 바뀌었으면(폴러가 목록을 바꿨다) 적지 않는다
@@ -8249,7 +8281,7 @@ var modalState = {
 		write: "사본을 쓰지 못함"
 	};
 	var _bakedPruned = {}; // projKey → 이번 세션에 구운 사본을 정리했는가
-	var _bakeDurMemo = {}; // 원본 경로|수정 시각 → 템플릿 길이(초, definition). 다시 쓴 사본의 연쇄 창에 쓴다
+	var _bakeDurMemo = {}; // 템플릿 경로|수정 시각 → 템플릿 길이(초, definition). 연쇄 창에 쓴다 (_templateDurSec)
 	// Node 모듈 (CEP --enable-nodejs --mixed-context). 못 쓰면 null
 	function _nodeRequire(name) {
 		try {
@@ -8269,6 +8301,31 @@ var modalState = {
 	// 구운 사본에 넣지 않는 항목: 썸네일 동영상과 지역화 썸네일 (thumb.png는 둔다)
 	function _bakeDropEntry(name) {
 		return /^thumb[^/]*\.(mp4|mov|m4v)$/i.test(name) || /^thumb_[A-Za-z]{2}_[A-Za-z]{2}\.(png|jpe?g)$/i.test(name);
+	}
+	// MOGRT 파일(원본 템플릿, AE·네이티브)의 길이(초): definition.json의 sourceInfoLocalized duration (mogrtDefDurSec).
+	// 경로|수정 시각마다 한 번 읽는다 (zip 목록과 definition.json만 푼다). 못 읽으면 0 (→ 연쇄 창은 NATIVE_PLACE_SEC).
+	// mtime: 호출부가 이미 읽은 수정 시각 (없으면 여기서 읽는다)
+	async function _templateDurSec(path, mtime) {
+		const fs = _nodeRequire("fs");
+		if (!fs || typeof JSZip === "undefined" || !path) return 0;
+		let m = mtime;
+		if (typeof m !== "number") {
+			try {
+				m = fs.statSync(path).mtimeMs;
+			} catch (_) {
+				return 0;
+			}
+		}
+		const memoKey = String(path) + "|" + m;
+		if (Object.prototype.hasOwnProperty.call(_bakeDurMemo, memoKey)) return _bakeDurMemo[memoKey];
+		let dur = 0;
+		try {
+			const zip = await JSZip.loadAsync(new Uint8Array(fs.readFileSync(path)));
+			const f = zip.file("definition.json");
+			if (f) dur = mogrtDefDurSec(jsonParseKeepNumbers(await f.async("string")));
+		} catch (_) {}
+		_bakeDurMemo[memoKey] = dur;
+		return dur;
 	}
 	// 네이티브 MOGRT srcPath에 texts(index 순)를 구운 사본 → {ok: true, path, key, reused, durSec} | {ok: false, why, detail}
 	//   definition.json의 TextLayer 수와 모든 project*.prgraphic의 Source Text 블롭 수가 texts 수와 같아야 한다
@@ -8290,15 +8347,18 @@ var modalState = {
 		const key = nativeBakeKey(srcPath, mtime, list);
 		const out = dir + "/" + key + ".mogrt";
 		const durKey = String(srcPath) + "|" + mtime;
+		let reuse = false;
 		try {
 			if (fs.existsSync(out)) {
 				try {
 					const now = new Date();
 					fs.utimesSync(out, now, now);
 				} catch (_) {}
-				return { ok: true, path: out, key, reused: true, durSec: _bakeDurMemo[durKey] || 0 };
+				reuse = true;
 			}
 		} catch (_) {}
+		// 다시 쓰는 사본의 길이: 이번 세션에 구웠으면 그 값, 아니면(패널을 다시 연 뒤) 원본 definition을 한 번 읽는다
+		if (reuse) return { ok: true, path: out, key, reused: true, durSec: await _templateDurSec(srcPath, mtime) };
 		let zip;
 		try {
 			zip = await JSZip.loadAsync(new Uint8Array(fs.readFileSync(srcPath)));
@@ -8431,8 +8491,8 @@ var modalState = {
 			return _isNativePreset(_rowPreset(sub)) || !!(rs && rs.ap && rs.ap.nk);
 		});
 	}
-	// 자리 [{t, s}]의 네이티브 클립을 지운다 (트랙마다 한 번) → {ok, removed, error}
-	async function _removeNativeSpots(spots) {
+	// 자리 [{t, s}]의 네이티브 클립을 지운다 (트랙마다 한 번) → {ok, removed, error}. seqId: 작업 시퀀스 식별자 (활성이 다르면 지우지 않는다)
+	async function _removeNativeSpots(spots, seqId) {
 		const byTrack = {};
 		(spots || []).forEach((p) => {
 			(byTrack[p.t] = byTrack[p.t] || []).push(p.s);
@@ -8441,7 +8501,7 @@ var modalState = {
 		for (const t of Object.keys(byTrack)) {
 			let res;
 			try {
-				res = await host.removeNativeClipsAt({ t: Number(t), s: byTrack[t] });
+				res = await host.removeNativeClipsAt({ t: Number(t), s: byTrack[t], seqId });
 			} catch (err) {
 				return { ok: false, removed, error: err.hostReason || err.message };
 			}
@@ -8467,34 +8527,93 @@ var modalState = {
 		}
 	}
 	// nativeApplyPlan 입력: 목록 전체(화자 줄 제외)와 휴지통의 적용한 줄(타임라인에 클립이 남는다. 다시 놓지는 않고 위험만 본다).
-	// targetIds의 줄은 baked[id] 결과, 그 밖의 네이티브 줄은 ap.nk 사본 파일이 있을 때만 다시 놓을 수 있다
-	function _nativePlanRows(targetIds, baked) {
-		const rows = state.subtitles.filter((s) => !s.spk).map((sub) => {
-			const rs = state.rowStates[sub.id];
-			const native = _isNativePreset(_rowPreset(sub));
+	// targetIds의 줄은 baked[id] 결과, 그 밖의 네이티브 줄은 ap.nk 사본 파일이 있을 때만 다시 놓을 수 있다.
+	// durSec(연쇄 창): 대상 네이티브 줄은 굽기 결과, 대상 밖 네이티브 줄은 지금 프리셋 템플릿 길이(ap.nk 사본도 그 원본에서
+	// 구웠다), 전에 네이티브로 놓았던 AE 대상 줄은 그 AE 템플릿 길이 (_templateDurSec: 템플릿마다 한 번 읽는다)
+	async function _nativePlanRows(targetIds, baked) {
+		const subs = state.subtitles;
+		const rowStates = state.rowStates;
+		const durs = {};
+		const durOf = async (preset) => {
+			const p = preset && preset.mogrtPath;
+			if (!p) return 0;
+			if (!Object.prototype.hasOwnProperty.call(durs, p)) durs[p] = await _templateDurSec(p);
+			return durs[p];
+		};
+		const rows = [];
+		for (const sub of subs) {
+			if (sub.spk) continue;
+			const rs = rowStates[sub.id];
+			const preset = rs && rs.presetId ? state.presets[rs.presetId] || null : null;
+			const native = _isNativePreset(preset);
 			const target = !!targetIds[sub.id];
 			const bk = target ? baked[sub.id] : null;
+			const apNk = rs && rs.ap && typeof rs.ap.nk === "string" ? rs.ap.nk : null;
 			let nk = null;
-			if (bk) nk = bk.ok ? bk.key : null;
-			else if (!target && native && rs && rs.ap && typeof rs.ap.nk === "string" && _bakedExists(rs.ap.nk)) nk = rs.ap.nk;
-			return { sub, rs, target, native, nk, durSec: bk && bk.durSec ? bk.durSec : 0 };
-		});
+			let durSec = 0;
+			if (bk) {
+				nk = bk.ok ? bk.key : null;
+				durSec = bk.durSec || 0;
+			} else if (!target && native && apNk && _bakedExists(apNk)) {
+				nk = apNk;
+				durSec = await durOf(preset);
+			} else if (target && !native && apNk) durSec = await durOf(preset);
+			rows.push({ sub, rs, target, native, nk, durSec });
+		}
 		(state.trashBin || []).forEach((t) => {
 			if (t && t.sub && !t.sub.spk && t.state && t.state.ap) rows.push({ sub: t.sub, rs: t.state, target: false, native: false, nk: null, durSec: 0 });
 		});
 		return rows;
 	}
+	// 트랙의 클립 시작 초 (v27 getTimelineClips, 읽기만) → [초] | null (읽지 못함: ap가 없는 줄은 자리를 모르는 채로 계획). 트랙이 없으면 []
+	async function _trackClipStarts(trackIndex) {
+		let res;
+		try {
+			res = String(await host.getTimelineClips({ videoTrackIndex: trackIndex }));
+		} catch (err) {
+			console.warn("[MOGRT] 트랙 클립 읽기 실패 (ap가 없는 줄은 연쇄·위험에서 뺍니다):", err.hostReason || err.message);
+			return null;
+		}
+		if (/^ERROR:\s*트랙 없음/.test(res)) return [];
+		if (res.indexOf("ERROR") === 0) return null;
+		try {
+			const list = JSON.parse(res);
+			return Array.isArray(list) ? list.map((c) => Number(c && c.startSec)).filter((x) => isFinite(x)) : null;
+		} catch (_) {
+			return null;
+		}
+	}
+	// 계획 (nativeApplyPlan). 새로 놓는 줄이 있으면 지금 트랙의 클립 시작을 읽어(ap가 없는 줄의 클립 자리) 다시 세운다
+	// (새로 놓는 줄이 없으면 창도 없다 → 읽지 않는다)
+	async function _nativePlan(rows, trackIndex) {
+		const plan = nativeApplyPlan(rows, trackIndex);
+		if (!Object.keys(plan.place).length) return plan;
+		return nativeApplyPlan(rows, trackIndex, await _trackClipStarts(trackIndex));
+	}
 	const NATIVE_RISK_RES = "앞부분이 잘렸을 수 있음 (앞 줄 네이티브 교체)";
-	// 계획의 자리를 지우고 위험한 줄을 표시한다 → {ok, error}
-	async function _nativeRemoveFor(plan) {
-		plan.risk.forEach((id) => {
+	const NATIVE_SEQ_CHANGED_MSG = "시퀀스가 바뀌어 적용을 취소했습니다";
+	// 계획의 자리를 지운다 → {ok, removed, error}. seqId: 적용을 시작할 때의 작업 시퀀스 식별자 (state.currentSequenceId).
+	// error "seq-changed": 활성 시퀀스가 그 시퀀스가 아니라 지우지 않았다 (적용 중에 사용자가 시퀀스를 바꿨다)
+	async function _nativeRemoveFor(plan, seqId) {
+		if (!plan.spots.length) return { ok: true, removed: 0 };
+		setStatus("네이티브 클립 지우는 중... (" + plan.spots.length + "곳)", "info");
+		return _removeNativeSpots(plan.spots, seqId);
+	}
+	// 그 사이 시퀀스가 바뀌었는가 (폴러가 목록을 바꿨거나, 활성 시퀀스가 작업 시퀀스가 아니라 지우지 않았다) → 상태 줄에 알리고 true.
+	// 이미 지운 클립이 있으면 알린다 (그 줄들의 ap는 그대로라 그 시퀀스에서 ▶를 다시 누르면 v27이 빈 자리에 새로 놓는다)
+	function _nativeSeqChanged(seq, rm) {
+		if (seq === _importSeqToken() && !(rm && !rm.ok && rm.error === "seq-changed")) return false;
+		const n = rm && rm.removed ? rm.removed : 0;
+		setStatus(NATIVE_SEQ_CHANGED_MSG + (n ? " (이미 지운 네이티브 클립 " + n + "개는 그 시퀀스에서 ▶로 다시 놓을 수 있습니다)" : ""), "err");
+		return true;
+	}
+	// 위험한 줄(nativeApplyPlan risk)을 줄에 표시한다. v27이 놓은 뒤에 부른다 (검증된 적용으로 적지 않은 줄이다)
+	function _markNativeRisk(ids) {
+		(ids || []).forEach((id) => {
 			_setRowRes(id, NATIVE_RISK_RES);
 			const sub = state.subtitles.find((s) => s.id === id);
 			if (sub) _refreshRowMarks(sub);
 		});
-		if (!plan.spots.length) return { ok: true, removed: 0 };
-		setStatus("네이티브 클립 지우는 중... (" + plan.spots.length + "곳)", "info");
-		return _removeNativeSpots(plan.spots);
 	}
 	function _idSet(ids) {
 		const o = {};
@@ -8506,6 +8625,7 @@ var modalState = {
 	// 굽지 못한 줄은 줄에 까닭을 적고 지우지도 놓지도 않는다
 	// → {baked, failed, extra: {id: true} 연쇄로 다시 놓는 대상 밖 줄, risk: [id]} | false (중단: 시퀀스가 바뀌었거나 지우지 못했다)
 	async function _nativePrepare(targetSubs, trackIndex, seq) {
+		const seqId = state.currentSequenceId; // seq와 같은 틱에 읽는다 (_legacyApply가 기다리지 않고 부른다)
 		const baked = {};
 		let failed = 0;
 		const natives = targetSubs.filter((sub) => _isNativePreset(_rowPreset(sub)));
@@ -8516,10 +8636,7 @@ var modalState = {
 				const sub = natives[k];
 				setStatus("네이티브 템플릿에 문구 굽는 중... " + (k + 1) + "/" + natives.length, "info");
 				const r = await _bakeRow(sub, state.rowStates[sub.id], _rowPreset(sub));
-				if (seq !== _importSeqToken()) {
-					setStatus("시퀀스가 바뀌어 적용을 취소했습니다", "err");
-					return false;
-				}
+				if (_nativeSeqChanged(seq)) return false;
 				baked[sub.id] = r;
 				if (!r.ok) {
 					failed++;
@@ -8527,8 +8644,10 @@ var modalState = {
 					_refreshRowMarks(sub);
 				}
 			}
-			const plan = nativeApplyPlan(_nativePlanRows(_idSet(targetSubs.map((s) => s.id)), baked), trackIndex);
-			const rm = await _nativeRemoveFor(plan);
+			const plan = await _nativePlan(await _nativePlanRows(_idSet(targetSubs.map((s) => s.id)), baked), trackIndex);
+			if (_nativeSeqChanged(seq)) return false;
+			const rm = await _nativeRemoveFor(plan, seqId);
+			if (_nativeSeqChanged(seq, rm)) return false;
 			if (!rm.ok) {
 				setStatus("네이티브 클립을 지우지 못해 적용을 멈췄습니다: " + rm.error, "err");
 				return false;
@@ -8557,32 +8676,19 @@ var modalState = {
 		if (nat.risk && nat.risk.length) parts.push("뒤 줄 " + nat.risk.length + "개는 새로 놓은 클립(약 5초)에 앞부분이 잘렸을 수 있습니다 (줄에 표시)");
 		return { text: parts.length ? " — " + parts.join(" · ") : "", err: !!(nat.failed || (nat.risk && nat.risk.length)) };
 	}
-	// ↑ 네이티브 줄 (updateSingleClip): 굽고 → 계획대로 지우고(문구·자리가 바뀌었으면 그 줄, 새 클립 창 안의 뒤 네이티브 줄) →
-	// v27 applyToTimeline으로 놓는다. updateClipAtTime은 시작 ±0.5초 안의 다른 줄 클립을 잡아 속성만 쓰고(빈 목록 → 아무것도
-	// 안 함) 끝날 수 있다. applyToTimeline은 같은 시작(10ms 키)만 보고, 없으면 새로 놓는다
-	async function _nativeUpdateSingle(sub, rs, preset) {
-		const trackIndex = parseInt(document.getElementById("trackSel").value, 10);
-		const seq = _importSeqToken();
-		setStatus("[" + sub.index + "] 네이티브 템플릿에 문구 굽는 중...", "info");
-		const bk = await _bakeRow(sub, rs, preset);
-		if (seq !== _importSeqToken()) {
-			setStatus("시퀀스가 바뀌어 적용을 취소했습니다", "err");
-			return;
-		}
-		if (!bk.ok) {
-			_setRowRes(sub.id, "네이티브 굽기 실패: " + _bakeWhy(bk));
-			_refreshRowMarks(sub);
-			setStatus("[" + sub.index + "] 네이티브 템플릿에 문구를 굽지 못했습니다: " + _bakeWhy(bk), "err");
-			return;
-		}
-		const plan = nativeApplyPlan(_nativePlanRows(_idSet([sub.id]), { [sub.id]: bk }), trackIndex);
-		const rm = await _nativeRemoveFor(plan);
+	// ↑ 한 줄 교체 (_nativeUpdateSingle·_nativeUpdateAe): 계획대로 지우고(그 줄, 새 클립 창 안의 뒤 네이티브 줄) → v27 applyToTimeline으로
+	// item과 연쇄 줄(마지막 적용 그대로)을 시작 순서로 놓는다 → 결과에 실패가 없으면 book()으로 검증된 적용을 적는다.
+	// updateClipAtTime은 쓰지 않는다: 시작 ±0.5초 안의 다른 줄 클립을 잡아 속성만 쓰거나(네이티브 사본은 빈 목록 → 아무것도 안 함),
+	// 클립을 못 찾으면 insertClip(뒤 클립을 민다)·importMGT로 놓는다. applyToTimeline은 같은 시작(10ms 키)만 보고, 없으면 덮어 놓는다
+	async function _nativeReplaceOne(sub, item, plan, trackIndex, seq, seqId, book, doneText) {
+		const rm = await _nativeRemoveFor(plan, seqId);
+		if (_nativeSeqChanged(seq, rm)) return;
 		if (!rm.ok) {
 			setStatus("[" + sub.index + "] 네이티브 클립을 지우지 못했습니다: " + rm.error, "err");
 			return;
 		}
 		const extra = _idSet(plan.extra);
-		const items = [{ mogrtPath: bk.path, startSec: sub.startSec, endSec: sub.endSec, text: sub.text, params: [] }]
+		const items = [item]
 			.concat(state.subtitles.filter((s) => extra[s.id]).map((s) => _nativeExtraItem(s, state.rowStates[s.id])))
 			.sort((a, b) => a.startSec - b.startSec);
 		let res;
@@ -8592,17 +8698,51 @@ var modalState = {
 			setStatus("클립 업데이트 실패: " + (err.hostReason || err.message), "err");
 			return;
 		}
+		const same = seq === _importSeqToken();
 		const note = _nativeNote({ failed: 0, extra, risk: plan.risk });
 		if (v27ResultOk(res)) {
-			if (seq === _importSeqToken()) {
-				markApplied(rs, sub, preset, trackIndex, bk.key);
+			if (same) {
+				book();
 				_setRowRes(sub.id, null);
 				_refreshRowMarks(sub);
 				saveSessionToStorage();
 				updateMultiSelect();
 			}
-			setStatus("[" + sub.index + "] 네이티브 클립 " + (Object.prototype.hasOwnProperty.call(plan.place, sub.id) ? "교체" : "적용") + " 완료" + note.text, note.err ? "err" : "ok");
+			setStatus("[" + sub.index + "] " + doneText + note.text, note.err ? "err" : "ok");
 		} else setStatus("[" + sub.index + "] " + String(res).replace(/^(SUCCESS|ERROR):\s*/, "") + note.text, "err");
+		if (same) _markNativeRisk(plan.risk);
+	}
+	// ↑ 네이티브 줄 (updateSingleClip): 굽고 → 계획대로 교체 (_nativeReplaceOne)
+	async function _nativeUpdateSingle(sub, rs, preset) {
+		const trackIndex = parseInt(document.getElementById("trackSel").value, 10);
+		const seq = _importSeqToken();
+		const seqId = state.currentSequenceId;
+		setStatus("[" + sub.index + "] 네이티브 템플릿에 문구 굽는 중...", "info");
+		const bk = await _bakeRow(sub, rs, preset);
+		if (_nativeSeqChanged(seq)) return;
+		if (!bk.ok) {
+			_setRowRes(sub.id, "네이티브 굽기 실패: " + _bakeWhy(bk));
+			_refreshRowMarks(sub);
+			setStatus("[" + sub.index + "] 네이티브 템플릿에 문구를 굽지 못했습니다: " + _bakeWhy(bk), "err");
+			return;
+		}
+		const plan = await _nativePlan(await _nativePlanRows(_idSet([sub.id]), { [sub.id]: bk }), trackIndex);
+		if (_nativeSeqChanged(seq)) return;
+		const item = { mogrtPath: bk.path, startSec: sub.startSec, endSec: sub.endSec, text: sub.text, params: [] };
+		const done = "네이티브 클립 " + (Object.prototype.hasOwnProperty.call(plan.place, sub.id) ? "교체" : "적용") + " 완료";
+		await _nativeReplaceOne(sub, item, plan, trackIndex, seq, seqId, () => markApplied(rs, sub, preset, trackIndex, bk.key), done);
+	}
+	// ↑ 전에 네이티브로 놓았던 줄(ap.nk)을 AE 프리셋으로 (updateSingleClip): 그 네이티브 클립을 지우면 v27이 AE 템플릿을 새로 놓는다
+	// (템플릿 길이 창을 차지한다) → 네이티브 줄과 같은 계획으로 교체한다 (창 안의 뒤 네이티브 줄은 연쇄, 그 밖은 위험 표시)
+	async function _nativeUpdateAe(sub, rs, preset, params) {
+		const trackIndex = parseInt(document.getElementById("trackSel").value, 10);
+		const seq = _importSeqToken();
+		const seqId = state.currentSequenceId;
+		setStatus("[" + sub.index + "] 네이티브 클립을 AE 템플릿으로 바꾸는 중...", "info");
+		const plan = await _nativePlan(await _nativePlanRows(_idSet([sub.id]), {}), trackIndex);
+		if (_nativeSeqChanged(seq)) return;
+		const item = { mogrtPath: preset.mogrtPath, startSec: sub.startSec, endSec: sub.endSec, text: sub.text, params };
+		await _nativeReplaceOne(sub, item, plan, trackIndex, seq, seqId, () => markApplied(rs, sub, preset, trackIndex), "네이티브 클립을 AE 템플릿으로 교체 완료");
 	}
 	// DEV·하드 테스트 훅: 굽기와 네이티브 클립 지우기를 직접 부른다 (코드를 고치지 않고 확인할 때)
 	window._mogrtDebug.bakeNative = (srcPath, texts) => bakeNativeMogrt(srcPath, texts);

@@ -267,9 +267,57 @@ test("nativeApplyPlan 연쇄: 새로 놓는 클립 창(길이 + 0.5초) 안의 �
 		{ spots: [], place: {}, extra: [], risk: [] });
 	p = plan([row(1, 2, { nk: K("b"), durSec: 9 }), row(2, 11, { rs: { ap: ap(11, 12, K("c")) }, nk: K("c") })]);
 	assert.deepEqual(p.place, { 1: 2, 2: 11 }, "9초 템플릿 창 [2, 11.5)");
-	// 굽지 못한 대상 줄은 놓지도 지우지도 않는다. AE 대상 줄의 ap.nk(전에 네이티브)는 지운다
+	// 굽지 못한 대상 줄은 놓지도 지우지도 않는다. AE 대상 줄의 ap.nk(전에 네이티브)는 지우고 v27이 AE 템플릿을 새로 놓는다
 	p = plan([row(1, 2, { rs: { ap: ap(2, 4, K("a")) }, nk: null }), row(2, 10, { native: false, rs: { ap: ap(10, 12, K("f")) } })]);
-	assert.deepEqual([p.place, p.spots], [{}, [{ t: 2, s: 10 }]]);
+	assert.deepEqual([p.place, p.spots], [{ 2: 10 }, [{ t: 2, s: 10 }]]);
+});
+
+test("nativeApplyPlan: 전에 네이티브로 놓은 AE 대상 줄(ap.nk)도 창을 차지한다 — 창 안의 네이티브 줄은 연쇄, 그 밖은 위험 (AE 템플릿 길이)", () => {
+	const sub = (id, s, e) => ({ id, startSec: s, endSec: e });
+	const K = (c) => c.repeat(32);
+	const ap = (s, e, nk, t) => ({ s, e, cap: "x", ps: "p", t: t === undefined ? 2 : t, nk });
+	const plan = (rows, clips) => plain(core.nativeApplyPlan(rows, 2, clips));
+	// 리뷰 재현: 3초 줄을 AE로 바꿨다 (ap.nk), 5초 네이티브 줄은 그대로 → 전에는 {spots: [3], place: {}} (5초 줄이 머리 잘림)
+	let p = plan([
+		{ sub: sub(2, 3, 4.5), rs: { ap: ap(3, 4.5, K("a")) }, target: true, native: false, nk: null, durSec: 0 },
+		{ sub: sub(3, 5, 6.5), rs: { ap: ap(5, 6.5, K("c")) }, target: true, native: true, nk: K("c"), durSec: 0 }
+	]);
+	assert.deepEqual(p, { spots: [{ t: 2, s: 3 }, { t: 2, s: 5 }], place: { 2: 3, 3: 5 }, extra: [], risk: [] });
+	// 트랙을 옮겼으면 옛 자리(ap)도 지운다. AE 템플릿이 10초면 창이 길다: 12초 대상 밖 네이티브 줄은 연쇄, 13초 AE 줄은 위험
+	p = plan([
+		{ sub: sub(1, 3, 4), rs: { ap: ap(3, 4, K("a"), 1) }, target: true, native: false, nk: null, durSec: 10 },
+		{ sub: sub(2, 12, 12.5), rs: { ap: ap(12, 12.5, K("d")) }, target: false, native: true, nk: K("d"), durSec: 0 },
+		{ sub: sub(3, 13, 14), rs: { ap: ap(13, 14) }, target: false, native: false, nk: null, durSec: 0 }
+	]);
+	assert.deepEqual(p.place, { 1: 3, 2: 12 });
+	assert.deepEqual(p.extra, [2]);
+	assert.deepEqual(p.risk, [3]);
+	assert.deepEqual(p.spots, [{ t: 2, s: 3 }, { t: 1, s: 3 }, { t: 2, s: 12 }]);
+	// ap가 없는 AE 줄은 AE 템플릿을 새로 놓지 않는다 (v27 그대로) → 창이 없다
+	assert.deepEqual(plan([{ sub: sub(1, 3, 4), rs: {}, target: true, native: false, nk: null, durSec: 0 }]), { spots: [], place: {}, extra: [], risk: [] });
+});
+
+test("nativeApplyPlan clipStarts: ap가 없는 줄은 트랙의 클립 시작(0.05초 안)으로 자리를 찾는다 — 창 안에 클립이 있으면 위험, 없으면(아직 놓지 않았다) 빼고, 모르면(null) 뺀다", () => {
+	const sub = (id, s, e) => ({ id, startSec: s, endSec: e });
+	const K = (c) => c.repeat(32);
+	const ap = (s, e, nk) => ({ s, e, cap: "x", ps: "p", t: 2, nk });
+	const plan = (rows, clips) => plain(core.nativeApplyPlan(rows, 2, clips));
+	// 리뷰 재현: [네이티브 1초(문구 바뀜), v27 AE 3초(ap 없음), 네이티브 5초(그대로)]
+	const rows = [
+		{ sub: sub(1, 1, 2.5), rs: { ap: ap(1, 2.5, K("a")) }, target: true, native: true, nk: K("b"), durSec: 0 },
+		{ sub: sub(2, 3, 4.5), rs: {}, target: true, native: false, nk: null, durSec: 0 },
+		{ sub: sub(3, 5, 6.5), rs: { ap: ap(5, 6.5, K("c")) }, target: true, native: true, nk: K("c"), durSec: 0 },
+		{ sub: sub(4, 5.5, 6), rs: {}, target: false, native: false, nk: null, durSec: 0 },
+		{ sub: sub(5, 20, 21), rs: {}, target: true, native: false, nk: null, durSec: 0 }
+	];
+	let p = plan(rows, [1.001, 2.9883, 4.9998, 5.52, 20]);
+	assert.deepEqual(p.place, { 1: 1, 3: 5 });
+	assert.deepEqual(p.risk, [2, 4], "3초 AE 대상 줄(프레임 스냅 12ms)·5.5초 대상 밖 줄은 창 안 클립 → 위험. 20초 줄은 창 밖");
+	assert.deepEqual(p.spots, [{ t: 2, s: 1 }, { t: 2, s: 5 }], "위험한 줄은 지우지 않는다");
+	p = plan(rows, [1, 5]);
+	assert.deepEqual(p.risk, [], "3초·5.5초에 클립이 없다 (아직 놓지 않은 줄: v27이 시작 순서로 새로 놓는다)");
+	assert.deepEqual(plan(rows).risk, [], "클립 목록을 모르면 ap가 없는 줄은 뺀다");
+	assert.deepEqual(plan(rows, [1, 3.06, 5]).risk, [], "0.05초 밖 클립은 그 줄 것이 아니다");
 });
 
 test("patchNativeDefinition durSec: sourceInfoLocalized duration 중 가장 긴 것 (없으면 0)", () => {

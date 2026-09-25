@@ -483,6 +483,8 @@ function makeHost(opts) {
 	host.handlers.$ = () => "C:/Temp";
 	// 네이티브 클립 지우기 (S1-11 ExtendScript 식, 인자 JSON {t, s}): 기본은 지운 것이 없다
 	host.handlers.removeNativeClipsAt = () => "SUCCESS: 0";
+	// v27 트랙 클립 목록 (S1-11 연쇄 계획이 ap 없는 줄의 클립 자리를 찾을 때 읽는다): 기본은 빈 트랙
+	host.handlers.getTimelineClips = () => "[]";
 	return host;
 }
 function parseCall(script) {
