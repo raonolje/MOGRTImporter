@@ -157,6 +157,12 @@ test("U+2028: 이스케이프해 보낸 payload는 읽히고, 호스트 응답�
 	const r = JSON.parse(raw);
 	assert.equal(r.tracks[0].clips[0].name, "줄" + SEP_A + "바꿈 [MI:ab12-3.1]");
 	assert.equal(r.tracks[0].clips[0].g, 1, "태그는 이름 끝");
-	const t = sim.call("MI_readClipTexts", Object.assign({}, base, { items: [{ track: 2, nodeId: sim.nodeId(c) }] }));
+	// 속성 값에는 날 U+2028이 있다 (v27 JSON 폴리필이 이스케이프하지 않는다). 시뮬레이터의 JSON.parse는 ExtendScript eval처럼
+	// 날 U+2028을 거부하므로(S0-3 h), 호스트가 이스케이프해 읽지 않으면 ""가 된다
+	assert.ok(sim.capsule(c).props[0].value.indexOf(SEP_A) !== -1, "속성 값에 날 U+2028");
+	assert.equal(sim.callRaw("parsePayload", JSON.stringify("\"a" + SEP_A + "b\"")), "null", "날 U+2028 → 폴리필 parse 실패");
+	assert.equal(sim.callRaw("parsePayload", JSON.stringify("\"a" + BS + "u2028b\"")), "a" + SEP_A + "b", "이스케이프하면 읽힌다");
+	const t = sim.call("MI_readClipTexts", Object.assign({}, base, { items: [{ track: 2, nodeId: sim.nodeId(c) }], want: { texts: true, params: true } }));
 	assert.deepEqual(t.results[0].texts, ["가" + SEP_A + "나", "포인트"]);
+	assert.equal(t.results[0].params[0].value, "가" + SEP_A + "나", "before(ParamDef) 값도 그대로 — 되돌리기가 캡션을 비우지 않는다");
 });

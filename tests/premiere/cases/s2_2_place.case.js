@@ -23,6 +23,9 @@
  *   T15 MGT 속성에 키프레임 → partial + keyed, 값 그대로
  *   T16 옛 8속성 클립 + 15속성 프리셋 params → 캡션은 옛 클립의 캡션 이름 속성에, 색은 이름으로 찾은 속성에, 새 전용 속성은 skipped
  *   T17 move → nodeId·효과(Tint)·Motion 키프레임 그대로, 시작 = sf, 끝 = ef
+ *   R1  같은 트랙 moveRegen, 옛 클립이 새 sf를 걸친다 → 새 클립 하나만, 옛 태그 조각이 남지 않는다
+ *   R2  replace 실패, 옛 템플릿 길이 안(새 자리 확인 밖)에 남의 클립 → lost-old, 남의 클립 그대로 (되놓기가 지우지 않는다)
+ *   R3  구운 네이티브를 문구 param(nativeText)과 함께 place → placed, skipped 없음
  * 실행: npm run hard -- s2_2
  * 단계 함수 steps(env)는 가짜 Premiere(tests/lib/premiereSim.js)로 미리 돌려 볼 수 있게 따로 내보낸다.
  */
@@ -400,6 +403,38 @@ async function steps(env) {
 	assert.deepEqual([d1.comps, d1.motionKeyed, d1.name], [d0.comps, true, d0.name], "효과·키프레임·이름 그대로");
 	assert.deepEqual(d1.props.map((p) => p[1]), d0.props.map((p) => p[1]), "속성 그대로");
 	log("T17 move: nodeId·효과(" + deco + ")·Motion 키 그대로");
+
+	// ── 리뷰 반영 (S2-1, S2-2) ──
+	// R1: 같은 트랙 moveRegen, 옛 클립이 새 sf를 걸친다 → 옛 클립을 둘로 자른 뒤 조각(옛 태그)이 남지 않는다
+	r = await chunk([item(71, "place", NT2, 20000, 20300)]);
+	const g71 = r.results[0];
+	assert.equal(g71.status, "placed", JSON.stringify(g71));
+	r = await chunk([item(71, "moveRegen", NT2, 20010, 20050, { g: 2, own: ownOf(g71, NT2), name: tag(71, 2) })]);
+	assert.deepEqual([r.results[0].status, r.results[0].reason, r.damaged], ["moved", "", []], JSON.stringify(r.results[0]));
+	const lo71 = BigInt(bigTicks(19990, FT));
+	const hi71 = BigInt(bigTicks(20400, FT));
+	const near71 = (await clips(NT2)).filter((c) => BigInt(c.e) > lo71 && BigInt(c.s) < hi71);
+	assert.deepEqual(near71.map((c) => [c.s, c.e, c.name]), [[bigTicks(20010, FT), bigTicks(20050, FT), tag(71, 2)]], "gen 1 조각 없음");
+	log("R1 같은 트랙 moveRegen: 옛 클립 조각 없음");
+	// R2: replace 실패 → 옛 템플릿 길이 [sf, sf + 5초) 안, 새 자리 확인 [sf, sf + 40f) 밖의 남의 클립은 지우지 않는다 (lost-old)
+	r = await chunk([item(23, "place", NT, 20000, 20040)]);
+	const o23 = r.results[0];
+	assert.equal(o23.status, "placed", JSON.stringify(o23));
+	const f23 = await hostJson(host, jsxPlaceNamed(P.mogrtPath, NT, 20060, 20080, "남의 클립 R2"), "R2 남의 클립");
+	assert.ok(!f23.error, JSON.stringify(f23));
+	const fA = (await clips(NT)).find((c) => c.nodeId === f23.nodeId);
+	r = await chunk([item(23, "replace", NT, 20000, 20040, { g: 2, own: ownOf(o23, NT), mogrtPath: BAD_PATH, durSec: 1.0, name: tag(23, 2) })]);
+	assert.deepEqual([r.results[0].status, r.results[0].reason, r.damaged], ["failed", "lost-old", []], JSON.stringify(r.results[0]));
+	const fB = (await clips(NT)).find((c) => c.nodeId === f23.nodeId);
+	assert.ok(fB, "남의 클립이 남아 있다");
+	assert.deepEqual([fB.s, fB.e, fB.inT, fB.name], [fA.s, fA.e, fA.inT, fA.name], "남의 클립 그대로");
+	assert.ok(!(await clips(NT)).some((c) => c.name === tag(23, 1) || c.name === tag(23, 2)), "옛 클립은 되놓지 않았다 (패널이 before로 다시 만든다)");
+	log("R2 되놓기 범위의 남의 클립 → lost-old, 남의 클립 그대로");
+	// R3: 구운 네이티브를 문구 param과 함께 새로 놓기 → placed (문구는 구운 .mogrt에 있다, skipped 없음)
+	const natCap = [{ index: 0, type: "text", displayName: "텍스트 1", value: "하드 S22 네이티브 하나", rawValue: "", nativeText: true }, { index: 1, type: "text", displayName: "텍스트 2", value: "둘째 줄", rawValue: "", nativeText: true }];
+	r = await chunk([item(24, "place", NT, 20500, 20560, { mogrtPath: nat[0].path, durSec: nat[0].durSec, params: natCap })]);
+	assert.deepEqual([r.results[0].status, r.results[0].kind, r.results[0].skipped], ["placed", "native", []], JSON.stringify(r.results[0]));
+	log("R3 구운 네이티브 + 문구 param → placed");
 	return { NT, NT2 };
 }
 

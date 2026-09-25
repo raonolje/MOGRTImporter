@@ -22,6 +22,9 @@
  *   - 네이티브: getMGTComponent() null, projectItem null, 이름 "Graphic", Source Text 초깃값은 한 글자 (#23, S0-3 w).
  *   - 같은 템플릿의 projectItem은 공유된다 (#7). overwriteClip(pi)은 템플릿의 oldParams(옛 구조)를 놓을 수 있다 (S0-3 x ③).
  *   - JSON은 hostscript의 ES3 폴리필을 쓴다 (vm의 JSON을 지운다 — Premiere ExtendScript에는 JSON이 없다).
+ *     ExtendScript의 eval은 문자열 속 날 U+2028/2029를 문법 오류로 본다 (S0-3 h). V8 eval(ES2019)은 받아 주므로
+ *     폴리필 JSON.parse를 감싸 같은 입력에서 같은 예외를 던진다 (JSON에서 두 글자는 문자열 안에만 올 수 있다).
+ *   - S.moveFails = true면 TrackItem.move가 예외를 던지고, S.moveSkewNext = ticks면 다음 move 한 번이 그만큼 더 간다.
  *   - QE: app.enableQE() 뒤 qe.project.getActiveSequence().addTracks(n, after, 0)은 비디오 트랙 n개를 끝에 더한다 (#3).
  * 호스트가 넘기는 래퍼 객체는 접근할 때마다 새로 만든다 (Premiere처럼 같은 클립이라도 === 로 같지 않다).
  */
@@ -82,6 +85,8 @@ function createSim(opts = {}) {
 		docId: opts.docId || "doc-sim-1",
 		misplaceNext: false,
 		overwriteFails: false,
+		moveFails: false,
+		moveSkewNext: 0,
 		counts: { importMGT: 0, overwriteClip: 0, setValue: 0, nativeTextWrites: 0, addTracks: 0 }
 	};
 
@@ -213,8 +218,10 @@ function createSim(opts = {}) {
 			return c ? wrapComp(c, m) : null;
 		};
 		w.move = (t) => {
+			if (S.moveFails) throw new Error("move 실패 (시뮬레이터)");
 			if (!m.removed) {
-				const d = ticksOf(t);
+				const d = ticksOf(t) + S.moveSkewNext;
+				S.moveSkewNext = 0;
 				m.s += d;
 				m.e += d;
 			}
@@ -338,6 +345,12 @@ function createSim(opts = {}) {
 	vm.runInContext("delete this.JSON;", ctx);
 	const src = fs.readFileSync(opts.hostFile || HOST_JSX, "utf8");
 	vm.runInContext(src, ctx, { filename: "hostscript.jsx" });
+	vm.runInContext(
+		"(function () { var es3Parse = JSON.parse; JSON.parse = function (s) {" +
+			" if (/[\\u2028\\u2029]/.test(String(s))) throw new SyntaxError('Unterminated string constant');" +
+			" return es3Parse(s); }; })();",
+		ctx
+	);
 
 	const api = {
 		S,

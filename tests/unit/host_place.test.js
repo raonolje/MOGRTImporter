@@ -42,10 +42,10 @@ function withCaption(params, text, idx = 0) {
 const place = (key, track, sf, ef, extra) => Object.assign({ key, op: "place", g: 1, track, sf, ef, mogrtPath: AE, durSec: 5.005, params: [], name: "철수 [MI:" + key + ".1]", guard: [] }, extra || {});
 const valuesOf = (m) => m.comps.map((c) => c.props.map((p) => JSON.stringify(p.value)));
 
-test("순수: MI__occupy — 시작을 덮으면 occupied, 안쪽 이웃은 끝 맞춤, 뒤쪽 남의 클립은 tail, guardAll, noTail", () => {
+test("순수: MI__occupy — 시작을 덮으면 occupied, 안쪽 이웃은 끝 맞춤, 뒤쪽 남의 클립은 tail, 뒤쪽 이웃은 guards, noTail", () => {
 	const ft = 100;
 	const L = (id, s, e) => ({ id, s: s * ft, e: e * ft });
-	const occ = (list, sf, ef, hi, o = {}) => plain(HP.MI__occupy(list, sf * ft, ef * ft, hi * ft, ft, o.skip || {}, o.guard || {}, !!o.noTail, !!o.all));
+	const occ = (list, sf, ef, hi, o = {}) => plain(HP.MI__occupy(list, sf * ft, ef * ft, hi * ft, ft, o.skip || {}, o.guard || {}, !!o.noTail));
 	assert.deepEqual(occ([L("a", 0, 10)], 10, 20, 30).conflict, null, "끝이 딱 맞닿으면 비어 있다");
 	assert.deepEqual(occ([L("a", 0, 10.4)], 10, 20, 30).conflict, null, "반 프레임 안 걸침은 무시");
 	assert.deepEqual(occ([L("a", 0, 11)], 10, 20, 30).conflict, { reason: "occupied", id: "a" });
@@ -55,13 +55,14 @@ test("순수: MI__occupy — 시작을 덮으면 occupied, 안쪽 이웃은 끝 
 	const g = occ([L("b", 15, 40)], 10, 20, 30, { guard: { nb: true } });
 	assert.deepEqual([g.conflict, g.efT, g.clamped, g.guards.map((x) => x.id)], [null, 15 * ft, true, ["b"]], "안쪽 이웃 → 끝 맞춤 + 되돌리기");
 	assert.deepEqual(occ([L("c", 25, 40)], 10, 20, 30).conflict, { reason: "tail", id: "c" });
-	assert.deepEqual(occ([L("c", 25, 40)], 10, 20, 30, { all: true }).guards.map((x) => x.id), ["c"]);
+	assert.deepEqual(occ([L("c", 25, 40)], 10, 20, 30, { guard: { nc: true } }).guards.map((x) => x.id), ["c"]);
 	assert.deepEqual(occ([L("c", 30, 40)], 10, 20, 30).conflict, null, "덮이는 범위 밖");
 	const mv = occ([L("b", 15, 40), L("c", 25, 40)], 10, 20, 20, { noTail: true });
 	assert.deepEqual([mv.conflict, mv.efT, mv.clamped, mv.guards.length], [null, 15 * ft, true, 0], "옮기기: 남의 클립이어도 끝만 맞춘다");
 	assert.deepEqual(occ([L("b", 10.5, 40)], 10, 20, 30, { guard: { nb: true } }).conflict, { reason: "occupied", id: "" }, "한 프레임보다 짧아지면 occupied");
 	assert.equal(HP.MI__nextStart([L("x", 5, 9), L("y", 12, 20), L("z", 30, 40)], 10 * ft, {}), 12 * ft);
 	assert.equal(HP.MI__nextStart([L("y", 12, 20)], 10 * ft, { ny: true }), null);
+	assert.deepEqual([HP.MI__saltOf("ab12-57"), HP.MI__saltOf("legacy-row-3"), HP.MI__saltOf(""), HP.MI__saltOf(null)], ["ab12", "", "", ""]);
 });
 
 test("순수: MI__checkItem — 작업별 필수 항목", () => {
@@ -459,4 +460,127 @@ test("T12 보완: 공유 projectItem이 다른 구조(재저장된 MOGRT)를 놓
 		}
 		assert.equal(live[0].name, "철수 [MI:ab12-1.1]");
 	}
+});
+
+// ── 리뷰 반영 (S2-1, S2-2) ──
+
+test("replace 되놓기: 옛 템플릿 길이 안(새 자리 확인 밖)의 남의 클립은 이웃이 아니다 → 되놓지 않고 lost-old, 남의 클립 그대로", () => {
+	const { sim, seq, chunk } = setup();
+	const old = sim.place(seq, 2, AE, 100, 140, "철수 [MI:ab12-1.1]"); // 옛 템플릿 D = 120f
+	const user = sim.placeOther(seq, 2, 160, 180, "user_broll.mp4"); // [100, 148) 밖, [100, 220) 안
+	const userId = sim.nodeId(user);
+	const r = chunk([{ key: "ab12-1", op: "replace", g: 2, track: 2, sf: 100, ef: 140, own: { track: 2, sf: 100, nodeId: sim.nodeId(old) }, mogrtPath: "C:/m/없는.mogrt", durSec: 2.0, params: [], name: "철수 [MI:ab12-1.2]", guard: [] }]);
+	const x = r.results[0];
+	assert.deepEqual([x.status, x.reason], ["failed", "lost-old"], JSON.stringify(x));
+	assert.equal(user.removed, false, "사용자 클립은 지워지지 않았다");
+	assert.deepEqual([user.s, user.e], [160 * seq.ft, 180 * seq.ft]);
+	assert.deepEqual(r.damaged, []);
+	assert.deepEqual([x.before.sf, x.before.ef, x.before.name], [100, 140, "철수 [MI:ab12-1.1]"], "패널은 before로 다시 만든다");
+	assert.deepEqual(sim.clips(seq, 2).map((c) => sim.nodeId(c)), [userId]);
+});
+
+test("replace 되놓기: 같은 salt 태그 클립(이 목록)은 guard가 아니어도 이웃 — 머리를 되돌리고 restored-old, 다른 salt·태그 없는 클립은 충돌", () => {
+	for (const [nbName, want] of [["철수 [MI:ab12-3.1]", "restored-old"], ["철수 [MI:zz99-3.1]", "lost-old"], [null, "lost-old"]]) {
+		const { sim, seq, chunk } = setup();
+		const old = sim.place(seq, 2, AE, 100, 140, "철수 [MI:ab12-1.1]");
+		const nb = sim.place(seq, 2, AE, 200, 400, nbName); // 옛 템플릿 [100, 220)이 머리를 덮는다
+		const nb0 = [sim.nodeId(nb), nb.s, nb.e, nb.inT];
+		const r = chunk([{ key: "ab12-1", op: "replace", g: 2, track: 2, sf: 100, ef: 140, own: { track: 2, sf: 100, nodeId: sim.nodeId(old) }, mogrtPath: "C:/m/없는.mogrt", durSec: 2.0, params: [], name: "철수 [MI:ab12-1.2]", guard: [] }]);
+		assert.deepEqual([r.results[0].status, r.results[0].reason], ["failed", want], String(nbName));
+		assert.deepEqual([nb.nodeId, nb.s, nb.e, nb.inT, nb.removed], nb0.concat([false]), "이웃 그대로 " + nbName);
+		assert.deepEqual(r.damaged, []);
+		if (want === "restored-old") assert.deepEqual(sim.clips(seq, 2).map((c) => [c.s / seq.ft, c.e / seq.ft, c.name]), [[100, 140, "철수 [MI:ab12-1.1]"], [200, 400, nbName]]);
+	}
+});
+
+test("moveRegen·legacyMove 같은 트랙: 옛 클립이 sf를 걸쳐도 둘로 잘린 뒤 조각(옛 태그)이 남지 않는다, 못 놓으면 옛 클립 그대로", () => {
+	const regen = (own, sf, ef, extra) => Object.assign({ key: "ab12-1", op: "moveRegen", g: 2, track: 2, sf, ef, own: { track: 2, sf: own.s / own.seq.ft, nodeId: own.nodeId }, mogrtPath: AE, durSec: 5.005, params: [], name: "철수 [MI:ab12-1.2]", guard: [] }, extra || {});
+	// 옛 클립 [100, 300), 새 자리 [110, 150) (D = 120f → [110, 230)을 덮는다)
+	let { sim, seq, chunk } = setup();
+	let own = sim.place(seq, 2, AE, 100, 300, "철수 [MI:ab12-1.1]");
+	sim.nodeId(own);
+	let r = chunk([regen(own, 110, 150)]);
+	assert.deepEqual([r.results[0].status, r.results[0].reason, r.damaged], ["moved", "", []]);
+	assert.deepEqual(sim.clips(seq, 2).map((c) => [c.s / seq.ft, c.e / seq.ft, c.name]), [[110, 150, "철수 [MI:ab12-1.2]"]], "gen 1 조각 없음");
+	assert.equal(own.removed, true);
+	// 옛 클립 [100, 400), 새 자리 [130, 420): 새 끝이 옛 조각 위로 겹치지 않는다
+	({ sim, seq, chunk } = setup());
+	own = sim.place(seq, 2, AE, 100, 400, "철수 [MI:ab12-1.1]");
+	sim.nodeId(own);
+	r = chunk([regen(own, 130, 420)]);
+	assert.deepEqual([r.results[0].status, r.results[0].reason], ["moved", ""]);
+	assert.deepEqual(sim.clips(seq, 2).map((c) => [c.s / seq.ft, c.e / seq.ft, c.name]), [[130, 420, "철수 [MI:ab12-1.2]"]]);
+	// legacyMove, removeAfter가 같은 트랙 (태그 없는 조각이 남으면 다음 계획에서 입양 후보로 보인다)
+	({ sim, seq, chunk } = setup());
+	const leg = sim.place(seq, 2, AE, 100, 300, null);
+	r = chunk([{ key: "ab12-2", op: "legacyMove", g: 1, track: 2, sf: 110, ef: 150, own: null, removeAfter: { track: 2, nodeId: sim.nodeId(leg) }, mogrtPath: AE, durSec: 5.005, params: [], name: "영희 [MI:ab12-2.1]" }]);
+	assert.deepEqual([r.results[0].status, r.results[0].reason], ["moved", ""]);
+	assert.deepEqual(sim.clips(seq, 2).map((c) => [c.s / seq.ft, c.e / seq.ft, c.name]), [[110, 150, "영희 [MI:ab12-2.1]"]]);
+	// 못 놓으면(없는 경로) 줄였던 옛 클립의 끝을 되돌린다
+	({ sim, seq, chunk } = setup());
+	own = sim.place(seq, 2, AE, 100, 300, "철수 [MI:ab12-1.1]");
+	const id = sim.nodeId(own);
+	r = chunk([regen(own, 110, 150, { mogrtPath: "C:/m/없는.mogrt" })]);
+	assert.deepEqual([r.results[0].status, r.results[0].reason, r.damaged], ["failed", "import-null", []]);
+	assert.deepEqual([own.nodeId, own.s, own.e, own.inT, own.removed], [id, 100 * seq.ft, 300 * seq.ft, IN_POINT, false], "옛 클립 그대로");
+});
+
+test("move 실패: move가 예외를 던지거나 시작이 sf에 오지 않으면 먼저 줄인 길이·옮긴 자리를 되돌린다", () => {
+	for (const how of ["throw", "skew"]) {
+		const { sim, seq, chunk } = setup();
+		const c = sim.place(seq, 2, AE, 100, 300, "철수 [MI:ab12-1.1]");
+		const id = sim.nodeId(c);
+		if (how === "throw") sim.S.moveFails = true;
+		else sim.S.moveSkewNext = 5 * seq.ft;
+		const r = chunk([{ key: "ab12-1", op: "move", g: 1, track: 2, sf: 400, ef: 450, own: { track: 2, sf: 100, nodeId: id }, params: [], name: "철수 [MI:ab12-1.1]" }]);
+		const x = r.results[0];
+		assert.deepEqual([x.status, x.reason], ["failed", "move"], how);
+		assert.deepEqual([c.nodeId, c.s, c.e, c.removed], [id, 100 * seq.ft, 300 * seq.ft, false], "원래 자리·길이 " + how);
+		assert.deepEqual([x.nodeId, x.sf, x.ef], [id, 100, 300], "되읽기도 원래 자리 " + how);
+		assert.deepEqual(r.damaged, []);
+	}
+});
+
+test("applyParamsSafe: 같은 이름 param이 둘 이상이고 옛 구조에서 index가 밀렸으면 순서로만 맞춘다 (k번째 → k번째)", () => {
+	const NEWP = [aeText("텍스트", "x"), num("여백", 1), aeText("텍스트", "y")]; // 텍스트 @0·@2
+	const OLDP = [num("A", 0), num("B", 0), aeText("텍스트", "ox"), num("여백", 1), num("C", 0), aeText("텍스트", "oy")]; // 텍스트 @2·@5
+	const sim = createSim();
+	const seq = sim.addSequence({ name: "T_23976", id: "seq-A", ft: FT.f23976, tracks: 5 });
+	const P3 = "C:/m/두 줄.mogrt";
+	sim.addTemplate(P3, { kind: "ae", name: "두 줄", params: NEWP, oldParams: OLDP });
+	const base = { seqId: seq.id, build: BUILD, frameTicks: seq.ft };
+	const P = presetParams(sim, seq, base, P3);
+	assert.deepEqual(P.map((p) => [p.index, p.displayName, p.type]), [[0, "텍스트", "text"], [1, "여백", "number"], [2, "텍스트", "text"]]);
+	const old = sim.place(seq, 2, P3, 100, 150, "철수 [MI:ab12-1.1]", { old: true });
+	const params = P.map((p) => (p.index === 0 ? Object.assign({}, p, { value: "첫째" }) : p.index === 2 ? Object.assign({}, p, { value: "둘째" }) : Object.assign({}, p, { value: "5" })));
+	const r = sim.call("MI_placeChunk", Object.assign({}, base, { items: [{ key: "ab12-1", op: "update", g: 1, track: 2, keepTime: true, own: { track: 2, sf: 100, nodeId: sim.nodeId(old) }, params, name: "철수 [MI:ab12-1.1]" }] }));
+	const x = r.results[0];
+	assert.deepEqual([x.status, x.skipped], ["updated", []], JSON.stringify(x));
+	assert.deepEqual(x.texts, ["첫째", "둘째"], "옛 @2 ← 첫째, 옛 @5 ← 둘째");
+	assert.equal(sim.prop(old, "여백").value, 5);
+	assert.deepEqual(["A", "B", "C"].map((n) => sim.prop(old, n).value), [0, 0, 0], "다른 속성은 건드리지 않았다");
+	// 목록 순서가 index 순서와 달라도 k는 index 순서다 (서로 바뀌지 않는다)
+	const old2 = sim.place(seq, 4, P3, 100, 150, "철수 [MI:ab12-3.1]", { old: true });
+	const rev = [params[2], params[1], params[0]];
+	const r3 = sim.call("MI_placeChunk", Object.assign({}, base, { items: [{ key: "ab12-3", op: "update", g: 1, track: 4, keepTime: true, own: { track: 4, sf: 100, nodeId: sim.nodeId(old2) }, params: rev, name: "철수 [MI:ab12-3.1]" }] }));
+	assert.deepEqual([r3.results[0].status, r3.results[0].texts], ["updated", ["첫째", "둘째"]]);
+	// 새 구조 클립(같은 index)도 그대로 맞는다
+	const cur = sim.place(seq, 3, P3, 100, 150, "철수 [MI:ab12-2.1]");
+	const r2 = sim.call("MI_placeChunk", Object.assign({}, base, { items: [{ key: "ab12-2", op: "update", g: 1, track: 3, keepTime: true, own: { track: 3, sf: 100, nodeId: sim.nodeId(cur) }, params, name: "철수 [MI:ab12-2.1]" }] }));
+	assert.deepEqual([r2.results[0].status, r2.results[0].texts], ["updated", ["첫째", "둘째"]]);
+});
+
+test("네이티브(구운 경로) 새로 놓기: 문구 param은 skipped가 아니다 (placed, 되읽기 texts는 \"\") — 기존 클립 update에서는 여전히 skipped", () => {
+	const { sim, seq, chunk } = setup();
+	const cap = [{ index: 0, type: "text", displayName: "텍스트 1", value: "구운 문구", rawValue: "", nativeText: true }, { index: 1, type: "text", displayName: "텍스트 2", value: "둘째 줄", rawValue: "", nativeText: true }];
+	const r = chunk([place("ab12-1", 3, 100, 150, { mogrtPath: NAT, params: cap })]);
+	const x = r.results[0];
+	assert.deepEqual([x.status, x.kind, x.skipped, x.keyed, x.texts], ["placed", "native", [], [], ["", ""]], JSON.stringify(x));
+	// replace(구운 다른 사본)도 같다
+	const rp = chunk([{ key: "ab12-1", op: "replace", g: 2, track: 3, sf: 100, ef: 150, own: { track: 3, sf: 100, nodeId: x.nodeId, m: NAT }, mogrtPath: NAT_OLD, durSec: 5.005, params: cap, name: "철수 [MI:ab12-1.2]" }]);
+	assert.deepEqual([rp.results[0].status, rp.results[0].skipped], ["replaced", []]);
+	// 기존 클립 update: 문구를 바꿀 수 없다 → skipped(partial), 패널은 replace로 보낸다
+	const u = chunk([{ key: "ab12-1", op: "update", g: 2, track: 3, keepTime: true, own: { track: 3, sf: 100, nodeId: rp.results[0].nodeId }, params: cap, name: "철수 [MI:ab12-1.2]" }]);
+	assert.deepEqual([u.results[0].status, u.results[0].skipped], ["partial", ["텍스트 1", "텍스트 2"]]);
+	assert.equal(sim.S.counts.nativeTextWrites, 0, "Source Text setValue 0번");
 });

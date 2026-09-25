@@ -2931,14 +2931,14 @@ function MI__checkItem(it) {
     return "";
 }
 /* 놓을 자리 확인 (순수). list = 트랙의 클립 [{id, s, e}] (ticks), [sfT, efT)에 놓고 [sfT, hiT)까지 덮인다 (hiT = sf + max(ef−sf, D)).
-   skip: 치울 클립(own·removeAfter, {"n"+id: true}), guard: 머리를 되돌릴 이웃. guardAll이면 뒤쪽 클립을 모두 이웃으로 본다.
+   skip: 치울 클립(own·removeAfter, {"n"+id: true}), guard: 머리를 되돌릴 이웃 (우리 클립만 — 남의 클립은 늘 충돌이다).
    noTail: 옮기기(move)처럼 아무것도 덮어쓰지 않는 경우 — 안쪽에서 시작하는 클립은 끝만 맞추고 뒤쪽은 보지 않는다.
    → {conflict: null | {reason: "occupied"|"tail", id}, efT(맞춘 끝), clamped, guards: [list 항목]}
      - 시작 프레임을 덮고 있는 클립(시작 ≤ sf, 끝이 반 프레임 넘게 안쪽): occupied
      - (sf, ef) 안에서 시작: 이웃이면 끝을 그 시작에 맞춘다(clamped), 아니면 occupied
      - [ef, hi)에서 시작: 이웃이면 guards, 아니면 tail (놓으면 머리가 잘리거나 지워진다)
      - 맞춘 길이가 한 프레임보다 짧으면 occupied */
-function MI__occupy(list, sfT, efT, hiT, ft, skip, guard, noTail, guardAll) {
+function MI__occupy(list, sfT, efT, hiT, ft, skip, guard, noTail) {
     var res = { conflict: null, efT: efT, clamped: false, guards: [] };
     var xs = [];
     var i;
@@ -2948,7 +2948,7 @@ function MI__occupy(list, sfT, efT, hiT, ft, skip, guard, noTail, guardAll) {
         var x = xs[i];
         if (skip && skip["n" + x.id]) continue;
         if (x.e <= sfT || x.s >= hiT) continue;
-        var isG = guardAll === true || (guard && guard["n" + x.id] === true);
+        var isG = guard && guard["n" + x.id] === true;
         if (x.s <= sfT) {
             if (x.e > sfT + ft / 2) {
                 res.conflict = { reason: "occupied", id: x.id };
@@ -2986,6 +2986,11 @@ function MI__nextStart(list, fromT, skip) {
         if (x.s > fromT && (best === null || x.s < best)) best = x.s;
     }
     return best;
+}
+/* 작업 key(uid "salt-id")의 salt, 아니면 "" (태그 없는 레거시 작업의 key 등) */
+function MI__saltOf(key) {
+    var m = /^([a-z0-9]{4})-\d+$/.exec(String(key === null || key === undefined ? "" : key));
+    return m ? m[1] : "";
 }
 /* MI_PURE_END */
 
@@ -3107,11 +3112,14 @@ function MI__props(c) {
     if (!comp) return null;
     try { return comp.properties; } catch (e) { return null; }
 }
-/* 속성 값 글자가 텍스트 JSON이면 textEditValue (읽지 못하면 ""), 텍스트가 아니면 null */
+/* 속성 값 글자가 텍스트 JSON이면 textEditValue (읽지 못하면 ""), 텍스트가 아니면 null.
+   v27 JSON 폴리필 stringify는 U+2028/2029를 이스케이프하지 않아 applyParamsToItem이 쓴 값에 날 글자로 남는데,
+   eval 폴리필 parse는 문자열 속 날 U+2028을 문법 오류로 본다 (S0-3 h). JSON에서 두 글자는 문자열 안에만 올 수 있으므로
+   JSON 유니코드 이스케이프(MI__esc)로 바꿔 읽는다 */
 function MI__textOf(raw) {
     var s = String(raw);
     if (String(s).indexOf("\"textEditValue\"") === -1) return null;
-    var o = parsePayload(s);
+    var o = parsePayload(s.replace(new RegExp("[" + String.fromCharCode(0x2028, 0x2029) + "]", "g"), MI__esc));
     if (o && o.textEditValue !== undefined && o.textEditValue !== null) return String(o.textEditValue);
     return "";
 }
@@ -3121,7 +3129,9 @@ function MI__nativeVal(pr) {
     try { v = String(pr.getValue()); } catch (e) { v = ""; }
     return v.length <= 1 ? "" : v;
 }
-/* 텍스트 값들: AE는 텍스트 속성의 textEditValue를 index 순으로, 네이티브는 Source Text 순으로 */
+/* 텍스트 값들: AE는 텍스트 속성의 textEditValue를 index 순으로, 네이티브는 Source Text 순으로.
+   네이티브는 구운 클립·기본값 클립 모두 한 글자 헤더만 읽혀 늘 ""이다 (S0-3 w) — rh·문장으로 맞추기(adopt)에 쓸 수 없다.
+   패널은 네이티브 줄의 문구를 되읽기가 아니라 자기가 구운 문구로 기록한다 */
 function MI__texts(c, kind) {
     var out = [];
     var i;
@@ -3498,13 +3508,19 @@ function MI__setName(c, name) {
 /* 속성 이름을 확인하고 쓴다 (index 쓰기의 위험을 막는다: 재저장된 MOGRT의 옛 구조 클립, S0-3 x·결정 16).
    → {written, skipped: [이름], keyed: [이름]}
    AE: props[p.index]의 displayName과 텍스트 여부가 p와 같을 때만 그 자리에 쓴다. 아니면 목록 안에서 같은 이름·같은
-       텍스트 여부인 param 가운데 k번째(k = 목록에서의 순서)인 속성에 쓴다. 그것도 없으면 skipped.
+       텍스트 여부인 param 가운데 k번째(k = 그 param들 사이의 index 순서)와 같은 순서의 속성에 쓴다. 그것도 없으면 skipped.
+       같은 이름·텍스트 여부인 param이 목록에 둘 이상이면 index 일치는 보지 않고 순서로만 맞춘다(k번째 param → k번째 속성,
+       k = 묶음 안 index 순서): index가 밀린 옛 구조에서 index 일치와 순서 맞추기를 섞으면 두 param이 한 속성에 몰려 하나가
+       빠지거나 서로 바뀐다.
        isTimeVarying(키프레임)인 속성은 keyed로 두고 쓰지 않는다 (setValue가 true를 돌려주고 조용히 무시된다, spike #8·S0-3 g).
        확인한 목록(index를 고친 사본)을 v27 applyParamsToItem에 한 번에 넘긴다. group·textsetting은 쓰지 않는다(v27과 같다).
    네이티브: Source Text에는 절대 쓰지 않는다 — 스크립트로 쓴 글자는 빈 글자로 렌더된다 (S0-3 §3-1a). 문구는 구운 .mogrt로
-       놓고, 문구가 바뀌면 패널이 replace로 계획한다 (S1-11). 지금 값과 같은 param은 건너뛰고(쓸 것 없음), 다른 값은 skipped.
+       놓고, 문구가 바뀌면 패널이 replace로 계획한다 (S1-11).
+       fresh(이 호출에서 구운 경로로 새로 놓은 클립: place·replace·moveRegen·legacyMove)면 nativeText param은 템플릿에 이미
+       들어 있다고 보고 쓰지도 skipped에 넣지도 않는다 — 되읽기로는 확인할 수 없다 (S0-3 w: Source Text는 한 글자 헤더 → "").
+       기존 클립(update·adopt·move)에서는 지금 값과 같은 param은 건너뛰고(쓸 것 없음), 다른 값은 skipped(partial).
    그 밖(영상 등): 모두 skipped */
-function MI__applyParamsSafe(c, kind, params) {
+function MI__applyParamsSafe(c, kind, params, fresh) {
     var res = { written: 0, skipped: [], keyed: [] };
     if (!MI__isArr(params) || !params.length) return res;
     var i, j, p, ty, dn;
@@ -3521,7 +3537,29 @@ function MI__applyParamsSafe(c, kind, params) {
             try { pv = String(pr.getValue()); } catch (e2) {}
             info.push({ pr: pr, dn: pdn, t: String(pv).indexOf("\"textEditValue\"") !== -1 });
         }
-        var seen = {};
+        /* 같은 이름·텍스트 여부인 param 묶음과 묶음 안 순서 k (index 순, 같거나 없으면 목록 순) */
+        var grp = {};
+        for (i = 0; i < params.length; i++) {
+            p = params[i];
+            if (!p || typeof p !== "object") continue;
+            ty = String(p.type || "").toLowerCase();
+            if (ty === "group" || ty === "textsetting") continue;
+            dn = String(p.displayName === undefined || p.displayName === null ? "" : p.displayName);
+            var mk = (ty === "text" ? "t|" : "o|") + dn;
+            if (!grp[mk]) grp[mk] = [];
+            grp[mk].push(i);
+        }
+        var rank = {};
+        var byIndex = function (a, b) {
+            var ia = MI__isInt(params[a].index) ? params[a].index : 1e9 + a;
+            var ib = MI__isInt(params[b].index) ? params[b].index : 1e9 + b;
+            return ia !== ib ? ia - ib : a - b;
+        };
+        for (var gk in grp) {
+            if (!Object.prototype.hasOwnProperty.call(grp, gk)) continue;
+            grp[gk].sort(byIndex);
+            for (j = 0; j < grp[gk].length; j++) rank["i" + grp[gk][j]] = j;
+        }
         var used = {};
         var list = [];
         for (i = 0; i < params.length; i++) {
@@ -3532,10 +3570,9 @@ function MI__applyParamsSafe(c, kind, params) {
             dn = String(p.displayName === undefined || p.displayName === null ? "" : p.displayName);
             var wantT = ty === "text";
             var sk = (wantT ? "t|" : "o|") + dn;
-            var ord = seen[sk] || 0;
-            seen[sk] = ord + 1;
+            var ord = rank["i" + i];
             var idx = -1;
-            if (MI__isInt(p.index) && p.index >= 0 && p.index < n && info[p.index].dn === dn && info[p.index].t === wantT) {
+            if (grp[sk].length === 1 && MI__isInt(p.index) && p.index >= 0 && p.index < n && info[p.index].dn === dn && info[p.index].t === wantT) {
                 idx = p.index;
             } else {
                 var cnt = 0;
@@ -3573,6 +3610,7 @@ function MI__applyParamsSafe(c, kind, params) {
         for (i = 0; i < params.length; i++) {
             p = params[i];
             if (!p || typeof p !== "object" || String(p.type || "").toLowerCase() !== "text") continue;
+            if (fresh === true && p.nativeText === true) continue;
             var k = MI__isInt(p.index) ? p.index : -1;
             dn = String(p.displayName || ("텍스트 " + (k + 1)));
             var want = String(p.value === undefined || p.value === null ? "" : p.value);
@@ -3620,7 +3658,8 @@ function MI__snapOf(c, ti, ft, m) {
 
 /* ── 새로 놓기: 자리 확인 → 이웃 스냅숏 → importMGT/overwriteClip → 끝 → 이웃 머리 되돌리기 ── */
 
-/* 자리 계획. spec {ti, sf, ef, endT?(정확한 끝 ticks), path, pi?(덮어 놓을 projectItem), durSec, guard, skip, guardAll}
+/* 자리 계획. spec {ti, sf, ef, endT?(정확한 끝 ticks), path, pi?(덮어 놓을 projectItem), durSec, guard, skip, salt?}
+   salt가 있으면 그 salt로 태그된 클립(이 목록의 클립)도 이웃으로 본다 — 옛 템플릿 되놓기만 쓴다 (MI__restoreOld)
    → {conflict} | {ti, sf, efT, clamped, path, pi, guards} */
 function MI__planPut(ctx, spec) {
     var ft = ctx.ft;
@@ -3640,7 +3679,20 @@ function MI__planPut(ctx, spec) {
     var hiT = (spec.sf + span) * ft;
     if (efT > hiT) hiT = efT;
     var win = MI__win(tr, sfT, hiT);
-    var oc = MI__occupy(win, sfT, efT, hiT, ft, spec.skip || {}, spec.guard || {}, false, spec.guardAll === true);
+    var guard = spec.guard || {};
+    if (spec.salt) {
+        var g2 = {};
+        for (var gk in guard) {
+            if (Object.prototype.hasOwnProperty.call(guard, gk)) g2[gk] = guard[gk];
+        }
+        for (var wi = 0; wi < win.length; wi++) {
+            var wt = null;
+            try { wt = MI__parseTag(String(win[wi].c.name)); } catch (e) { wt = null; }
+            if (wt && wt.salt === spec.salt) g2["n" + win[wi].id] = true;
+        }
+        guard = g2;
+    }
+    var oc = MI__occupy(win, sfT, efT, hiT, ft, spec.skip || {}, guard, false);
     if (oc.conflict) return { conflict: oc.conflict, durKnown: dF !== null };
     return { ti: spec.ti, sf: spec.sf, efT: oc.efT, clamped: oc.clamped, path: spec.path || "", pi: spec.pi || null, guards: oc.guards };
 }
@@ -3783,6 +3835,57 @@ function MI__removeNode(ctx, ti, id) {
     if (ok === false) return MI__find(ctx, ti, id) ? "left" : "gone";
     return MI__find(ctx, ti, id) ? "left" : "removed";
 }
+/* 작업이 실패했을 때 건드린 클립을 원래 자리 [s0, e0)로 되돌린다: 시작이 다르면 move(s0 − 지금 시작), 그다음 end = e0.
+   되읽어 다르면 ctx.damaged (패널이 그 줄을 다시 놓는다, 분기 C) → true | false */
+function MI__putBack(ctx, ti, id, s0, e0) {
+    MI__dirty(ctx, ti);
+    var c = MI__find(ctx, ti, id);
+    if (!c) {
+        MI__damage(ctx, id);
+        return false;
+    }
+    var s = null;
+    try { s = MI__s(c); } catch (e) { s = null; }
+    if (s !== null && s !== s0) {
+        try { c.move(MI__T(s0 - s)); } catch (e1) {}
+        MI__dirty(ctx, ti);
+        c = MI__find(ctx, ti, id) || c;
+    }
+    try { c.end = MI__T(e0); } catch (e2) {}
+    var s2 = null;
+    var e2v = null;
+    try { s2 = MI__s(c); e2v = MI__e(c); } catch (e3) {}
+    if (s2 !== s0 || e2v !== e0) {
+        MI__damage(ctx, id);
+        return false;
+    }
+    return true;
+}
+/* 같은 트랙의 옛 클립(ids)이 sfT를 걸치면(시작 < sfT < 끝) 끝을 sfT로 줄인다 → [{id, s, e}](되돌리기용) | null.
+   걸친 채로 새 클립을 놓으면 overwrite가 옛 클립을 둘로 자르고, 뒤 조각은 새 nodeId·같은 이름(같은 태그)으로 남아
+   nodeId로 지워지지 않는다 (#1b). 줄이지 못한 클립이 있으면 줄인 것을 되돌리고 null */
+function MI__trimOld(ctx, ti, ids, sfT) {
+    var out = [];
+    var i;
+    for (i = 0; i < ids.length; i++) {
+        var c = MI__find(ctx, ti, ids[i]);
+        if (!c) continue;
+        var s = 0;
+        var e = 0;
+        try { s = MI__s(c); e = MI__e(c); } catch (e1) { continue; }
+        if (!(s < sfT && e > sfT)) continue;
+        try { c.end = MI__T(sfT); } catch (e2) {}
+        out.push({ id: ids[i], s: s, e: e });
+        var e2v = null;
+        try { e2v = MI__e(c); } catch (e3) { e2v = null; }
+        if (e2v === null || e2v > sfT) {
+            for (var k = 0; k < out.length; k++) MI__putBack(ctx, ti, out[k].id, out[k].s, out[k].e);
+            return null;
+        }
+    }
+    if (out.length) MI__dirty(ctx, ti);
+    return out;
+}
 
 /* ── 작업 실행 ── */
 
@@ -3890,10 +3993,10 @@ function MI__locate(ctx, it) {
     }
     return pr;
 }
-/* 새로 놓은 클립 마무리: 속성(이름 확인), 이름(태그), 되읽기(deco 포함) → r.status */
+/* 새로 놓은 클립 마무리: 속성(이름 확인, 네이티브는 구운 문구라 fresh), 이름(태그), 되읽기(deco 포함) → r.status */
 function MI__finishNew(ctx, it, r, put, okStatus) {
     var c = put.clip;
-    var ap = MI__applyParamsSafe(c, MI__kind(c), it.params);
+    var ap = MI__applyParamsSafe(c, MI__kind(c), it.params, true);
     r.skipped = ap.skipped;
     r.keyed = ap.keyed;
     r.clamped = put.clamped === true;
@@ -3971,7 +4074,8 @@ function MI__opUpdate(ctx, it, pr, r) {
 }
 /* move: TrackItem.move(Δ) — nodeId·이름·속성·효과·키프레임이 그대로다 (S0-3 r). move는 겹침을 막지 않으므로
    목적 범위 [sf, ef)를 먼저 확인한다: 시작을 덮은 클립이 있으면 conflict, 안쪽에서 시작하는 클립이 있으면 끝을 맞춘다.
-   길이를 먼저 줄인 뒤 옮기고 끝을 ef × frameTicks로 쓴다. 같은 트랙 안에서만 (다른 트랙은 moveRegen) */
+   길이를 먼저 줄인 뒤 옮기고 끝을 ef × frameTicks로 쓴다. 같은 트랙 안에서만 (다른 트랙은 moveRegen).
+   move가 예외를 던지거나 시작이 sf에 오지 않으면 클립을 원래 [시작, 끝)으로 되돌린다 (못 하면 damaged) */
 function MI__opMove(ctx, it, pr, r) {
     var ft = ctx.ft;
     if (pr.ti !== it.track) {
@@ -4004,19 +4108,23 @@ function MI__opMove(ctx, it, pr, r) {
     if (e0 - s0 > len) {
         try { c.end = MI__T(s0 + len); } catch (e) {}
     }
+    var moveErr = "";
     if (sfT !== s0) {
-        try { c.move(MI__T(sfT - s0)); } catch (e2) { r.status = "failed"; r.reason = "move"; r.detail = MI__errText(e2); return; }
+        try { c.move(MI__T(sfT - s0)); } catch (e2) { moveErr = MI__errText(e2); }
     }
     MI__dirty(ctx, pr.ti);
     var m = MI__find(ctx, pr.ti, pr.id) || c;
-    try { m.end = MI__T(oc.efT); } catch (e3) {}
     var nowF = null;
-    try { nowF = MI__frameOf(MI__s(m), ft); } catch (e4) { nowF = null; }
-    if (nowF !== it.sf) {
+    if (!moveErr) {
+        try { m.end = MI__T(oc.efT); } catch (e3) {}
+        try { nowF = MI__frameOf(MI__s(m), ft); } catch (e4) { nowF = null; }
+    }
+    if (moveErr || nowF !== it.sf) {
         r.status = "failed";
         r.reason = "move";
-        r.detail = "시작 " + nowF + "f";
-        MI__readback(r, m, pr.ti, ft, false);
+        r.detail = moveErr || ("시작 " + nowF + "f");
+        MI__putBack(ctx, pr.ti, pr.id, s0, e0);
+        MI__readback(r, MI__find(ctx, pr.ti, pr.id) || m, pr.ti, ft, false);
         return;
     }
     var ap = MI__applyParamsSafe(m, pr.kind, it.params);
@@ -4033,11 +4141,20 @@ function MI__opMove(ctx, it, pr, r) {
     r.status = ap.skipped.length || ap.keyed.length ? "partial" : "moved";
 }
 /* moveRegen / legacyMove: 새 자리에 새로 놓고(gen+1 또는 legacyMove의 gen 1) 확인한 뒤 옛 클립(own, removeAfter)을 nodeId로 지운다.
-   지우지 못하면 reason old-left (새 클립은 남는다). 자리가 막혀 있으면 아무것도 바꾸지 않는다 */
+   지우지 못하면 reason old-left (새 클립은 남는다). 자리가 막혀 있으면 아무것도 바꾸지 않는다.
+   같은 트랙의 옛 클립이 sf를 걸치면 놓기 전에 끝을 sf로 줄인다 (MI__trimOld: 걸친 채 놓으면 뒤 조각이 옛 태그로 남는다).
+   못 놓으면 줄인 끝을 되돌린다. 태그 쓰기가 실패해 옛 클립을 남길 때는 줄인 끝 그대로 둔다 (되돌리면 새 클립과 겹친다) */
 function MI__opRegen(ctx, it, pr, r) {
     var skip = {};
-    if (pr.id && pr.ti === it.track) skip["n" + pr.id] = true;
-    if (pr.raId && pr.raTi === it.track) skip["n" + pr.raId] = true;
+    var olds = [];
+    if (pr.id && pr.ti === it.track) {
+        skip["n" + pr.id] = true;
+        olds.push(pr.id);
+    }
+    if (pr.raId && pr.raTi === it.track && !(pr.raId === pr.id && pr.raTi === pr.ti)) {
+        skip["n" + pr.raId] = true;
+        olds.push(pr.raId);
+    }
     var plan = MI__planPut(ctx, { ti: it.track, sf: it.sf, ef: it.ef, path: it.mogrtPath, durSec: it.durSec, guard: MI__set(it.guard), skip: skip });
     if (plan.fail) {
         r.status = "failed";
@@ -4050,8 +4167,16 @@ function MI__opRegen(ctx, it, pr, r) {
         r.detail = plan.conflict.id;
         return;
     }
+    var cut = MI__trimOld(ctx, it.track, olds, it.sf * ctx.ft);
+    if (cut === null) {
+        r.status = "conflict";
+        r.reason = "occupied";
+        r.detail = "옛 클립의 끝을 sf로 줄이지 못했다";
+        return;
+    }
     var put = MI__doPut(ctx, plan);
     if (!put.clip) {
+        for (var k = 0; k < cut.length; k++) MI__putBack(ctx, it.track, cut[k].id, cut[k].s, cut[k].e);
         r.status = put.status || "failed";
         r.reason = put.reason || "";
         r.detail = put.detail || "";
@@ -4102,7 +4227,7 @@ function MI__opReplace(ctx, it, pr, r) {
     }
     r.status = "failed";
     r.detail = (put.reason || "") + (put.detail ? ": " + put.detail : "");
-    var back = MI__restoreOld(ctx, pr);
+    var back = MI__restoreOld(ctx, pr, it);
     if (back) {
         r.reason = "restored-old";
         if (!back.sameLay) r.detail += " (되놓은 클립의 속성 구조가 옛 클립과 다르다)";
@@ -4112,13 +4237,17 @@ function MI__opReplace(ctx, it, pr, r) {
     }
 }
 /* replace가 실패했을 때 옛 템플릿을 옛 자리에 되놓는다 (속성·이름은 before로) → {clip, sameLay} | null.
+   옛 템플릿의 기본 길이 D는 새 템플릿의 것과 달라 [sf, sf + D_old)가 새 자리 확인 범위를 넘을 수 있다 (D를 모르면 60초를 본다).
+   그 안에서 이웃으로 보는 것은 작업의 guard와 같은 salt 태그 클립(이 목록의 클립: 머리를 되돌리고, 통째로 덮이면 damaged →
+   패널이 다시 놓는다)뿐이다. 남의 클립이 있으면 되놓지 않는다(null → lost-old, 패널은 before로 다시 만든다) — 되놓기가
+   사용자 클립을 지우면 되돌릴 길이 없다.
    공유 projectItem으로 놓은 클립의 구조가 옛 클립과 다르면(같은 capsule로 재저장된 MOGRT는 overwriteClip이 다른 버전을
    놓을 수 있다, S0-3 x ③) 지우고 옛 경로 m(importMGT)으로 다시 놓는다 */
-function MI__restoreOld(ctx, pr) {
+function MI__restoreOld(ctx, pr, it) {
     var b = pr.before;
     if (!b) return null;
     var usePi = pr.kind === "ae" ? pr.pi : null;
-    var spec = { ti: pr.ti, sf: b.sf, ef: Math.max(b.ef, b.sf + 1), endT: pr.eT, path: b.m || "", pi: usePi, durSec: 0, guard: {}, skip: {}, guardAll: true };
+    var spec = { ti: pr.ti, sf: b.sf, ef: Math.max(b.ef, b.sf + 1), endT: pr.eT, path: b.m || "", pi: usePi, durSec: 0, guard: MI__set(it.guard), skip: {}, salt: MI__saltOf(it.key) };
     var plan = MI__planPut(ctx, spec);
     if (plan.fail || plan.conflict) return null;
     var put = MI__doPut(ctx, plan);
@@ -4185,6 +4314,11 @@ function MI_ensureVideoTracks(payloadStr) {
    - 새로 놓는 자리 [sf, max(ef, sf + D))는 확인한다: 남의 클립이면 conflict(occupied|tail), guard 이웃은 머리를 되돌리고
      (분기 R, 분기 P는 불가 — S0-3 a), 되돌리지 못한 이웃은 damaged (패널이 다시 놓는다, 분기 C).
    - 끝은 늘 ef × frameTicks (clamped면 다음 클립 시작). 시작은 sf × frameTicks.
+   - replace가 실패해 옛 템플릿을 되놓을 때는 guard와 같은 salt 태그 클립만 이웃으로 본다: 옛 템플릿 길이 안에 남의 클립이
+     있으면 되놓지 않고 lost-old (MI__restoreOld).
+   - 네이티브(구운 경로)를 새로 놓는 작업(place·replace·moveRegen·legacyMove)의 nativeText param은 skipped가 아니다 — 문구는
+     구운 .mogrt에 있다. update·adopt·move에서 값이 다른 nativeText param은 skipped(partial): 문구를 바꾸려면 replace로 보낸다.
+     네이티브 되읽기 texts는 늘 ""다 (S0-3 w).
    - projectItem 캐시는 이 호출 안에서만 쓴다 (S0-3 결정 13). */
 function MI_placeChunk(payloadStr) {
     var t0 = MI__now();
