@@ -73,7 +73,8 @@ function hostCallSource(fn, payload) {
 
 /** 패널에서 호스트 JSX를 평가하는 페이지 표현식 */
 function evalScriptExpr(jsx) {
-	return "new Promise((resolve) => { new CSInterface().evalScript(" + JSON.stringify(asciiJsx(jsx)) + ", (v) => resolve(String(v))); })";
+	// replMode 평가에서는 맨 앞의 await가 있어야 Promise 값이 풀린다 (없으면 {}가 돌아온다 — 2026-09-25 실측)
+	return "await new Promise((resolve) => { new CSInterface().evalScript(" + JSON.stringify(asciiJsx(jsx)) + ", (v) => resolve(String(v))); })";
 }
 
 /** DEV용 .jsx 사본: install_dev.sh와 같은 규칙(tools/lib/stamp.js). MI_test.prproj·환경 변수 이름은 그대로 */
