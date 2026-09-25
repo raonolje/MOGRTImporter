@@ -92,7 +92,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - **운영(`--prod`, 7777)**: 저장소의 `tests/premiere/smoke.expr.txt`(`cdp.js`의 `PROD_SMOKE_FILES`)와 `--check-build`만 받는다. 다른 파일, `--reload`, `cdp.js --prod --expr-file <다른 파일>`은 거부한다. 운영 페이지는 `window._mogrtDebug._fsWrite`·`saveSession()`과 `evalScript`를 드러내므로 아무 표현식이나 돌리면 운영 캐시나 실제 프로젝트가 바뀔 수 있다. 운영 스모크 표현식을 늘릴 때는 읽기 전용인지 확인하고 `smoke.expr.txt`에 넣는다.
 - `npm run hard` (`tests/premiere/suite.js`): 가드 → `smoke.expr.txt` → `cases/*.case.js`(이름순). `npm run hard -- s1_9`처럼 이름 일부로 거른다.
 - 스모크(`tests/premiere/smoke.expr.txt`, 읽기 전용): `window._mogrtDebug`가 object, `getActiveSequenceInfo()`가 seqId를 돌려준다.
-- 케이스 공용 도우미 `tests/premiere/lib/hard.js`: `waitFor`(페이지 표현식이 참이 될 때까지), 트랙 읽기·비우기 JSX(`jsxReadVideoTrack`, `jsxClearVideoTrack` — V2 이상·T_ 시퀀스만), `#srtInput`에 파일 넣기(`pageDropSrt`), 행 요약(`PAGE_ROWS`), 새로 고침 예외 검사(`reloadClean`), 프리셋이 없을 때 모달로 만들기(`ensurePreset` — 먼저 `setupPreviewSequence`로 프리뷰 시퀀스를 만들어 V1을 지킨다).
+- 케이스 공용 도우미 `tests/premiere/lib/hard.js`: `waitFor`(페이지 표현식이 참이 될 때까지), 트랙 읽기·비우기 JSX(`jsxReadVideoTrack`, `jsxClearVideoTrack` — 스크래치 사본의 V2 이상만), 스크래치 시퀀스(`withScratchSequence` — 활성 T_ 시퀀스를 `Sequence.clone()`해 `T_scratch_<tag>`로 돌리고 끝나면 `deleteSequence`·DEV 세션 폴더 정리. 원본 T_23976에는 S0-3 수동 확인용 클립이 있어 타임라인을 바꾸는 케이스는 반드시 여기서 돈다), `#srtInput`에 파일 넣기(`pageDropSrt`), 행 요약(`PAGE_ROWS`), 새로 고침 예외 검사(`reloadClean`), 프리셋이 없을 때 모달로 만들기(`ensurePreset` — 먼저 `setupPreviewSequence`로 프리뷰 시퀀스를 만들어 V1을 지킨다).
 
 ### 테스트 프로젝트
 

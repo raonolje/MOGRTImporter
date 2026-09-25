@@ -8,8 +8,12 @@
  *   const v3 = JSON.parse(await host(H.jsxReadVideoTrack(2)));
  *
  * - JSX 문자열은 ES3로 쓴다 (host()가 ASCII로 바꿔 evalScript에 넘긴다).
- * - 트랙 비우기는 T_ 시퀀스의 V2 이상에서만 한다. V1(영상)은 절대 건드리지 않는다.
+ * - 타임라인을 바꾸는 케이스는 withScratchSequence(활성 T_ 시퀀스의 복제본 T_scratch_…)에서 돈다.
+ *   트랙 비우기는 스크래치 사본의 V2 이상에서만 한다. V1(영상)과 원본 T_ 시퀀스는 건드리지 않는다.
  */
+
+const fs = require("node:fs");
+const path = require("node:path");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -43,15 +47,73 @@ function jsxReadVideoTrack(idx) {
 		"return JSON.stringify({seqName:String(seq.name),timebase:String(seq.timebase),clips:out});})()";
 }
 
-/** 활성 T_ 시퀀스의 비디오 트랙 idx(1 이상)를 비운다 → 남은 클립 수 문자열 */
+/**
+ * 활성 스크래치 시퀀스(T_scratch_…)의 비디오 트랙 idx(1 이상)를 비운다 → 남은 클립 수 문자열.
+ * T_23976 등 원본 T_ 시퀀스에는 S0-3 수동 확인용 클립이 있으므로 스크래치 사본에서만 지운다
+ * ('not-scratch'를 돌려준다). 스크래치 사본은 withScratchSequence로 만든다.
+ */
 function jsxClearVideoTrack(idx) {
 	const i = Number(idx);
 	if (!(i >= 1)) throw new Error("V1(트랙 0)은 비우지 않는다: " + idx);
 	return "(function(){var seq=app.project.activeSequence;if(!seq)return 'no-seq';" +
-		"if(String(seq.name).indexOf('T_')!==0)return 'not-T';" +
+		"if(String(seq.name).indexOf('" + SCRATCH_PREFIX + "')!==0)return 'not-scratch';" +
 		"var t=seq.videoTracks[" + i + "];if(!t)return 'no-track';" +
 		"for(var k=t.clips.numItems-1;k>=0;k--){try{t.clips[k].remove(false,false);}catch(e){}}" +
 		"return String(t.clips.numItems);})()";
+}
+
+// ── 스크래치 시퀀스 (S0-3 결정 3: Sequence.clone → 이름 T_… → 테스트 → deleteSequence) ──
+
+const SCRATCH_PREFIX = "T_scratch_";
+
+/** 활성 T_ 시퀀스를 복제해 T_scratch_<tag>로 이름 짓고 활성화 → JSON {orig:{id,name}, clone:{id,name}} */
+function jsxCloneActiveAsScratch(tag) {
+	const name = SCRATCH_PREFIX + String(tag).replace(/[^A-Za-z0-9_]/g, "_");
+	return "(function(){var p=app.project,o=p.activeSequence;if(!o)return JSON.stringify({error:'no-seq'});" +
+		"if(String(o.name).indexOf('T_')!==0)return JSON.stringify({error:'not-T'});" +
+		"var before={};for(var k=0;k<p.sequences.numSequences;k++)before[String(p.sequences[k].sequenceID)]=1;" +
+		"var ok=o.clone();var c=null;for(var j=0;j<p.sequences.numSequences;j++){var s=p.sequences[j];if(!before[String(s.sequenceID)]){c=s;break;}}" +
+		"if(!c)return JSON.stringify({error:'clone-failed',ok:String(ok)});" +
+		"c.name=" + JSON.stringify(name) + ";p.openSequence(String(c.sequenceID));" +
+		"return JSON.stringify({orig:{id:String(o.sequenceID),name:String(o.name)},clone:{id:String(c.sequenceID),name:String(c.name)}});})()";
+}
+
+/** 원본을 다시 활성화하고 스크래치 사본(이름이 T_scratch_로 시작할 때만)을 지운다 → 결과 문자열 */
+function jsxDropScratch(origId, cloneId) {
+	return "(function(){var p=app.project;try{p.openSequence(" + JSON.stringify(String(origId)) + ");}catch(e){}" +
+		"for(var k=0;k<p.sequences.numSequences;k++){var s=p.sequences[k];if(String(s.sequenceID)===" + JSON.stringify(String(cloneId)) + "){" +
+		"if(String(s.name).indexOf('" + SCRATCH_PREFIX + "')!==0)return 'not-scratch';return String(p.deleteSequence(s));}}return 'not-found';})()";
+}
+
+/**
+ * 활성 T_ 시퀀스의 스크래치 사본에서 fn({clone, orig})을 돌린다. 끝나면 원본으로 돌아가 사본을 지우고,
+ * DEV 캐시에 생긴 사본의 세션 폴더도 지운다.
+ */
+async function withScratchSequence(api, tag, fn) {
+	const { panel, host, log } = api;
+	const info = JSON.parse(await host(jsxCloneActiveAsScratch(tag)));
+	if (info.error) throw new Error("스크래치 시퀀스를 만들지 못했다: " + JSON.stringify(info));
+	if (log) log("스크래치 시퀀스: " + info.clone.name + " (원본 " + info.orig.name + ")");
+	let projKey = null;
+	try {
+		await waitFor(panel, "window._mogrtDebug.snapshot().keys.seqId === " + JSON.stringify(info.clone.id), { timeoutMs: 15000, what: "패널이 스크래치 시퀀스로 전환" });
+		await waitKeys(panel);
+		projKey = (await panel("window._mogrtDebug.snapshot()")).keys.proj;
+		return await fn(info);
+	} finally {
+		const r = await host(jsxDropScratch(info.orig.id, info.clone.id));
+		if (log) log("스크래치 시퀀스 정리: " + r);
+		try {
+			await waitFor(panel, "window._mogrtDebug.snapshot().keys.seqId === " + JSON.stringify(info.orig.id), { timeoutMs: 15000, what: "패널이 원본 시퀀스로 복귀" });
+			const root = await devCacheRoot(panel);
+			if (projKey) {
+				const dir = path.join(root, projKey, projKey + "_seq_" + info.clone.id.replace(/[^a-zA-Z0-9-]/g, "_"));
+				if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+			}
+		} catch (e) {
+			if (log) log("정리 경고: " + e.message);
+		}
+	}
 }
 
 /** 이름이 있는 시퀀스가 프로젝트에 있는가 → "true"/"false" */
@@ -200,7 +262,7 @@ async function devCacheRoot(panel) {
 
 module.exports = {
 	sleep, waitFor, ticksToFrame,
-	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed,
+	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed, jsxCloneActiveAsScratch, jsxDropScratch, withScratchSequence, SCRATCH_PREFIX,
 	pageDropSrt, pageSetRowPreset, pageImportPresetsText,
 	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS,
 	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot
