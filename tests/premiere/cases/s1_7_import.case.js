@@ -103,9 +103,7 @@ module.exports = {
 				const nums = await panel("Array.from(document.querySelectorAll('#listWrap .sub-row .sub-num')).slice(0, 2).map((e) => e.textContent)");
 				assert.deepEqual(nums, ["C1" + String.fromCharCode(0xb7) + "1", "C2" + String.fromCharCode(0xb7) + "1"]);
 				log("(e) 화자 C1·C2, 13줄, salt " + snap.mi.salt + ", cast.json hwm " + side.hwm);
-				// ▶는 화자 줄을 v27 한 트랙 경로로 보내지 않는다
-				await panel("document.getElementById('btnApply').click(), true");
-				await H.waitStatus(panel, /화자별 배치는 개발 중입니다/);
+				// (S2-4부터 ▶는 화자별 배치를 실제로 한다 — 그 검증은 s2_4_e2e. 여기서는 가져오기만 본다)
 
 				// (f) C2 두 파일
 				assert.equal(await panel(H.pageDropSrts([{ name: "a_C2.srt", content: bytesOf("cap_interview_C2.srt") }, { name: "b_C2.srt", content: bytesOf("cap_C1.srt") }])), "sent");

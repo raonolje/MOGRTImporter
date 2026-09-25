@@ -2696,7 +2696,7 @@
 	// 값으로 옮기지 않는 종류 (구조·설명)
 	const REBASE_SKIP_TYPES = { group: true, comment: true, textsetting: true };
 	// 배치에서 배우는 프리셋 선택 필드 (계획서 §2.3). 프리셋을 다시 저장해도 MOGRT(경로·속성 구조)가 같으면 가져간다
-	const PRESET_LEARNED_FIELDS = ["mogrtItemName", "mogrtDurSec", "mogrtLs", "mogrtBaseComps"];
+	const PRESET_LEARNED_FIELDS = ["mogrtItemName", "mogrtDurSec", "mogrtLs", "mogrtBaseComps", "mogrtBaseKeyed"];
 	// 줄 속성 목록 rowAll → 프리셋의 지금 구조 (순수). → {params: 새 _allParams, orphanFields: [{displayName, value}]}
 	//   텍스트 필드: 프리셋의 T-ID마다 줄에서 같은 ID를 찾아(resolveFields: 서수+이름, 이름, 네이티브는 서수;
 	//     한쪽이 '텍스트 N'이고 개수가 같으면 서수) 줄의 문장을 옮긴다. 스타일은 프리셋 것이다
@@ -3654,11 +3654,16 @@
 		const txt = "V" + (b.t + 1) + " " + secOf(c.sf).toFixed(1) + "~" + secOf(c.ef).toFixed(1) + (c.name ? " " + c.name : "");
 		return b.why === "tail" ? txt + " (템플릿 길이 " + secOf((b.op && b.op.D) || 0).toFixed(1) + "초 안)" : txt;
 	}
-	// 효과·키프레임이 있는 클립인가 (되읽은 deco: 컴포넌트가 프리셋이 배운 기본 수보다 많거나, Motion·Opacity에 키)
+	// 효과·키프레임이 있는 클립인가 (되읽은 deco: 컴포넌트가 프리셋이 배운 기본 수보다 많거나, Motion·Opacity에 키).
+	// 템플릿 자체에 있는 키(네이티브 템플릿의 Opacity 페이드 등, 2026-09-25 실측)는 첫 배치에서 배운 mogrtBaseKeyed로 빼고 본다.
+	// 네이티브는 기본값을 아직 모르면 키를 효과로 치지 않는다 (새로 놓은 클립도 키가 있을 수 있다)
 	function decoratedOf(d, preset) {
 		if (!d || !d.deco) return false;
 		const base = preset && typeof preset.mogrtBaseComps === "number" ? preset.mogrtBaseComps : null;
-		return (base !== null && d.deco.comps > base) || (Array.isArray(d.deco.keyed) && d.deco.keyed.length > 0);
+		const baseKeyed = preset && Array.isArray(preset.mogrtBaseKeyed) ? preset.mogrtBaseKeyed : null;
+		let keyed = Array.isArray(d.deco.keyed) ? d.deco.keyed.filter((k) => !(baseKeyed && baseKeyed.indexOf(k) !== -1)) : [];
+		if (baseKeyed === null && d.kind && d.kind !== "ae") keyed = [];
+		return (base !== null && d.deco.comps > base) || keyed.length > 0;
 	}
 	// 배치 계획 (순수). inp:
 	//   rows     대상 줄 [{sub, rs, preset, baked: {path, key, durSec} | null, bakeWhy, oldBaked: 전에 네이티브로 놓은 사본 경로 | null}]
@@ -11362,6 +11367,7 @@ var modalState = {
 		if (ls) upd.mogrtLs = ls;
 		const comps = res.comps && typeof res.comps[op.m] === "number" ? res.comps[op.m] : r.deco && typeof r.deco.comps === "number" ? r.deco.comps : null;
 		if (comps !== null) upd.mogrtBaseComps = comps;
+		if (r.deco && Array.isArray(r.deco.keyed)) upd.mogrtBaseKeyed = r.deco.keyed.slice();
 		Object.keys(upd).forEach((k) => {
 			if (preset[k] !== upd[k]) {
 				preset[k] = upd[k];
@@ -11408,6 +11414,15 @@ var modalState = {
 			_refreshRowMarks(sub);
 		}
 		if (opCreates(op) && preset && !isNativeList(preset.params)) _miLearn(preset, op, r, res, ctx);
+		else if (opCreates(op) && preset && isNativeList(preset.params) && r.deco && !ctx.learned["deco:" + op.presetId]) {
+			// 네이티브(구운 사본)는 효과 판정의 기본값(컴포넌트 수·템플릿 키)만 배운다 (mogrtLs·D는 AE 전용)
+			ctx.learned["deco:" + op.presetId] = true;
+			const upd = { mogrtBaseKeyed: Array.isArray(r.deco.keyed) ? r.deco.keyed.slice() : [] };
+			if (typeof r.deco.comps === "number") upd.mogrtBaseComps = r.deco.comps;
+			Object.keys(upd).forEach((k) => {
+				if (JSON.stringify(preset[k]) !== JSON.stringify(upd[k])) { preset[k] = upd[k]; ctx.presetsDirty = true; }
+			});
+		}
 		ctx.spkOk[op.K] = true;
 		_laRecord(ctx, op, r);
 		const cat = _laCat(op);
