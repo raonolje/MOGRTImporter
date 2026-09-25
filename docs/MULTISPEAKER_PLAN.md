@@ -406,6 +406,7 @@ ui/subtitleList 3375 · main.ts 3862
   - 외부에서 쓸 때는 fieldSignature가 일치해야 한다. 다르면 `fields-changed`로 거부한다.
   - 같은 프리셋을 다시 저장하면 `rebaseRowParams`가 fid를 기준으로 값을 옮긴다. 옮기지 못한 값은 `orphanFields`에 남긴다.
 - **네이티브**:
+  - (2026-09-25) 네이티브는 스크립트로 텍스트를 쓸 수 없어 **굽기**로 적용한다(S1-11). T-ID 규칙은 같다.
   - S0-3 f가 순서를 확인해야 definition.json의 이름을 쓴다.
   - **패치를 적용한 뒤에** 캐시한다(지금은 2948에서 캐시하고 3007에서 패치해서 캐시를 쓸 때 패치가 빠진다).
   - 기존 프리셋을 덧씌울 때 네이티브 목록은 displayName도 가져간다.
@@ -902,6 +903,19 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   - '현재 구조로 맞추기'는 사용자가 누를 때만 하고, 적용을 자동으로 부르지 않는다.
   - 선택: v1.1.7 배포.
 - **테스트**: 옛 구조 픽스처, 이름이 바뀐 필드가 orphan으로 가는지, 프리셋 저장 뒤에도 T2가 유지되는지, 구조를 맞춘 뒤 안전 적용.
+
+#### S1-11 feat: 네이티브 MOGRT 굽기(bake) 적용 — v27 네이티브 쓰기 버그 수정 (2026-09-25 추가)
+
+- **배경**: `docs/spike_s0.md` §3-1a. Premiere에서 만든(네이티브) MOGRT의 `Source Text.setValue`는 어떤 형식이든 **빈 글자로 렌더**된다. v27 운영본의 네이티브 지원은 "성공"을 보고하며 텍스트를 지운다. `.mogrt` 사본에 문구를 구우면 정확히 렌더된다.
+- **변경**:
+  - core(순수): `nativeBakeKey(srcPath, srcMtime, texts)`(fnv 해시), `uuidFromHash(hash)`(같은 문구 → 같은 capsuleID → Premiere가 프로젝트 항목을 재사용), `patchNativeDefinition(defJson, texts, capsuleId)`, `patchSourceTextBlob(b64, text)`(8바이트 LE 길이 + UTF-16LE JSON의 `mTextParam.mStyleSheet.mText`).
+  - 패널(Node + 이미 로드된 JSZip): `bakeNativeMogrt(srcPath, texts)` → `cache/{projKey}/baked/<key>.mogrt`. definition.json(capsuleID, capsuleName에 " [MI]", TextLayer `value.strDB[].str`)과 모든 `project*.prgraphic`(zip → gzip XML의 `<Name>Source Text</Name>` StartKeyframeValue)를 바꾼다. 같은 키가 있으면 다시 만들지 않는다.
+  - 적용 경로: 네이티브 프리셋 줄은 `mogrtPath = 구운 사본`, 텍스트 params는 보내지 않는다(v27 호스트의 네이티브 분기가 다시 비우지 않도록). v27 호스트 코드는 바꾸지 않는다. 텍스트가 바뀐 네이티브 줄의 갱신은 **교체**(제자리 갱신 불가).
+  - ↑(한 줄 갱신)과 프리셋 모달 미리보기도 같은 굽기 경로를 쓴다.
+  - 정리: 어떤 줄도 참조하지 않는 구운 사본은 30일 뒤 지운다(프로젝트 빈의 항목은 사용자가 정리).
+  - 2단계 호스트(`MI_placeChunk`)의 네이티브 항목은 `bakedPath`를 받고, 텍스트 변경은 `replace`로 계획한다.
+- **테스트**: 단위(블롭 왕복, 한글, 여러 TextLayer 순서, 같은 문구 → 같은 키·UUID), 하드(구운 사본 배치 후 exportFramePNG에 문구가 보임 — 사람이 확인, 두 번째 적용은 같은 프로젝트 항목 재사용, 텍스트 변경 시 교체).
+- **완료**: 네이티브 프리셋으로 적용한 자막이 화면에 보인다. v1.1.7에 포함한다.
 
 ### 2단계 (13일)
 
