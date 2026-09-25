@@ -55,14 +55,16 @@ module.exports = {
 
 		// ── (1) 노출 안 된 색상을 바꿔 프리셋 저장 → 줄의 후반 작업 필드가 남는다 ──
 		const snap0 = await panel(SNAP);
+		// 캡션 + 속성창에 노출된 후반 작업 텍스트 필드 + 노출 안 된 색상이 있는 AE 프리셋 (텍스트 필드가 많은 것부터)
 		const candidates = Object.keys(snap0.presets).map((id) => Object.assign({}, snap0.presets[id], { id })).filter((p) => {
 			const texts = p.params.filter((x) => x.type === "text");
 			const cap = p.params.find((x) => x.index === p.textParamIndex);
+			const post = texts.some((x) => x.index !== p.textParamIndex && p.exposedIndices.indexOf(x.index) !== -1);
 			const color = p.params.find((x) => x.type === "color" && p.exposedIndices.indexOf(x.index) === -1 && x.displayName);
-			return !texts.some((x) => x.nativeText) && texts.length >= 2 && cap && cap.type === "text" && color;
-		});
+			return !texts.some((x) => x.nativeText) && cap && cap.type === "text" && post && color;
+		}).sort((a, b) => b.params.filter((x) => x.type === "text").length - a.params.filter((x) => x.type === "text").length);
 		const P = candidates[0] || null;
-		assert.ok(P, "텍스트 필드 2개 이상 + 노출 안 된 색상이 있는 프리셋이 필요하다 (DEV 캐시의 프리셋: " + Object.keys(snap0.presets).join(",") + ")");
+		assert.ok(P, "캡션·노출된 후반 작업 텍스트 필드·노출 안 된 색상이 있는 프리셋이 필요하다 (DEV 캐시의 프리셋: " + Object.keys(snap0.presets).join(",") + ")");
 		const color = P.params.find((x) => x.type === "color" && P.exposedIndices.indexOf(x.index) === -1 && x.displayName);
 		log("프리셋 " + P.id + " " + P.name + " — 노출 안 된 색상 '" + color.displayName + "' (idx " + color.index + ")");
 		await H.withScratchSequence(api, "s1_10a", async () => {
