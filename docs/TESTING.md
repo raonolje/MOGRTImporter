@@ -21,7 +21,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
     - 최상위 이름: `function`(`function*`, `async function` 포함), `class`, `var/let/const` 선언 목록 전체(`const A = 1, B = 2`, `const { C, D: E, ...R } = o`, `const [F, , G = 1] = xs`). 블록 안 `var`는 세지 않는다.
   - vm에는 `console`, `TextDecoder`, `TextEncoder`만 있다.
   - 순수성 가드: 불러오는 region이 `document`, `window`, `state.`, `host.`, `localStorage`, `cep`, `CSInterface`를 쓰면 예외. 주석·문자열·템플릿의 글자 부분은 보지 않지만 템플릿 `${ … }` 안의 코드는 본다. 새 순수 로직은 `//#region src/mi/core.ts`에 둔다.
-  - `loadHostPure()`: hostscript.jsx의 `/* MI_PURE_BEGIN */`~`/* MI_PURE_END */`(ES3)를 그대로 node에서 실행한다. S2-1 전에는 `{}`.
+  - `loadHostPure()`: hostscript.jsx의 `/* MI_PURE_BEGIN */`~`/* MI_PURE_END */`(ES3)를 그대로 node에서 실행한다 (S2-1부터 `MI__json`, `MI__parseTag` 등). 블록이 없는 파일은 `{}`.
   - `regionHash(name)`: region 본문의 fnv1a32(8자리 hex). 5단계 MCP 드리프트 검사에 쓴다.
   - vm 객체는 프로토타입이 달라 `assert.deepStrictEqual`이 실패한다. 비교 전에 `plain(v)`를 쓴다.
 - `tests/unit/legacy_parseSRT.test.js`는 v27 골든이다. 깨지면 단일 화자 가져오기가 v27과 달라진 것이다.
@@ -39,6 +39,13 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   - `makeOldLayoutMogrt({newName})`: 새 버전(기본 '자동 줄바꿈 박스')과 텍스트 컨트롤 이름이 순서대로 같고 구조가 다른 옛 버전(이 PC에서는 `Project_MOGRT/기본 자막.mogrt`, 8속성)을 찾아 바이트 그대로 복사한다. `MI_OLD_MOGRT`로 원본을 직접 지정할 수 있다.
   - `makeRenamedMogrt(src, {옛: 새}, out)`: 같은 capsuleID로 컨트롤 이름만 바꾼 사본(S0-3 x ②). zip 읽기·쓰기는 의존성 없이 이 파일에 있다(`tests/unit/fixtures_mogrt.test.js`는 합성 템플릿으로만 본다).
 - `tests/fixtures/mogrt/make_native_mogrt.js` (S1-11): 합성 네이티브 MOGRT(definition.json, gzip .prproj를 담은 project.prgraphic·project_ko_KR.prgraphic, 썸네일)와 구운 사본 읽기(`readNativeMogrt`). 설치된 Premiere 템플릿(2018 형식)의 모양을 따른다: Source Text 블롭 = 8바이트 LE 길이 + UTF-16LE JSON, 지역화 파일은 속성 이름이 '소스 텍스트', 같은 블롭은 빈 요소 `<… BinaryHash="h"/>`로 가리킨다. `format: "binary"`는 새 Premiere(apiVersion 2.x)의 이진 Source Text(굽지 못함). `durationSec`는 definition의 템플릿 길이(`sourceInfoLocalized` duration, 연쇄 창).
+- `tests/lib/premiereSim.js` (S2-1): **hostscript.jsx 전체**를 가짜 Premiere(ExtendScript DOM) 위에서 node:vm으로 돌린다. v28 MI_ 호스트의 단위 테스트용이다 (`host_read.test.js`, S2-2부터 `host_place.test.js`).
+  - 흉내 내는 실측: importMGT·overwriteClip의 [S, S+D) 덮어쓰기(앞 클립 끝 자름·통째로 덮인 클립 지움·뒤 클립 머리와 inPoint 밀기·가운데는 둘로), 시작은 가장 가까운 프레임, 끝은 스냅 안 함, 트랙 번호 ≥ 트랙 수면 마지막 트랙, nodeId는 처음 읽을 때 발급, razor(`sim.razor`), start·inPoint·end 대입은 그 값만, move는 겹침 검사 없음, remove 두 번째는 false, 키 있는 속성 setValue 무시, 네이티브(getMGTComponent·projectItem null, Source Text 한 글자 초깃값), 공유 projectItem과 overwriteClip의 옛 구조(`oldParams`), QE addTracks.
+  - vm의 JSON을 지워 hostscript의 ES3 JSON 폴리필(eval)을 쓴다. 호스트에 넘기는 래퍼는 접근할 때마다 새로 만든다 (같은 클립도 `===`가 아니다).
+  - `sim.call(fn, payload)`는 패널 `_callMi`처럼 JSON(U+2028/2029 이스케이프) 문자열 하나로 부르고 결과를 파싱한다. 네이티브 Source Text 쓰기 횟수는 `sim.S.counts.nativeTextWrites`.
+  - 실제 Premiere 동작은 하드 케이스(`s2_1_tracks`, `s2_2_place`)가 확인한다. 시뮬레이터가 통과해도 하드 케이스를 건너뛰지 않는다.
+- `tests/unit/host_pure.test.js` (S2-1): MI_PURE 블록(MI__json 이스케이프·NaN, 태그 왕복, 프레임 계산)과 **v27 부분의 바이트 고정**(머리 주석 뒤 ~ `/* MI:BEGIN v28 */` 앞 본문의 fnv = v27 태그에서 잰 값).
+- `tests/unit/panel_host_mi.test.js` (S2-1): 패널 어댑터 `host.mi`(`_callMi`: 접두사, build·seqId 붙이기, U+2028/2029 이스케이프)와 `_miHostOk`(실행마다 ping, v 28·빌드 확인), `status.panel.build`·`status.host`.
 - `tests/compat/native_bake_real.test.js` (S1-11): 설치된 MOGRT 폴더(`MI_MOGRT_ROOT`, 기본 `%APPDATA%/Adobe/Common/Motion Graphics Templates`)가 있으면 돈다. 읽기 전용(메모리에서만 굽는다). Classic Lower Third Two Lines를 굽고, 모든 네이티브 템플릿의 prgraphic마다 Source Text 수가 TextLayer 수와 같거나 0(새 형식)인지 본다.
 - `tests/compat/` (S1-5부터, `preset_refs.test.js`는 S1-2 리뷰 반영): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지). 출력은 숫자·id만.
   - `realcache.test.js` (S1-5): 비어 있지 않은 session.json을 하네스(메모리 cep.fs)에 넣고 불러와 다시 저장해도 JSON이 같고 키 4개(mi 없음)인지, 히스토리 항목을 드롭다운으로 복원해도 목록·rowStates·휴지통이 같은지, 캡션 T-ID가 모든 줄에서 캡션 필드로 해석되고 isV27Unsafe가 옛 구조 줄과 정확히 같은지 본다. 실행: `MI_REAL_CACHE="$APPDATA/Adobe/CEP/extensions/CEP_MogrtImporter/cache" node --test tests/compat/realcache.test.js`
@@ -47,7 +54,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 ## 3. ES3 린트
 
 - `npm run lint:jsx` = `node tests/lib/es3lint.js extension/jsx/hostscript.jsx`. v27 코드는 보지 않고 `/* MI:BEGIN v28 */`~`/* MI:END */`만 본다. 구역이 없으면 통과.
-- 금지: `let`, `const`, `=>`, `class`, 템플릿 문자열(`${ … }` 안도 검사), `.forEach/.map/.filter/.some/.every/.reduce(`, `Array.isArray`, 배열 `indexOf`, `.trim(`, `Object.keys/create`(와 ES5+ Object.*: `getOwnPropertyDescriptor`, `is`, `fromEntries`, `isFrozen`, `setPrototypeOf` …), `.bind(`, `Date.now`, `.normalize(`, get/set 리터럴, 예약어 속성 이름(`x.default`, `{new: …}`), `JSON.*`(→ `MI__json`, `parsePayload`), ES2015+ 문자열 메서드(`.includes/.padStart/.matchAll/.replaceAll(` …), 배열 메서드(`.find/.findIndex/.fill/.flat/.flatMap/.entries/.keys/.values/.at(` …), `.toISOString/.toJSON(`, 정적 메서드·상수(`Array.from`, `Number.isSafeInteger`, `Number.MAX_SAFE_INTEGER`, `Math.trunc/imul` …), ES2015 전역(`Promise`, `Map` …), 전개, `for…of`, 기본 매개변수.
+- 금지: `let`, `const`, `=>`, `class`, 템플릿 문자열(`${ … }` 안도 검사), `.forEach/.map/.filter/.some/.every/.reduce(`, `Array.isArray`, 배열 `indexOf`, `.trim(`, `Object.keys/create`(와 ES5+ Object.*: `getOwnPropertyDescriptor`, `is`, `fromEntries`, `isFrozen`, `setPrototypeOf` …), `.bind(`, `Date.now`, `.normalize(`, get/set 리터럴, 예약어 속성 이름(`x.default`, `{new: …}`), `JSON.*`(→ `MI__json`, `parsePayload`), ES2015+ 문자열 메서드(`.includes/.padStart/.matchAll/.replaceAll(` …), 배열 메서드(`.find/.findIndex/.fill/.flat/.flatMap/.entries/.keys/.values/.at(` …), `.toISOString/.toJSON(`, 정적 메서드·상수(`Array.from`, `Number.isSafeInteger`, `Number.MAX_SAFE_INTEGER`, `Math.trunc/imul` …), ES2015 전역(`Promise`, `Map` …), 전개, `for…of`, 기본 매개변수, 객체·배열 리터럴의 끝 쉼표(`{a: 1,}`, `[1,]`, S2-1).
 - 목록에 없는 ES5+ 내장은 통과하므로 새 호스트 코드에서 낯선 메서드를 쓰면 ES3에 있는지 먼저 확인하고, 없으면 규칙과 실패 픽스처(`tests/unit/es3lint.test.js`)를 같이 늘린다.
 - `indexOf`는 정적으로 배열/문자열을 구분할 수 없다. 수신자가 문자열 리터럴, `String(…)`, `(x + "")`, 문자열 메서드 결과(`.toLowerCase()`, `.join(…)` 등)일 때만 통과한다. 문자열이면 `String(name).indexOf("[MI:")`처럼 감싸고, 배열 멤버십은 `MI__idx(arr, x)`를 쓴다.
 

@@ -81,7 +81,9 @@ const BANNED = [
 	["es6-global", "var m = new Map();"],
 	["spread", "f(...xs);"],
 	["for-of", "for (var x of xs) { n += x; }"],
-	["default-param", "function f(a, b = 1) { return a + b; }"]
+	["default-param", "function f(a, b = 1) { return a + b; }"],
+	["trailing-comma", "var o = { a: 1, b: 2, };"],
+	["trailing-comma", "var a = [1, 2,\n];"]
 ];
 
 for (const [rule, body] of BANNED) {

@@ -31,6 +31,10 @@
 	// 여러 SRT 가져오기(다화자) 플래그. S2-4(화자별 배치)까지 false: 운영은 v27처럼 SRT 한 개만 연다.
 	// DEV·하드 테스트는 코드를 고치지 않고 window._mogrtDebug.setMiCast(true)로 켠다 (_miCastEnabled)
 	const MI_CAST_ENABLED = false;
+	// v28 호스트(hostscript.jsx MI_ 구역) 이름 접두사와 이 패널의 빌드. DEV 설치가 둘 다 바꾼다
+	// (접두사 뒤에 D를 붙이고 @@BUILD@@ → dev-<sha>, tools/lib/stamp.js). 호스트 MI_ping의 prefix·build와 같아야 한다
+	const MI_PREFIX = "MI_";
+	const MI_BUILD_PANEL = "@@BUILD@@";
 	// 화자 줄의 ▶·↑ 안내 (화자별 트랙 배치는 S2-4. 그 전에는 v27 한 트랙 경로로 보내지 않는다)
 	const CAST_APPLY_PENDING_MSG = "화자별 배치는 개발 중입니다";
 	// 레거시 적용 (src/mi/apply.ts, S1-9). renderAll이 부팅 중에 읽으므로 여기 둔다.
@@ -670,6 +674,43 @@
 		}
 	}
 
+	// ── v28 호스트 호출 (hostscript.jsx MI_ 구역, S2-1) ──
+	// 이름은 MI_PREFIX + name (DEV 설치는 접두사 뒤에 D가 붙는다). payload에 build(MI_BUILD_PANEL)와 seqId(없으면 지금 작업 시퀀스)를
+	// 붙여 JSON 하나로 보낸다. 호스트는 빌드·활성 시퀀스가 다르면 아무것도 하지 않고 build-mismatch·seq-mismatch로 답한다.
+	// 호스트 JSON.parse는 eval 폴리필이라 문자열 속 날 U+2028/2029는 문법 오류다 (S0-3 h). Chromium 99의
+	// JSON.stringify는 둘을 이스케이프하지 않으므로 JSON 텍스트에서 \u2028·\u2029 이스케이프로 바꾼 뒤 보낸다.
+	// 응답은 늘 JSON 객체다 ({ok:false, error, detail}도 그대로 돌려준다 — 호출부가 .ok를 본다).
+	// 전송 실패(빈 응답·EvalScript error.)와 JSON이 아닌 응답은 던진다.
+	const MI_SEP_RE = /[\u2028\u2029]/g;
+	function _miJsonText(obj) {
+		return JSON.stringify(obj).replace(MI_SEP_RE, (c) => "\\u" + c.charCodeAt(0).toString(16));
+	}
+	async function _callMi(name, payload) {
+		const fn = MI_PREFIX + name;
+		let script = fn + "()";
+		if (payload !== undefined) {
+			const body = Object.assign({}, payload);
+			body.build = MI_BUILD_PANEL;
+			if (body.seqId === undefined || body.seqId === null) body.seqId = state.currentSequenceId || "";
+			let json;
+			try {
+				json = _miJsonText(body);
+			} catch (e) {
+				throw _hostError(fn, "페이로드 직렬화 실패: " + ((e && e.message) || e));
+			}
+			script = `${fn}(decodeURIComponent("${encodeURIComponent(json)}"))`;
+		}
+		const res = await _invoke(fn, script);
+		let out;
+		try {
+			out = JSON.parse(res);
+		} catch (e) {
+			throw _hostError(fn, "JSON 파싱 실패: " + ((e && e.message) || e), res);
+		}
+		if (!out || typeof out !== "object" || Array.isArray(out)) throw _hostError(fn, "응답이 객체가 아니다", res);
+		return out;
+	}
+
 	// 네이티브 그래픽 클립 지우기 (S1-11, host.removeNativeClipsAt). v27 호스트 함수를 바꾸지 않으려고 ExtendScript 식으로 보낸다.
 	// function(t, s, id): 활성 시퀀스 비디오 트랙 t에서 시작이 s[k]와 반 프레임 안이고, MGT 컴포넌트가 없고 Text 컴포넌트가 있는
 	// 클립(Premiere 네이티브 그래픽)만 지운다. AE MOGRT·영상 클립은 건드리지 않는다 → "SUCCESS: 지운 수" | "ERROR: no-seq|seq-changed"
@@ -738,6 +779,16 @@
 		},
 		// 트랙의 클립 목록 (v27 getTimelineClips, 읽기만) → JSON 글자 [{startSec, endSec, name}] | "ERROR: …" (S1-11 연쇄 계획)
 		getTimelineClips: (payload) => _callWithPayload("getTimelineClips", payload),
+
+		// ── v28 호스트 (MI_ 구역). 모두 파싱한 객체를 돌려준다. 호출부는 .ok를 확인한다 (_callMi) ──
+		mi: {
+			// {ok, v, build, prefix, seqId, seqName, isPreview, docId, frameTicks, zeroPoint, endFrame}. 가드 없음
+			ping: () => _callMi("ping"),
+			// {tracks: [트랙 번호] | null(V1 뺀 전부), fromFrame, toFrame} → {ok, frameTicks, numVideoTracks, tracks: [{i, locked, clips}], ms}
+			getTracks: (payload) => _callMi("getTracks", payload),
+			// {items: [{track, nodeId}] (40개까지), want: {texts, lay, deco, params}} → {ok, results, ms}
+			readTexts: (payload) => _callMi("readClipTexts", payload)
+		},
 
 		// 호스트 함수가 아니라 ExtendScript 식이다. 프리뷰 캡처 임시 경로용으로,
 		// 실패해도 진행에 지장이 없어 여기서만 예외를 삼키고 기본값을 준다.
@@ -3034,6 +3085,64 @@
 			if (ap && (apTrack(ap) !== track || Math.abs(ap.s - place[r.sub.id]) > NATIVE_SAME_SEC)) add(apTrack(ap), ap.s);
 		});
 		return { spots, place, extra, risk: list.filter((r) => risk[r.sub.id]).map((r) => r.sub.id) };
+	}
+
+	// ── 타임라인 클립 태그와 스캔 색인 (v28 호스트, S2-1) ──
+	// 우리 클립은 이름 끝에 "[MI:<salt>-<id>.<gen>]"을 단다 (예: "철수 [MI:k7q2-57.1]"). 호스트도 같은 정규식을 쓴다.
+	// uid = salt + "-" + id. 가장 높은 gen이 지금 클립이고 낮은 gen은 정리 대상이다.
+	// 자르기(razor)는 두 조각에 같은 이름을 남긴다(spike #1b) → 가장 높은 gen이 둘 이상이면 dup이고 자동으로 풀지 않는다.
+	const CLIP_TAG_RE = /\[MI:([a-z0-9]{4})-(\d+)\.(\d+)\]\s*$/;
+	// 클립 이름 → {salt, id, g, uid} | null
+	function parseClipTag(name) {
+		const m = CLIP_TAG_RE.exec(String(name == null ? "" : name));
+		if (!m) return null;
+		const id = parseInt(m[2], 10);
+		return { salt: m[1], id, g: parseInt(m[3], 10), uid: m[1] + "-" + id };
+	}
+	// 태그 글자 "[MI:salt-id.g]"
+	function makeClipTag(salt, id, g) {
+		return "[MI:" + salt + "-" + id + "." + g + "]";
+	}
+	// 호스트 트랙 스캔(호스트 getTracks 결과 또는 그 tracks 배열) → 태그로 나눈 색인. salt는 지금 목록의 salt.
+	//   own       {uid: [clip…]}  우리 salt의 클립 전부 (gen 내림차순, 같으면 트랙·시작순)
+	//   current   {uid: clip}     가장 높은 gen이 하나뿐인 클립
+	//   stale     [clip]          가장 높은 gen보다 낮은 우리 클립 (중단된 적용이 남긴 옛 클립 → 정리)
+	//   dup       {uid: [clip…]}  가장 높은 gen이 둘 이상 (자르기) → 건너뛰고 보고한다
+	//   foreignMi [clip]          다른 salt 태그 (복제한 시퀀스 등). 그 salt는 받지 않는다 (id가 부딪힌다)
+	//   untagged  [clip]          태그 없음 (v27 클립, 사용자 클립)
+	//   salts     {salt: 개수}    태그의 salt별 클립 수 (salt 복구 표본)
+	// clip = 호스트 클립 {sf, ef, nodeId, name}에 track과 이름에서 읽은 salt·id·g·uid를 붙인 사본.
+	// 태그는 호스트가 준 값이 아니라 이름에서 다시 읽는다. salt가 비어 있으면 own은 없다.
+	function scanIndex(scan, salt) {
+		const tracks = Array.isArray(scan) ? scan : (scan && Array.isArray(scan.tracks) ? scan.tracks : []);
+		const out = { own: {}, current: {}, stale: [], dup: {}, foreignMi: [], untagged: [], salts: {} };
+		const mine = String(salt || "");
+		tracks.forEach((t) => {
+			(t && Array.isArray(t.clips) ? t.clips : []).forEach((c) => {
+				if (!c) return;
+				const clip = { track: t.i, sf: c.sf, ef: c.ef, nodeId: String(c.nodeId == null ? "" : c.nodeId), name: String(c.name == null ? "" : c.name) };
+				const tag = parseClipTag(clip.name);
+				if (!tag) {
+					out.untagged.push(clip);
+					return;
+				}
+				Object.assign(clip, { salt: tag.salt, id: tag.id, g: tag.g, uid: tag.uid });
+				out.salts[tag.salt] = (out.salts[tag.salt] || 0) + 1;
+				if (!mine || tag.salt !== mine) {
+					out.foreignMi.push(clip);
+					return;
+				}
+				(out.own[tag.uid] = out.own[tag.uid] || []).push(clip);
+			});
+		});
+		Object.keys(out.own).forEach((uid) => {
+			const list = out.own[uid].sort((a, b) => b.g - a.g || a.track - b.track || a.sf - b.sf);
+			const top = list.filter((c) => c.g === list[0].g);
+			if (top.length === 1) out.current[uid] = top[0];
+			else out.dup[uid] = top;
+			list.forEach((c) => { if (c.g < list[0].g) out.stale.push(c); });
+		});
+		return out;
 	}
 	// app.js 원문에서 //#region <name> 본문을 잘라낸다 (표식 줄 제외, 줄바꿈 LF). 없으면 null.
 	// tests/lib/loadRegions.js의 sliceRegion과 같은 규칙: coreHash = fnv1a32(이 region 본문)
@@ -7777,16 +7886,23 @@ var modalState = {
 		return rowSummary(sub, rs, preset, (state.mi && state.mi.salt) || "", _castMode());
 	}
 	const _COMMANDS = {
-		// 패널·시퀀스·목록 요약. host는 v28 호스트 ping이 생기면 채운다 (S2-1)
-		status: () => {
+		// 패널·시퀀스·목록 요약. panel.build는 이 패널의 빌드 스탬프, host는 v28 호스트 ping 결과
+		// (MI_ 호스트가 없거나 응답이 없으면 null — v27 호스트가 캐시된 채인 Premiere)
+		status: async () => {
 			const mi = state.mi || miDefault();
 			const speakers = (mi.castOrder || []).map((k) => {
 				const c = (mi.cast && mi.cast[k]) || {};
 				return { key: k, name: c.name || k, track: typeof c.track === "number" ? c.track : null, presetId: c.presetId || "", count: state.subtitles.filter((s) => s.spk === k).length };
 			});
+			let hostPing = null;
+			try {
+				hostPing = await host.mi.ping();
+			} catch (_) {
+				hostPing = null;
+			}
 			return _cmdOk({
-				panel: { v: 28, build: null },
-				host: null,
+				panel: { v: 28, build: MI_BUILD_PANEL },
+				host: hostPing,
 				seq: { id: state.currentSequenceId || "", name: (_seqLabelInfo && _seqLabelInfo.seqName) || "" },
 				projKey: state.currentProjectKey,
 				seqKey: state.currentSequenceKey,
@@ -8770,6 +8886,28 @@ var modalState = {
 	// DEV·하드 테스트 훅: 굽기와 네이티브 클립 지우기를 직접 부른다 (코드를 고치지 않고 확인할 때)
 	window._mogrtDebug.bakeNative = (srcPath, texts) => bakeNativeMogrt(srcPath, texts);
 	window._mogrtDebug.removeNativeClipsAt = (payload) => host.removeNativeClipsAt(payload);
+
+	// ── v28 호스트 확인 (S2-1) ──
+	// 화자별 배치(MI_ 호출) 실행마다 먼저 ping한다. 실행 사이에 결과를 캐시하지 않는다: hostscript.jsx는 Premiere를
+	// 다시 시작할 때까지 캐시되고, 모든 CEP 확장이 전역 범위를 같이 써 마지막에 로드된 것이 이긴다 (spike #16).
+	// v 28이고 빌드가 이 패널(MI_BUILD_PANEL)과 같아야 한다. 아니면 화자 모드 동작에서만 MI_HOST_STALE_MSG를 보이고
+	// 아무것도 보내지 않는다. 레거시(v27) 경로는 이 확인과 상관없이 그대로 동작한다.
+	// → {ok: true, ping} | {ok: false, msg, why: "no-host"|"version"|"build", ping}
+	const MI_HOST_STALE_MSG = "다른 버전의 호스트 스크립트가 로드됨 — Premiere를 다시 시작하세요";
+	async function _miHostOk() {
+		let ping = null;
+		try {
+			ping = await host.mi.ping();
+		} catch (_) {
+			return { ok: false, msg: MI_HOST_STALE_MSG, why: "no-host", ping: null };
+		}
+		if (!ping || ping.ok !== true || ping.v !== 28) return { ok: false, msg: MI_HOST_STALE_MSG, why: "version", ping };
+		if (ping.build !== MI_BUILD_PANEL) return { ok: false, msg: MI_HOST_STALE_MSG, why: "build", ping };
+		return { ok: true, ping };
+	}
+	// DEV·하드 테스트 훅: 호스트 확인과 v28 호출을 패널 어댑터 그대로 부른다 (build·seqId·U+2028 이스케이프 포함)
+	window._mogrtDebug.miHostOk = () => _miHostOk();
+	window._mogrtDebug.callMi = (name, payload) => _callMi(name, payload);
 	//#endregion
 	//#region src/main.ts
 	function setStatus(msg, cls) {

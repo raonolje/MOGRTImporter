@@ -349,7 +349,9 @@ test("runCommand status: 키·시퀀스·줄 수·화자·coreHash(= 설치된 a
 	assert.deepEqual(d.speakers, [{ key: "C1", name: "철수", track: null, presetId: "", count: 2 }, { key: "C2", name: "영희", track: 3, presetId: "", count: 1 }]);
 	assert.equal(d.busy, false);
 	assert.equal(d.coreHash, regionHash("src/mi/core.ts"));
-	assert.deepEqual(d.panel, { v: 28, build: null });
+	// 패널 빌드는 스탬프 자리표시(저장소 app.js), 호스트는 MI_ping이 없는 하네스라 null (S2-1)
+	assert.deepEqual(d.panel, { v: 28, build: "@@BUILD@@" });
+	assert.equal(d.host, null);
 	noErrors(h);
 });
 

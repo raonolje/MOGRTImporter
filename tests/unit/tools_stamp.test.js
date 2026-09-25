@@ -139,11 +139,19 @@ test("verifyDev: MI_ 가 남거나 신원이 운영이면 잡는다", () => {
 	assert.ok(p.some((x) => /@@BUILD@@/.test(x)));
 });
 
-test("stageDev: 지금 사본도 통과한다 (MI_ → MID_ 말고는 그대로, 스탬프 없음, 벤더 js 포함)", () => {
+test("stageDev: 지금 사본도 통과한다 (MI_ → MID_와 빌드 스탬프 말고는 그대로, 벤더 js 포함)", () => {
+	const build = "dev-0aa8b82-d20260925120000";
 	assert.deepEqual(S.verifyDev(D.v27, EXT), []);
-	assert.equal(read("jsx/hostscript.jsx", D.v27), read("jsx/hostscript.jsx"));
-	// 패널 상수 MI_CAST_ENABLED(S1-7)도 DEV에서는 MID_CAST_ENABLED가 된다 (파일 안에서 한결같이 바뀐다)
-	assert.equal(read("html/js/app.js", D.v27), S.rewriteMiPrefix(read("html/js/app.js")));
+	// S2-1부터 호스트에 MI_ 구역(MI_BUILD = "@@BUILD@@")이 있다 → DEV 사본은 MID_ + 스탬프
+	const host = read("jsx/hostscript.jsx", D.v27);
+	assert.equal(host, S.stampBuild(S.rewriteMiPrefix(read("jsx/hostscript.jsx")), build));
+	assert.match(host, /function MID_ping\(\)/);
+	assert.equal(S.buildOfHost(host), build);
+	// 패널 상수 MI_CAST_ENABLED(S1-7)·MI_PREFIX·MI_BUILD_PANEL(S2-1)도 DEV에서는 MID_…가 된다 (파일 안에서 한결같이 바뀐다)
+	const app = read("html/js/app.js", D.v27);
+	assert.equal(app, S.stampBuild(S.rewriteMiPrefix(read("html/js/app.js")), build));
+	assert.match(app, /const MID_PREFIX = "MID_";/);
+	assert.match(app, new RegExp("const MID_BUILD_PANEL = \"" + build + "\";"));
 	assert.equal(read("html/CSInterface.js", D.v27), read("html/CSInterface.js"));
 });
 

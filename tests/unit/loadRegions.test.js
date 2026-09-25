@@ -131,8 +131,11 @@ test("regionHash: 8자리 hex, 본문이 바뀌면 달라지고 CRLF에는 둔�
 	assert.equal(L.fnv1a32("a"), "e40c292c");
 });
 
-test("loadHostPure: 블록이 없으면 {} (S2-1 이전), 있으면 ES3 코드를 그대로 실행", () => {
-	assert.deepEqual(L.loadHostPure(), {});
+test("loadHostPure: 블록이 없으면 {}, 있으면 ES3 코드를 그대로 실행 (저장소 hostscript는 S2-1부터 MI_PURE가 있다)", () => {
+	const real = L.loadHostPure();
+	assert.equal(typeof real.MI__json, "function");
+	assert.equal(typeof real.MI__parseTag, "function");
+	const none = tmpFile("none.jsx", "function v27() { return app.project; }\n");
 	const jsx = tmpFile("h.jsx", [
 		"function v27() { return app.project; }",
 		"/* MI:BEGIN v28 */",
@@ -145,9 +148,10 @@ test("loadHostPure: 블록이 없으면 {} (S2-1 이전), 있으면 ES3 코드�
 	].join("\n"));
 	const bad = tmpFile("bad.jsx", "/* MI_PURE_BEGIN */\nfunction MI__x() { return app.project.path; }\n/* MI_PURE_END */\n");
 	try {
+		assert.deepEqual(L.loadHostPure(none), {});
 		const h = L.loadHostPure(jsx);
 		assert.deepEqual(Object.keys(h).sort(), ["MI__K", "MI__idx"]);
 		assert.equal(h.MI__idx(["a", "b"], "b"), 1);
 		assert.throws(() => L.loadHostPure(bad), /순수성 가드.*app\./);
-	} finally { fs.unlinkSync(jsx); fs.unlinkSync(bad); }
+	} finally { fs.unlinkSync(none); fs.unlinkSync(jsx); fs.unlinkSync(bad); }
 });

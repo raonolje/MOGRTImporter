@@ -15,7 +15,8 @@
  * normalize, get/set 리터럴, 예약어 속성 이름(x.default, {new: …}), JSON.*(MI__json·parsePayload를 쓴다),
  * ES2015+ 문자열 메서드(includes, padStart, matchAll …), 배열 메서드(find, findIndex, fill, flat, flatMap,
  * entries/keys/values, at …), Date toISOString/toJSON, 정적 메서드·상수(Array.from, Number.isSafeInteger,
- * Number.MAX_SAFE_INTEGER, Math.trunc …), ES2015 전역(Promise, Map …), 전개 연산자, for…of, 기본 매개변수.
+ * Number.MAX_SAFE_INTEGER, Math.trunc …), ES2015 전역(Promise, Map …), 전개 연산자, for…of, 기본 매개변수,
+ * 객체·배열 리터럴의 끝 쉼표.
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -67,7 +68,8 @@ const RULES = [
 	{ id: "es6-global", re: /\b(Promise|Symbol|Map|Set|WeakMap|WeakSet|Proxy|Reflect)\s*[.(]|\bnew\s+(Promise|Map|Set|WeakMap|WeakSet|Proxy)\b/g, msg: "ES2015+ 전역 객체는 ES3에 없다" },
 	{ id: "spread", re: /\.\.\./g, msg: "전개/나머지 연산자는 ES3에 없다" },
 	{ id: "for-of", re: /\bfor\s*\(\s*(var\s+)?[A-Za-z_$][\w$]*\s+of\b/g, msg: "for…of는 ES3에 없다" },
-	{ id: "default-param", re: /\bfunction\b[^(]*\([^)]*=[^)]*\)/g, msg: "기본 매개변수는 ES3에 없다" }
+	{ id: "default-param", re: /\bfunction\b[^(]*\([^)]*=[^)]*\)/g, msg: "기본 매개변수는 ES3에 없다" },
+	{ id: "trailing-comma", re: /,\s*[}\]]/g, msg: "끝 쉼표는 ES3에 없다 — {a: 1,} / [1, 2,] (JScript 계열은 배열 길이도 달라진다)" }
 ];
 
 /** array-indexOf: 수신자가 문자열이 확실하면 통과 */

@@ -1,6 +1,9 @@
 /*
- * hostscript.jsx  v27
+ * hostscript.jsx  v28
  * Premiere Pro ExtendScript
+ * - v28 변경사항:
+ *   1. 파일 끝에 다화자 호스트 구역(MI:BEGIN v28 ~ MI:END)을 더했다. 진입점은 MI_, 헬퍼는 MI__ 접두사,
+ *      ES3만 쓴다 (npm run lint:jsx). 위의 v27 함수는 한 바이트도 바꾸지 않았다 (tests/unit/host_pure.test.js).
  * - v27 변경사항:
  *   1. Premiere 네이티브 템플릿 지원. getMGTComponent가 null인 클립은
  *      AE.ADBE Text 컴포넌트의 "Source Text"를 읽고 쓴다.
@@ -2763,3 +2766,519 @@ function selectExportFolder() {
         return "ERROR: " + e.message;
     }
 }
+
+/* MI:BEGIN v28 */
+/* ══════════════════════════════════════════════
+   v28 다화자 호스트 (docs/MULTISPEAKER_PLAN.md §7, spec placement 14)
+   - 진입점은 MI_, 헬퍼·전역은 MI__ 접두사. ExtendScript 전역은 모든 CEP 확장이 같이 쓴다.
+     DEV 설치는 접두사 뒤에 D를 붙여(stamp.js rewriteMiPrefix) 운영 호스트와 부딪히지 않는다 (tools/lib/stamp.js).
+   - 위의 v27 함수는 바꾸지 않고 부르기만 한다: parsePayload, detectParamType, collectNativeTextProps,
+     applyParamsToItem, ensureQE, PREVIEW_SEQ_NAME.
+   - ES3만 쓴다 (npm run lint:jsx). JSON.*은 쓰지 않는다: 입력은 parsePayload(eval 폴리필), 출력은 MI__json.
+   - 입력: JSON 문자열 하나 {seqId, build, …}. 패널(_callMi)이 U+2028/2029를 JSON 이스케이프로 바꿔 보낸다
+     (eval 폴리필은 문자열 속 날 U+2028을 문법 오류로 본다, S0-3 h).
+   - 출력: 늘 비어 있지 않은 JSON이고 "ERROR"로 시작하지 않는다. 실패는
+     {"ok":false,"error":"bad-payload|no-sequence|preview-active|seq-mismatch|build-mismatch|no-track|add-failed|exception","detail":"…"}
+   - 모든 진입점(MI_ping 빼고)은 MI__guard로 시작한다: 빌드가 같고, 활성 시퀀스가 있고, 프리뷰가 아니고,
+     activeSequence.sequenceID가 payload.seqId와 같아야 한다. 시퀀스를 id로 찾아 다루지 않는다
+     (QE addTracks는 활성 시퀀스만 바꾼다, spike #3).
+   - 시간: 모든 스크립트 시간은 시퀀스 0 기준(zeroPoint와 무관, S0-3 o). 프레임 = Math.round(ticks / frameTicks).
+     시작은 sf × frameTicks로 정확히 놓는다. 끝은 Premiere가 스냅하지 않으므로 늘 ef × frameTicks로 쓴다 (S0-3 p).
+   - 클립 태그: TrackItem.name 끝의 "[MI:<salt>-<id>.<gen>]" (저장·재시작 뒤에도 남는다, spike #1).
+     호스트는 태그를 읽기만 한다. 누가 우리 것인지(현재·옛 gen·중복)는 패널 core scanIndex가 가른다.
+══════════════════════════════════════════════ */
+var MI_VERSION = 28;
+var MI_BUILD = "@@BUILD@@";
+
+/* MI_PURE_BEGIN */
+/* 순수 헬퍼 (Premiere 객체 app·qe·$·File·Folder를 쓰지 않는다). node 테스트가 이 블록만 잘라
+   그대로 돌린다 (tests/lib/loadRegions.js loadHostPure, tests/unit/host_pure.test.js). */
+var MI__TPS = 254016000000;
+/* 클립 이름 끝의 태그 (패널 core CLIP_TAG_RE와 같은 규칙) */
+var MI__TAG_RE = /\[MI:([a-z0-9]{4})-(\d+)\.(\d+)\]\s*$/;
+/* MI_readClipTexts 한 번에 읽는 클립 수 상한 (클립당 54~61 ms, S0-3 결정 8) */
+var MI__READ_MAX = 40;
+
+/* 배열인가 (ES3에는 Array.isArray가 없다) */
+function MI__isArr(v) {
+    return Object.prototype.toString.call(v) === "[object Array]";
+}
+/* 정수인가 (숫자 타입만) */
+function MI__isInt(v) {
+    return typeof v === "number" && isFinite(v) && Math.floor(v) === v;
+}
+/* 배열 안 x의 위치, 없으면 -1 (ES3에는 배열 indexOf가 없다) */
+function MI__idx(arr, x) {
+    if (!arr) return -1;
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i] === x) return i;
+    }
+    return -1;
+}
+/* JSON 문자열 속 한 글자 이스케이프 */
+function MI__esc(c) {
+    var n = c.charCodeAt(0);
+    if (c === "\"") return "\\\"";
+    if (c === "\\") return "\\\\";
+    if (n === 10) return "\\n";
+    if (n === 13) return "\\r";
+    if (n === 9) return "\\t";
+    if (n === 8) return "\\b";
+    if (n === 12) return "\\f";
+    var h = n.toString(16);
+    while (h.length < 4) h = "0" + h;
+    return "\\u" + h;
+}
+/* 문자열 → JSON 문자열 리터럴. 따옴표·역슬래시·0x20 미만 제어 문자·U+2028/2029를 이스케이프한다 */
+function MI__str(s) {
+    return "\"" + String(s).replace(/[\\"\u0000-\u001f\u2028\u2029]/g, MI__esc) + "\"";
+}
+/* 값 → JSON 텍스트 (v27 JSON 폴리필 대신 쓰는 직렬화기).
+   NaN·Infinity → null, undefined·함수인 속성은 뺀다, 배열 속 undefined → null. 한글은 그대로 둔다 */
+function MI__json(v) {
+    var t = typeof v;
+    if (v === null || v === undefined || t === "function") return "null";
+    if (t === "number") return isFinite(v) ? String(v) : "null";
+    if (t === "boolean") return v ? "true" : "false";
+    if (t === "string") return MI__str(v);
+    var i, parts = [];
+    if (MI__isArr(v)) {
+        for (i = 0; i < v.length; i++) {
+            parts.push((v[i] === undefined || typeof v[i] === "function") ? "null" : MI__json(v[i]));
+        }
+        return "[" + parts.join(",") + "]";
+    }
+    if (t === "object") {
+        for (var k in v) {
+            if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+            if (v[k] === undefined || typeof v[k] === "function") continue;
+            parts.push(MI__str(k) + ":" + MI__json(v[k]));
+        }
+        return "{" + parts.join(",") + "}";
+    }
+    return MI__str(String(v));
+}
+/* 클립 이름의 태그 → {salt, id, g} | null */
+function MI__parseTag(name) {
+    var m = MI__TAG_RE.exec(String(name === null || name === undefined ? "" : name));
+    if (!m) return null;
+    return { salt: m[1], id: parseInt(m[2], 10), g: parseInt(m[3], 10) };
+}
+/* 태그 글자 "[MI:salt-id.g]" */
+function MI__makeTag(salt, id, g) {
+    return "[MI:" + salt + "-" + id + "." + g + "]";
+}
+/* ticks → 프레임 (가장 가까운 프레임, S0-3 q: Premiere도 시작을 가장 가까운 프레임에 맞춘다) */
+function MI__frameOf(ticks, ft) {
+    return Math.round(Number(ticks) / Number(ft));
+}
+/* 프레임 → ticks 문자열. frame × frameTicks가 2^53 아래(약 9.8시간)면 정확하다 */
+function MI__ticks(frame, ft) {
+    return String(Math.round(Number(frame) * Number(ft)));
+}
+/* MI_PURE_END */
+
+/* ── 공통 헬퍼 ── */
+
+function MI__now() {
+    return new Date().getTime();
+}
+function MI__errText(e) {
+    var s = "";
+    try { s = String(e && e.message ? e.message : e); } catch (x) { s = "?"; }
+    try { if (e && e.line) s += " (line " + e.line + ")"; } catch (x2) {}
+    return s;
+}
+/* 실패 응답 {"ok":false,"error":code,"detail":…} */
+function MI__fail(code, detail) {
+    return MI__json({ ok: false, error: code, detail: (detail === undefined || detail === null) ? "" : String(detail) });
+}
+/* 입력 JSON → 객체 (JSON이 아니거나 객체가 아니면 null) */
+function MI__parse(payloadStr) {
+    var p = parsePayload(String(payloadStr === undefined || payloadStr === null ? "" : payloadStr));
+    if (!p || typeof p !== "object" || MI__isArr(p)) return null;
+    return p;
+}
+/* 진입점 공통 확인 → {seq} | {err, detail}.
+   빌드가 먼저다: 캐시된 옛 호스트나 다른 빌드는 아무것도 하지 않고 build-mismatch로 답한다 */
+function MI__guard(p) {
+    if (!p) return { err: "bad-payload", detail: "JSON 객체가 아니다" };
+    if (String(p.build) !== MI_BUILD) return { err: "build-mismatch", detail: "host " + MI_BUILD + " / panel " + p.build };
+    var seq = null;
+    try { seq = app.project.activeSequence; } catch (e) { seq = null; }
+    if (!seq) return { err: "no-sequence", detail: "활성 시퀀스 없음" };
+    var name = "";
+    try { name = String(seq.name); } catch (e2) {}
+    if (name === PREVIEW_SEQ_NAME) return { err: "preview-active", detail: name };
+    var id = "";
+    try { id = String(seq.sequenceID); } catch (e3) {}
+    if (p.seqId === undefined || p.seqId === null || String(p.seqId) !== id) {
+        return { err: "seq-mismatch", detail: "활성 " + id + " (" + name + ") / 요청 " + p.seqId };
+    }
+    return { seq: seq };
+}
+/* 프레임당 ticks: videoFrameRate.ticks → timebase → 23.976 */
+function MI__ft(seq) {
+    var ft = 0;
+    try { ft = Number(seq.getSettings().videoFrameRate.ticks); } catch (e) { ft = 0; }
+    if (!(ft > 0)) {
+        try { ft = Number(seq.timebase); } catch (e2) { ft = 0; }
+    }
+    if (!(ft > 0)) ft = 10594584000;
+    return ft;
+}
+/* ticks → Time */
+function MI__T(ticks) {
+    var t = new Time();
+    t.ticks = String(Math.round(Number(ticks)));
+    return t;
+}
+/* 프레임 → Time (정확한 ticks) */
+function MI__at(frame, ft) {
+    var t = new Time();
+    t.ticks = MI__ticks(frame, ft);
+    return t;
+}
+/* 비디오 트랙 ti (없으면 null) */
+function MI__track(seq, ti) {
+    var n = 0;
+    try { n = seq.videoTracks.numTracks; } catch (e) { return null; }
+    if (!MI__isInt(ti) || ti < 0 || ti >= n) return null;
+    try { return seq.videoTracks[ti]; } catch (e2) { return null; }
+}
+function MI__numTracks(seq) {
+    try { return seq.videoTracks.numTracks; } catch (e) { return 0; }
+}
+function MI__locked(tr) {
+    try { return tr.isLocked() === true; } catch (e) { return false; }
+}
+/* 트랙의 nodeId → 클립 표 (호출마다 새로 만든다. 키는 "n" + nodeId).
+   nodeId는 처음 읽을 때 발급되므로(S0-3 §3 7) 이 표를 만들면 모든 클립이 번호를 받는다 */
+function MI__nodeMap(tr) {
+    var m = {};
+    var cs, n = 0;
+    try { cs = tr.clips; n = cs.numItems; } catch (e) { return m; }
+    for (var k = 0; k < n; k++) {
+        var c = null;
+        try { c = cs[k]; } catch (e2) { continue; }
+        if (!c) continue;
+        var id = "";
+        try { id = String(c.nodeId); } catch (e3) { continue; }
+        m["n" + id] = c;
+    }
+    return m;
+}
+/* 클립 시작·끝 ticks (Number) */
+function MI__s(c) {
+    return Number(c.start.ticks);
+}
+function MI__e(c) {
+    return Number(c.end.ticks);
+}
+function MI__mgt(c) {
+    try { return c.getMGTComponent(); } catch (e) { return null; }
+}
+/* 클립 종류: "ae"(MGT 컴포넌트 있음) | "native"(MGT 없음 + Text 컴포넌트, Premiere에서 만든 템플릿) | "other" */
+function MI__kind(c) {
+    if (MI__mgt(c)) return "ae";
+    var n = 0;
+    try { n = c.components.numItems; } catch (e) { return "other"; }
+    for (var i = 0; i < n; i++) {
+        var mn = "";
+        try { mn = String(c.components[i].matchName); } catch (e2) { continue; }
+        if (String(mn).indexOf("Text") !== -1) return "native";
+    }
+    return "other";
+}
+/* AE MGT 속성 목록 (없으면 null) */
+function MI__props(c) {
+    var comp = MI__mgt(c);
+    if (!comp) return null;
+    try { return comp.properties; } catch (e) { return null; }
+}
+/* 속성 값 글자가 텍스트 JSON이면 textEditValue (읽지 못하면 ""), 텍스트가 아니면 null */
+function MI__textOf(raw) {
+    var s = String(raw);
+    if (String(s).indexOf("\"textEditValue\"") === -1) return null;
+    var o = parsePayload(s);
+    if (o && o.textEditValue !== undefined && o.textEditValue !== null) return String(o.textEditValue);
+    return "";
+}
+/* 네이티브 Source Text 값: 한 글자 이하(쓰기 전 헤더 한 글자, S0-3 w)는 빈 값 */
+function MI__nativeVal(pr) {
+    var v = "";
+    try { v = String(pr.getValue()); } catch (e) { v = ""; }
+    return v.length <= 1 ? "" : v;
+}
+/* 텍스트 값들: AE는 텍스트 속성의 textEditValue를 index 순으로, 네이티브는 Source Text 순으로 */
+function MI__texts(c, kind) {
+    var out = [];
+    var i;
+    if (kind === "ae") {
+        var ps = MI__props(c);
+        var n = 0;
+        try { n = ps ? ps.numItems : 0; } catch (e) { n = 0; }
+        for (i = 0; i < n; i++) {
+            var v = "";
+            try { v = String(ps[i].getValue()); } catch (e2) { continue; }
+            var t = MI__textOf(v);
+            if (t !== null) out.push(t);
+        }
+    } else if (kind === "native") {
+        var nt = collectNativeTextProps(c);
+        for (i = 0; i < nt.length; i++) out.push(MI__nativeVal(nt[i]));
+    }
+    return out;
+}
+/* 클립 자체의 속성 레이아웃: AE [[displayName, "t"|"o"], …] ("t" = 값에 textEditValue), 네이티브 {n}, 그 밖 null.
+   패널 core clipLs(lay)가 해시한다 (옛 버전 MOGRT 클립 알아보기) */
+function MI__lay(c, kind) {
+    if (kind === "native") return { n: collectNativeTextProps(c).length };
+    if (kind !== "ae") return null;
+    var out = [];
+    var ps = MI__props(c);
+    var n = 0;
+    try { n = ps ? ps.numItems : 0; } catch (e) { n = 0; }
+    for (var i = 0; i < n; i++) {
+        var dn = "";
+        var v = "";
+        try { dn = String(ps[i].displayName); } catch (e2) {}
+        try { v = String(ps[i].getValue()); } catch (e3) {}
+        out.push([dn, String(v).indexOf("\"textEditValue\"") !== -1 ? "t" : "o"]);
+    }
+    return out;
+}
+/* 효과·키프레임: {comps: 컴포넌트 수, keyed: [키가 있는 Motion/Opacity의 matchName]} */
+function MI__deco(c) {
+    var o = { comps: 0, keyed: [] };
+    var n = 0;
+    try { n = c.components.numItems; } catch (e) { return o; }
+    o.comps = n;
+    for (var i = 0; i < n; i++) {
+        var cp = null;
+        var mn = "";
+        try { cp = c.components[i]; mn = String(cp.matchName); } catch (e2) { continue; }
+        if (mn !== "AE.ADBE Motion" && mn !== "AE.ADBE Opacity") continue;
+        var ps = null;
+        var np = 0;
+        try { ps = cp.properties; np = ps.numItems; } catch (e3) { continue; }
+        for (var j = 0; j < np; j++) {
+            var tv = false;
+            try { tv = ps[j].isTimeVarying() === true; } catch (e4) { tv = false; }
+            if (tv) { o.keyed.push(mn); break; }
+        }
+    }
+    return o;
+}
+/* 클립의 속성 전체를 ParamDef로 (되돌리기용 'before').
+   AE: getMogrtParams와 같은 규칙으로 type을 매긴다 (detectParamType, 텍스트 값이 든 그룹은 text).
+       {index, type, displayName, value, rawValue}. colorHex는 넣지 않는다 → applyParamsToItem이 rawValue로
+       정확히 되돌린다. boolean 값은 "true"/"false".
+   네이티브: {index: 서수, type: "text", displayName: "텍스트 N", value, rawValue: "", nativeText: true} */
+function MI__readParams(c, kind) {
+    var out = [];
+    var i;
+    if (kind === "ae") {
+        var ps = MI__props(c);
+        var n = 0;
+        try { n = ps ? ps.numItems : 0; } catch (e) { n = 0; }
+        for (i = 0; i < n; i++) {
+            var pr = null;
+            try { pr = ps[i]; } catch (e2) { continue; }
+            if (!pr) continue;
+            var dn = "";
+            try { dn = String(pr.displayName || ""); } catch (e3) {}
+            var val = "";
+            try { val = pr.getValue(); } catch (e4) { val = ""; }
+            if (val === null || val === undefined) val = "";
+            var sub = 0;
+            try { sub = pr.numItems || 0; } catch (e5) { sub = 0; }
+            var ty = detectParamType(val, dn, sub > 0, pr);
+            var raw = String(val);
+            if (ty === "group" && String(raw).indexOf("\"textEditValue\"") !== -1) ty = "text";
+            var value = raw;
+            if (ty === "text") {
+                var tx = MI__textOf(raw);
+                value = tx === null ? raw : tx;
+            } else if (ty === "boolean") {
+                value = raw.toLowerCase().replace(/^\s+|\s+$/g, "") === "true" ? "true" : "false";
+            } else if (ty === "group") {
+                value = "";
+            }
+            out.push({ index: i, type: ty, displayName: dn, value: value, rawValue: raw });
+        }
+    } else if (kind === "native") {
+        var nt = collectNativeTextProps(c);
+        for (i = 0; i < nt.length; i++) {
+            out.push({ index: i, type: "text", displayName: "텍스트 " + (i + 1), value: MI__nativeVal(nt[i]), rawValue: "", nativeText: true });
+        }
+    }
+    return out;
+}
+/* 클립의 프로젝트 항목 이름 (AE MOGRT = capsule 이름, S0-3 k). 네이티브는 null */
+function MI__pin(c) {
+    try {
+        var pi = c.projectItem;
+        return pi ? String(pi.name) : null;
+    } catch (e) {
+        return null;
+    }
+}
+/* 클립 요약 {track, sf, ef, nodeId, name} */
+function MI__brief(c, ti, ft) {
+    var o = { track: ti, sf: 0, ef: 0, nodeId: "", name: "" };
+    try { o.sf = MI__frameOf(MI__s(c), ft); } catch (e) {}
+    try { o.ef = MI__frameOf(MI__e(c), ft); } catch (e2) {}
+    try { o.nodeId = String(c.nodeId); } catch (e3) {}
+    try { o.name = String(c.name); } catch (e4) {}
+    return o;
+}
+/* 트랙의 클립 목록 [{sf, ef, nodeId, name, salt?, id?, g?}] — 시작순 (move 뒤 track.clips는 시작순이 아닐 수 있다, S0-3 r).
+   loT/hiT(ticks, null이면 끝없음)와 겹치는 클립만. 시작만 먼저 읽어 창 밖은 건너뛴다 (S0-3 s) */
+function MI__scanTrack(tr, ft, loT, hiT) {
+    var out = [];
+    var cs, n = 0;
+    try { cs = tr.clips; n = cs.numItems; } catch (e) { return out; }
+    for (var k = 0; k < n; k++) {
+        var c = null;
+        try { c = cs[k]; } catch (e1) { continue; }
+        if (!c) continue;
+        var s, en;
+        try { s = MI__s(c); } catch (e2) { continue; }
+        if (hiT !== null && s >= hiT) continue;
+        try { en = MI__e(c); } catch (e3) { continue; }
+        if (loT !== null && en <= loT) continue;
+        var o = { sf: MI__frameOf(s, ft), ef: MI__frameOf(en, ft), nodeId: "", name: "", st: s };
+        try { o.nodeId = String(c.nodeId); } catch (e4) {}
+        try { o.name = String(c.name); } catch (e5) {}
+        var tag = MI__parseTag(o.name);
+        if (tag) {
+            o.salt = tag.salt;
+            o.id = tag.id;
+            o.g = tag.g;
+        }
+        out.push(o);
+    }
+    out.sort(function (a, b) { return a.st - b.st; });
+    for (var i = 0; i < out.length; i++) delete out[i].st;
+    return out;
+}
+
+/* ══ 진입점: 읽기 (S2-1) ══ */
+
+/* 호스트 버전·빌드와 활성 시퀀스 → {ok, v, build, prefix, seqId, seqName, isPreview, docId, frameTicks, zeroPoint, endFrame}.
+   가드가 없다: 패널이 적용마다 먼저 불러 v 28과 빌드가 같은지 본다 (_miHostOk). 시퀀스가 없으면 seqId "" */
+function MI_ping() {
+    try {
+        var o = { ok: true, v: MI_VERSION, build: MI_BUILD, prefix: "MI_", seqId: "", seqName: "", isPreview: false, docId: "", frameTicks: "", zeroPoint: "0", endFrame: 0 };
+        try { o.docId = String(app.project.documentID || ""); } catch (e) {}
+        var seq = null;
+        try { seq = app.project.activeSequence; } catch (e2) { seq = null; }
+        if (seq) {
+            try { o.seqId = String(seq.sequenceID || ""); } catch (e3) {}
+            try { o.seqName = String(seq.name || ""); } catch (e4) {}
+            o.isPreview = o.seqName === PREVIEW_SEQ_NAME;
+            var ft = MI__ft(seq);
+            o.frameTicks = String(ft);
+            try { o.zeroPoint = String(seq.zeroPoint); } catch (e5) {}
+            try { o.endFrame = MI__frameOf(seq.end, ft); } catch (e6) {}
+        }
+        return MI__json(o);
+    } catch (e) {
+        return MI__fail("exception", MI__errText(e));
+    }
+}
+
+/* 트랙 스캔 (최소 읽기: 시작·끝·nodeId·이름과 읽은 태그)
+   payload {seqId, build, tracks: [트랙 번호] | null, fromFrame?, toFrame?}
+   tracks가 null이면 V1(영상)을 뺀 모든 비디오 트랙. 없는 트랙 번호는 건너뛴다.
+   fromFrame~toFrame과 겹치는 클립만 (없으면 트랙 전체).
+   → {ok, frameTicks, numVideoTracks, tracks: [{i, locked, clips: [{sf, ef, nodeId, name, salt?, id?, g?}]}], ms} */
+function MI_getTracks(payloadStr) {
+    var t0 = MI__now();
+    try {
+        var p = MI__parse(payloadStr);
+        var g = MI__guard(p);
+        if (g.err) return MI__fail(g.err, g.detail);
+        var seq = g.seq;
+        var ft = MI__ft(seq);
+        var nt = MI__numTracks(seq);
+        var list = [];
+        var i;
+        if (p.tracks === undefined || p.tracks === null) {
+            for (i = 1; i < nt; i++) list.push(i);
+        } else if (MI__isArr(p.tracks)) {
+            for (i = 0; i < p.tracks.length; i++) {
+                var ti = p.tracks[i];
+                if (!MI__isInt(ti) || ti < 0) return MI__fail("bad-payload", "tracks[" + i + "]");
+                if (ti < nt && MI__idx(list, ti) === -1) list.push(ti);
+            }
+        } else {
+            return MI__fail("bad-payload", "tracks는 배열 또는 null");
+        }
+        if (p.fromFrame !== undefined && p.fromFrame !== null && typeof p.fromFrame !== "number") return MI__fail("bad-payload", "fromFrame");
+        if (p.toFrame !== undefined && p.toFrame !== null && typeof p.toFrame !== "number") return MI__fail("bad-payload", "toFrame");
+        var loT = typeof p.fromFrame === "number" ? p.fromFrame * ft : null;
+        var hiT = typeof p.toFrame === "number" ? p.toFrame * ft : null;
+        var out = [];
+        for (i = 0; i < list.length; i++) {
+            var tr = MI__track(seq, list[i]);
+            if (!tr) continue;
+            out.push({ i: list[i], locked: MI__locked(tr), clips: MI__scanTrack(tr, ft, loT, hiT) });
+        }
+        return MI__json({ ok: true, frameTicks: String(ft), numVideoTracks: nt, tracks: out, ms: MI__now() - t0 });
+    } catch (e) {
+        return MI__fail("exception", MI__errText(e));
+    }
+}
+
+/* 후보 클립의 무거운 읽기 (한 번에 40개까지)
+   payload {seqId, build, items: [{track, nodeId}], want: {texts, lay, deco, params}} (want가 없으면 texts·lay·deco)
+   → {ok, results: [{nodeId, found, track, sf, ef, name, kind, pin, texts?, lay?, deco?, params?}], ms}
+   트랙마다 nodeId 표를 한 번만 만든다 */
+function MI_readClipTexts(payloadStr) {
+    var t0 = MI__now();
+    try {
+        var p = MI__parse(payloadStr);
+        var g = MI__guard(p);
+        if (g.err) return MI__fail(g.err, g.detail);
+        var seq = g.seq;
+        var ft = MI__ft(seq);
+        var items = p.items;
+        if (!MI__isArr(items)) return MI__fail("bad-payload", "items는 배열");
+        if (items.length > MI__READ_MAX) return MI__fail("bad-payload", "items는 " + MI__READ_MAX + "개까지 (" + items.length + ")");
+        var want = (p.want && typeof p.want === "object") ? p.want : { texts: true, lay: true, deco: true, params: false };
+        var maps = {};
+        var results = [];
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i] || {};
+            var r = { nodeId: String(it.nodeId), found: false };
+            var ti = it.track;
+            var tr = MI__track(seq, ti);
+            if (tr) {
+                if (!maps["t" + ti]) maps["t" + ti] = MI__nodeMap(tr);
+                var c = maps["t" + ti]["n" + r.nodeId];
+                if (c) {
+                    var b = MI__brief(c, ti, ft);
+                    var kind = MI__kind(c);
+                    r.found = true;
+                    r.track = ti;
+                    r.sf = b.sf;
+                    r.ef = b.ef;
+                    r.name = b.name;
+                    r.kind = kind;
+                    r.pin = MI__pin(c);
+                    if (want.texts) r.texts = MI__texts(c, kind);
+                    if (want.lay) r.lay = MI__lay(c, kind);
+                    if (want.deco) r.deco = MI__deco(c);
+                    if (want.params) r.params = MI__readParams(c, kind);
+                }
+            }
+            results.push(r);
+        }
+        return MI__json({ ok: true, results: results, ms: MI__now() - t0 });
+    } catch (e) {
+        return MI__fail("exception", MI__errText(e));
+    }
+}
+/* MI:END */
