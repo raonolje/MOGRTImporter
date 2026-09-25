@@ -1,0 +1,15 @@
+// (l) MANUAL: first pick an SRT whose folder/file name is Korean with the DEV panel's SRT 열기 button (#srtInput), then run:
+//   node tests/premiere/run.js --port 7778 <this file>
+// It prints File.path of the picked file, a cep.fs.stat of that path (mtime), and whether node fs can read it. Read-only.
+await (async () => {
+  const inp = document.getElementById("srtInput");
+  const f = inp && inp.files && inp.files[0];
+  if (!f) return "no file picked in #srtInput";
+  const out = { name: f.name, size: f.size, lastModified: f.lastModified, path: String(f.path) };
+  if (f.path) {
+    const st = window.cep.fs.stat(f.path);
+    out.cepStat = { err: st.err, mtime: st.data ? String(st.data.mtime) : null };
+    try { out.nodeReadBytes = require("fs").readFileSync(f.path).length; } catch (e) { out.nodeRead = "THROW " + e.message; }
+  }
+  return JSON.stringify(out);
+})()

@@ -1,0 +1,33 @@
+// (n) TextDecoder utf-16be / utf-16le / euc-kr in the CEP 12 panel (Chromium 99)
+await (async () => {
+  const out = {};
+  const be = new Uint8Array([0xFE, 0xFF, 0xD5, 0x5C, 0xAE, 0x00, 0x00, 0x0A, 0x00, 0x41]); // BOM + "한글\nA"
+  const le = new Uint8Array([0xFF, 0xFE, 0x5C, 0xD5, 0x00, 0xAE, 0x0A, 0x00, 0x41, 0x00]);
+  try { const d = new TextDecoder("utf-16be"); out.utf16be = JSON.stringify(d.decode(be)); out.utf16beIgnoreBOMdefault = d.ignoreBOM; } catch (e) { out.utf16be = "THROW " + e.message; }
+  try { out.utf16be_fatal = JSON.stringify(new TextDecoder("utf-16be", { fatal: true }).decode(be)); } catch (e) { out.utf16be_fatal = "THROW " + e.message; }
+  try { out.utf16le = JSON.stringify(new TextDecoder("utf-16le").decode(le)); } catch (e) { out.utf16le = "THROW " + e.message; }
+  try { out.eucKr = new TextDecoder("euc-kr").encoding; } catch (e) { out.eucKr = "THROW " + e.message; }
+  try { out.cp949 = new TextDecoder("cp949").encoding; } catch (e) { out.cp949 = "THROW " + e.message; }
+  // odd byte count in utf-16be (truncated file)
+  try { out.utf16be_odd = JSON.stringify(new TextDecoder("utf-16be").decode(be.slice(0, 9))); } catch (e) { out.utf16be_odd = "THROW " + e.message; }
+  return JSON.stringify(out);
+})()
+---
+// (l) File.path availability, cep.fs.stat mtime on a Korean path, window.cep.fs dialog functions present (not called: they block)
+await (async () => {
+  const out = {};
+  out.filePathOnPrototype = ("path" in File.prototype);
+  const f = new File(["x"], "x.srt");
+  out.syntheticFilePath = String(f.path);
+  out.showOpenDialogEx = typeof (window.cep && window.cep.fs && window.cep.fs.showOpenDialogEx);
+  out.showOpenDialog = typeof (window.cep && window.cep.fs && window.cep.fs.showOpenDialog);
+  const ko = process.env.APPDATA.replace(/\\/g, "/") + "/Adobe/Common/Motion Graphics Templates/Project_MOGRT/정의자막.mogrt";
+  const st = window.cep.fs.stat(ko);
+  out.cepStat = { err: st.err, keys: st.data ? Object.keys(st.data) : null, mtime: st.data ? String(st.data.mtime) : null, isFile: st.data && st.data.isFile ? st.data.isFile() : null };
+  const ns = require("fs").statSync(ko);
+  out.nodeStat = { mtimeMs: ns.mtimeMs, size: ns.size };
+  const rd = window.cep.fs.readFile(ko, window.cep.encoding.Base64);
+  out.cepReadKoreanPath = { err: rd.err, b64len: rd.data ? rd.data.length : 0 };
+  out.inputFileAcceptsWebkitdirectory = "webkitdirectory" in document.createElement("input");
+  return JSON.stringify(out);
+})()

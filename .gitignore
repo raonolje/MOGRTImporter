@@ -16,3 +16,4 @@ dist/
 # 로컬 작업물
 *.log
 tmp/
+tests/premiere/spikes/*.mogrt
