@@ -158,7 +158,8 @@ function pageLoadWork(name, obj) {
 
 /** runCommand 결과 (window._mogrtDebug.cmd, 약속을 기다린다) */
 function pageCmd(op, args) {
-	return "window._mogrtDebug.cmd(" + JSON.stringify(op) + ", " + JSON.stringify(args || {}) + ")";
+	// replMode 평가라 맨 앞의 await가 있어야 약속이 풀린다 (없으면 {}가 돌아온다)
+	return "await window._mogrtDebug.cmd(" + JSON.stringify(op) + ", " + JSON.stringify(args || {}) + ")";
 }
 
 /** 목록 행 요약 [{id, num, text, preset, checked, cls}] */
