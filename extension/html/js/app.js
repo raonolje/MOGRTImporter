@@ -259,6 +259,18 @@
 		const usedPresets = new Set(Object.values(state.rowStates).map((rs) => rs.presetId).filter(Boolean));
 		usedPresets.forEach((pid) => _getPresetColorIndex(pid));
 	}
+	// 새 프리셋 id (단조 증가, 빈 번호를 다시 쓰지 않는다). state.nextPresetId를 함께 올린다.
+	// 참조: 살아 있는 프리셋, 프리셋 휴지통, 행과 자막 휴지통이 가리키는 id.
+	// (S1-5에서 mi.cast, S2-3에서 cast_defaults가 참조에 더해진다)
+	// 호출한 쪽이 savePresetsToStorage()로 저장한다.
+	function _allocPresetId() {
+		const refs = [];
+		Object.values(state.rowStates || {}).forEach((rs) => { if (rs && rs.presetId) refs.push(rs.presetId); });
+		(state.trashBin || []).forEach((t) => { if (t && t.state && t.state.presetId) refs.push(t.state.presetId); });
+		const r = nextFreePresetId(state.presets, state.presetTrash, refs, state.nextPresetId);
+		state.nextPresetId = r.next;
+		return r.id;
+	}
 	function loadAllFromStorage() {
 		// 마이그레이션 먼저 시도 (최초 1회, 파일 없을 때만 localStorage에서 복사)
 		_migrateFromLocalStorage();
@@ -866,6 +878,23 @@
 		if (refs) Array.from(refs).forEach(see);
 		const n = max + 1;
 		return { id: "preset_" + n, next: n + 1 };
+	}
+	// 프리셋 가져오기의 id 대응: 가져온 항목마다 이름이 같고 MOGRT 파일 이름(대소문자 무시)이 같은
+	// 살아 있는 프리셋이 있으면 그 id를 다시 쓴다(파일의 id와 같은 후보를 먼저). 한 id는 한 번만 쓴다.
+	// items: [{id: 파일의 id, name, mogrtPath}], live: {id: preset}
+	// → {ids: [다시 쓸 id | null(새 id 필요)], dropped: [다시 쓰이지 않은 live id]}
+	function matchImportedPresets(items, live) {
+		const base = (p) => String((p && p.mogrtPath) || "").split(/[\\/]/).pop().toLowerCase();
+		const liveIds = live && typeof live === "object" ? Object.keys(live) : [];
+		const taken = {};
+		const ids = (items || []).map((it) => {
+			const cands = liveIds.filter((id) => !taken[id] && live[id] && it && live[id].name === it.name && base(live[id]) === base(it));
+			if (!cands.length) return null;
+			const id = cands.indexOf(it.id) !== -1 ? it.id : cands[0];
+			taken[id] = true;
+			return id;
+		});
+		return { ids, dropped: liveIds.filter((id) => !taken[id]) };
 	}
 	// 줄 id 다시 매기기 (다른 시퀀스의 작업 파일): startId부터 줄 → 휴지통 순으로.
 	// rowStates 키와 줄 id가 함께 바뀌고, 휴지통 항목은 제 상태를 품고 새 id를 받는다.
@@ -1943,7 +1972,7 @@
 			row.className = "trash-row";
 			const nameEl = document.createElement("span");
 			nameEl.className = "trash-text";
-			nameEl.textContent = item.preset.name;
+			nameEl.textContent = item.preset.name + (item.why === "import" ? " (가져오기로 교체됨)" : "");
 			const mogrtEl = document.createElement("span");
 			mogrtEl.className = "trash-time";
 			mogrtEl.textContent = item.preset.mogrtPath.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? "";
@@ -1952,12 +1981,20 @@
 			restoreBtn.textContent = "복구";
 			restoreBtn.addEventListener("click", () => {
 				const restored = state.presetTrash.splice(ti, 1)[0];
-				state.presets[restored.preset.id] = restored.preset;
+				// 같은 id가 이미 살아 있으면(다른 프리셋이 그 id를 쓰는 중) 덮어쓰지 않고 새 id로 복구한다
+				let rid = restored.preset.id;
+				const reissued = !rid || !!state.presets[rid];
+				if (reissued) {
+					rid = _allocPresetId();
+					restored.preset.id = rid;
+				}
+				state.presets[rid] = restored.preset;
 				savePresetsToStorage();
 				renderPresetList();
 				renderPresetTrash();
 				refreshAllSelects();
-				_setStatus$3("프리셋 \"" + restored.preset.name + "\" 복구됨", "ok");
+				if (reissued) _setStatus$3("프리셋 \"" + restored.preset.name + "\" 새 ID로 복구 (" + rid + ")", "ok");
+				else _setStatus$3("프리셋 \"" + restored.preset.name + "\" 복구됨", "ok");
 			});
 			row.appendChild(nameEl);
 			row.appendChild(mogrtEl);
@@ -3862,7 +3899,7 @@ var modalState = {
 			let presetName = document.getElementById("presetNameInput")?.value.trim() ?? "";
 			if (!presetName) presetName = mogrtPath.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? "Preset";
 			let presetId = modalState.presetId;
-			if (!presetId) presetId = "preset_" + state.nextPresetId++;
+			if (!presetId) presetId = _allocPresetId();
 			const usedBy = Object.entries(state.rowStates).filter(([, rs]) => rs.presetId === presetId).map(([id]) => parseInt(id, 10));
 			const doSave = () => {
 				state.presets[presetId] = {
@@ -4339,7 +4376,7 @@ var modalState = {
 			if (!rs) continue;
 			const origPreset = state.presets[item.presetId];
 			if (!origPreset) continue;
-			const newId = "preset_" + state.nextPresetId++;
+			const newId = _allocPresetId();
 			const newName = origPreset.name + "_sync_" + (/* @__PURE__ */ new Date()).toLocaleTimeString("ko-KR", {
 				hour: "2-digit",
 				minute: "2-digit"
@@ -5005,13 +5042,13 @@ var modalState = {
 						showAlert("MOGRT 스캔이 진행 중입니다.\n스캔 완료 후 다시 시도하세요.");
 						return;
 					}
+					// clearFirst(교체): 가져온 프리셋과 이름·MOGRT가 같은 기존 프리셋은 그 id를 그대로 쓰고,
+					// 다시 쓰이지 않은 기존 프리셋은 지우지 않고 프리셋 휴지통으로 보낸다(why "import").
+					// 새 id는 항상 _allocPresetId()로 받는다. 카운터를 되돌리지 않으므로 다른 세션·휴지통의
+					// 'preset_3'이 조용히 다른 MOGRT를 가리키는 일이 없다.
 					const doImport = (clearFirst) => {
-						if (clearFirst) {
-							// 기존 프리셋 전체 삭제
-							// 아래 가져오기 루프가 끝난 뒤 savePresetsToStorage()가 돈다.
-							setPresets({}, { reason: "프리셋 가져오기 - 기존 삭제", persist: false });
-							state.nextPresetId = 1;
-						}
+						const live = Object.assign({}, state.presets);
+						const accepted = [];
 						let imported = 0;
 						let skipped = 0;
 						const skippedNames = [];
@@ -5038,31 +5075,55 @@ var modalState = {
 							}
 							// 파일명 일치 시 실제 경로로 업데이트
 							if (matched.path !== p.mogrtPath) p.mogrtPath = matched.path;
-							let newId = pid;
-							if (state.presets[newId]) newId = "preset_" + state.nextPresetId++;
-							state.presets[newId] = {
-								...p,
-								id: newId,
-								exposedFontFields: p.exposedFontFields || {}
-							};
-							imported++;
+							accepted.push({ pid, p });
 						}
+						const plan = matchImportedPresets(accepted.map((a) => ({ id: a.pid, name: a.p.name, mogrtPath: a.p.mogrtPath })), live);
+						let lostRows = 0;
+						if (clearFirst) {
+							const deletedAt = new Date().toISOString();
+							plan.dropped.forEach((id) => {
+								state.presetTrash.push({ preset: JSON.parse(JSON.stringify(live[id])), deletedAt, why: "import" });
+								delete state.presets[id];
+							});
+							lostRows = Object.values(state.rowStates).filter((rs) => rs && rs.presetId && plan.dropped.indexOf(rs.presetId) !== -1).length;
+						}
+						let kept = 0;
+						accepted.forEach((a, i) => {
+							const reuse = plan.ids[i];
+							const newId = reuse || _allocPresetId();
+							if (reuse) kept++;
+							state.presets[newId] = migratePreset({
+								...a.p,
+								id: newId,
+								exposedFontFields: a.p.exposedFontFields || {}
+							});
+							imported++;
+						});
+						// 휴지통으로 간 프리셋을 가리키던 행은 '프리셋 없음'이 된다 (다른 MOGRT로 바뀌지 않는다)
+						_sanitizeOrphanPresets();
 						savePresetsToStorage();
+						saveSessionToStorage();
+						renderAll();
 						renderPresetList();
+						renderPresetTrash();
 						refreshAllSelects();
 						updatePresetTabCount();
 						let msg = "프리셋 불러오기: " + imported + "개 " + (clearFirst ? "교체" : "추가");
+						if (kept > 0) msg += " (ID 유지 " + kept + "개)";
+						const lostMsg = lostRows > 0 ? lostRows + "개 줄의 프리셋 연결이 끊어졌습니다 (프리셋 휴지통에서 복구 가능)" : "";
+						if (lostMsg) msg += " · " + lostMsg;
 						if (skipped > 0) {
 							msg += ", " + skipped + "개 스킵";
-							showAlert("불러오기 완료: " + imported + "개 " + (clearFirst ? "교체됨" : "추가됨") + "\n\n다음 프리셋은 MOGRT 파일을 찾을 수 없어 스킵되었습니다:\n" + skippedNames.slice(0, 5).join("\n") + (skippedNames.length > 5 ? "\n..." : ""));
+							showAlert("불러오기 완료: " + imported + "개 " + (clearFirst ? "교체됨" : "추가됨") + (lostMsg ? "\n" + lostMsg : "") + "\n\n다음 프리셋은 MOGRT 파일을 찾을 수 없어 스킵되었습니다:\n" + skippedNames.slice(0, 5).join("\n") + (skippedNames.length > 5 ? "\n..." : ""));
+							setStatus(msg, "ok");
 						} else setStatus(msg, "ok");
 					};
 					const existingCount = Object.keys(state.presets).length;
 					if (existingCount > 0) {
-						// 기존 프리셋이 있으면 OK = 덮어쓰기, Cancel = 취소
+						// 기존 프리셋이 있으면 OK = 교체, Cancel = 취소
 						showConfirm(
-							"기존 프리셋 " + existingCount + "개가 있습니다.\n\n[확인] 기존 프리셋을 모두 삭제하고 불러오기\n[취소] 불러오기 취소",
-							() => doImport(true),   // OK: 기존 삭제 후 교체
+							"기존 프리셋 " + existingCount + "개가 있습니다.\n\n[확인] 가져온 프리셋으로 교체 (이름과 MOGRT가 같은 프리셋은 ID 유지, 나머지는 프리셋 휴지통으로)\n[취소] 불러오기 취소",
+							() => doImport(true),   // OK: 교체 (다시 쓰이지 않은 기존 프리셋은 프리셋 휴지통으로)
 							() => {}                // Cancel: 아무것도 안 함
 						);
 					} else {
@@ -5351,6 +5412,30 @@ var modalState = {
 	function _saveHistoryOnAction(label) { _saveHistory(label, false); }
 	// 히스토리 버튼 초기 상태 업데이트
 	_updateHistoryBtn();
+
+	// ── 하드 테스트용 읽기 전용 스냅숏 (CDP) ──
+	// 상태의 깊은 사본만 돌려주고 아무것도 바꾸지 않는다. 프리셋 썸네일은 길이만 남긴다.
+	function _debugSnapshot() {
+		const slim = (p) => {
+			const c = JSON.parse(JSON.stringify(p || {}));
+			if (typeof c.thumbnailData === "string") c.thumbnailData = c.thumbnailData.length;
+			return c;
+		};
+		const presets = {};
+		Object.keys(state.presets).forEach((id) => { presets[id] = slim(state.presets[id]); });
+		return JSON.parse(JSON.stringify({
+			keys: { proj: state.currentProjectKey, seq: state.currentSequenceKey, seqId: state.currentSequenceId },
+			subtitles: state.subtitles,
+			rowStates: state.rowStates,
+			trashBin: state.trashBin,
+			nextId: state.nextId,
+			presets,
+			presetTrash: state.presetTrash.map((t) => Object.assign({}, t, { preset: slim(t.preset) })),
+			nextPresetId: state.nextPresetId,
+			mogrtCount: state.mogrtList.length
+		}));
+	}
+	window._mogrtDebug.snapshot = _debugSnapshot;
 
 	//#endregion
 })();

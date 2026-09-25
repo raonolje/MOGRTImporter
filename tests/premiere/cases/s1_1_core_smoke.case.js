@@ -22,7 +22,7 @@ module.exports = {
 		const { panel, host, assert, log, reload } = api;
 		await H.reloadClean(reload, assert, log);
 		assert.equal(await panel("typeof window._mogrtDebug"), "object");
-		await H.waitFor(panel, "(document.getElementById('activeSeqLabel') || {}).textContent.indexOf('T_') !== -1", { what: "시퀀스 키 확정" });
+		await H.waitKeys(panel);
 
 		const v1Before = JSON.parse(await host(H.jsxReadVideoTrack(0)));
 		assert.equal(await host(H.jsxClearVideoTrack(TRACK)), "0", "V3 비우기");

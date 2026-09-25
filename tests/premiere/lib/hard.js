@@ -110,35 +110,98 @@ async function reloadClean(reload, assert, log) {
 	return logs;
 }
 
+/** 시퀀스 키가 확정되고(T_ 시퀀스) SRT 열기가 열릴 때까지 기다린다 (S1-3 부팅 게이트 포함) */
+async function waitKeys(panel, opts = {}) {
+	return waitFor(panel, "(() => { const l = (document.getElementById('activeSeqLabel') || {}).textContent || '';" +
+		" const i = document.getElementById('srtInput'); return l.indexOf('T_') !== -1 && i && !i.disabled; })()",
+	{ timeoutMs: opts.timeoutMs || 30000, what: "시퀀스 키 확정 + SRT 열기 가능" });
+}
+
+/** 스캔된 MOGRT 목록을 기다린다 → [[경로, 이름]] */
+async function waitMogrts(panel, min = 1) {
+	return waitFor(panel, "(() => { const o = " + PAGE_MOGRT_OPTIONS + "; return o.length >= " + Number(min) + " ? o : null; })()", { timeoutMs: 90000, what: "MOGRT 스캔 " + min + "개 이상" });
+}
+
 /**
- * 프리셋이 하나도 없으면 모달로 하나 만든다 (행 select 옵션 기준).
+ * 프리셋 모달로 새 프리셋 하나를 만든다 (MOGRT 경로 하나).
  * v27 getMogrtParams는 프리뷰 시퀀스가 없으면 작업 시퀀스 V1 0~5초를 자르므로,
  * 모달을 열기 전에 호스트 setupPreviewSequence로 __MOGRT_PREVIEW__를 먼저 만든다.
- * → [id, 이름]
  */
-async function ensurePreset(api, opts = {}) {
+async function createPresetViaModal(api, mogrtPath, opts = {}) {
 	const { panel, host, log } = api;
-	const have = await panel(PAGE_PRESET_OPTIONS);
-	if (have.length) return have[0];
-	const mogrts = await waitFor(panel, "(() => { const o = " + PAGE_MOGRT_OPTIONS + "; return o.length ? o : null; })()", { timeoutMs: 60000, what: "MOGRT 스캔" });
-	const re = opts.prefer || /라온올제/;
-	const pick = mogrts.find((m) => re.test(m[1])) || mogrts[0];
-	if (log) log("프리셋 만들기: " + pick[1]);
-	const setup = await host("setupPreviewSequence(" + JSON.stringify(JSON.stringify({ mogrtPath: pick[0], durationSec: 5 })) + ")");
-	if (String(setup).indexOf("SUCCESS") !== 0) throw new Error("setupPreviewSequence 실패: " + setup);
+	if (!opts.skipPreviewSetup) {
+		const setup = await host("setupPreviewSequence(" + JSON.stringify(JSON.stringify({ mogrtPath, durationSec: 5 })) + ")");
+		if (String(setup).indexOf("SUCCESS") !== 0) throw new Error("setupPreviewSequence 실패: " + setup);
+	}
 	await panel("document.getElementById('btnAddPreset').click(), true");
 	await waitFor(panel, "document.getElementById('defaultMogrtSel').options.length > 1", { what: "모달 MOGRT 목록" });
-	await panel("(() => { const s = document.getElementById('defaultMogrtSel'); s.value = " + JSON.stringify(pick[0]) + "; s.dispatchEvent(new Event('change')); return s.value; })()");
+	await panel("(() => { const s = document.getElementById('defaultMogrtSel'); s.value = " + JSON.stringify(mogrtPath) + "; s.dispatchEvent(new Event('change')); return s.value; })()");
+	if (opts.name) await panel("(() => { const n = document.getElementById('presetNameInput'); if (n) n.value = " + JSON.stringify(opts.name) + "; return true; })()");
+	// 이전 상태 문구가 '프리셋 저장'으로 오인되지 않게 비운다 (테스트 전용 DOM 조작)
+	await panel("(() => { const s = document.getElementById('statusBar'); s.textContent = ''; return true; })()");
 	// 파라미터가 오기 전에는 저장이 '파라미터가 없습니다.'로 끝난다 → 될 때까지 누른다
 	await waitFor(panel, "(() => { document.getElementById('btnSaveDefault').click(); return /프리셋 저장/.test(document.getElementById('statusBar').textContent); })()",
 		{ timeoutMs: 120000, stepMs: 1500, what: "프리셋 저장" });
+	if (log) log("프리셋 저장: " + (await panel(PAGE_STATUS)).text);
+}
+
+/**
+ * 프리셋이 하나도 없으면 모달로 하나 만든다 (행 select 옵션 기준).
+ * → [id, 이름]
+ */
+async function ensurePreset(api, opts = {}) {
+	const { panel, log } = api;
+	const have = await panel(PAGE_PRESET_OPTIONS);
+	if (have.length) return have[0];
+	const mogrts = await waitMogrts(panel, 1);
+	const re = opts.prefer || /라온올제/;
+	const pick = mogrts.find((m) => re.test(m[1])) || mogrts[0];
+	if (log) log("프리셋 만들기: " + pick[1]);
+	await createPresetViaModal(api, pick[0]);
 	const after = await waitFor(panel, "(() => { const o = " + PAGE_PRESET_OPTIONS + "; return o.length ? o : null; })()", { what: "행 select의 새 프리셋" });
 	return after[after.length - 1];
+}
+
+/**
+ * 프리셋 가져오기 버튼을 누르되, 파일 대화상자 대신 text를 파일로 넣는다.
+ * (핸들러가 만드는 <input type=file>의 click을 잠깐 바꿔 change를 바로 보낸다)
+ */
+function pageImportPresetsText(text, name = "hard_presets.json") {
+	return "(() => { const text = " + JSON.stringify(text) + "; const orig = document.createElement;" +
+		" document.createElement = function (tag, o) { const el = orig.call(document, tag, o);" +
+		"  if (String(tag).toLowerCase() === 'input') { el.click = function () { const dt = new DataTransfer();" +
+		"   dt.items.add(new File([text], " + JSON.stringify(name) + ", { type: 'application/json' })); el.files = dt.files; el.dispatchEvent(new Event('change')); }; }" +
+		"  return el; };" +
+		" try { document.getElementById('btnImportPresets').click(); } finally { document.createElement = orig; }" +
+		" return true; })()";
+}
+
+/** 열린 확인창의 [확인]을 누른다 (창이 뜰 때까지 기다린다) → 확인창 문구 */
+async function confirmYes(panel, opts = {}) {
+	const msg = await waitFor(panel, "(() => { const m = document.getElementById('confirmModal'); return m && m.classList.contains('open') ? document.getElementById('confirmMessage').textContent : null; })()", { timeoutMs: opts.timeoutMs || 15000, what: "확인창" });
+	await panel("document.getElementById('confirmYes').click(), true");
+	return msg;
+}
+
+/** 열린 알림창 문구 (없으면 null) */
+const PAGE_ALERT = "(() => { const m = document.getElementById('alertModal'); return m && m.classList.contains('open') ? document.getElementById('alertMessage').textContent : null; })()";
+
+/** 상태 줄이 정규식에 맞을 때까지 기다린다 → {text, cls} */
+async function waitStatus(panel, re, opts = {}) {
+	return waitFor(panel, "(() => { const s = " + PAGE_STATUS + "; return s && " + re.toString() + ".test(s.text) ? s : null; })()", { timeoutMs: opts.timeoutMs || 30000, what: "상태 " + re });
+}
+
+/** DEV 캐시 루트인지 확인한다 (운영 캐시에는 절대 쓰지 않는다) → 루트 */
+async function devCacheRoot(panel) {
+	const root = await panel("window._mogrtDebug.getCacheRoot()");
+	if (!/CEP_MogrtImporter_dev\/cache$/.test(String(root || ""))) throw new Error("DEV 캐시가 아니다 — 쓰지 않는다: " + root);
+	return root;
 }
 
 module.exports = {
 	sleep, waitFor, ticksToFrame,
 	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed,
-	pageDropSrt, pageSetRowPreset, PAGE_ROWS, PAGE_STATUS, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS,
-	reloadClean, ensurePreset
+	pageDropSrt, pageSetRowPreset, pageImportPresetsText,
+	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS,
+	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot
 };
