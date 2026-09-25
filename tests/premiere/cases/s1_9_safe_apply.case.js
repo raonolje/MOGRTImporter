@@ -16,6 +16,8 @@
  *   (5) 평소 ▶ (병합 표시·위험한 줄 없음): 확인창 없이 v27과 같은 페이로드 (호스트를 부르지 않는 스텁으로 잡는다), ap 없음
  *   (4) 0.3초 옆에 다른 줄이 있는 줄은 건너뛴다: updateClipAtTime 1번(떨어진 줄)만, 건너뛴 줄 클립은 그대로,
  *       줄에 '근처에 다른 줄이 있어 건너뜀', mm 유지
+ * S2-5부터 v28 호스트가 답하면 [안전하게 적용]·↑는 레거시 안전 경로(nodeId, s2_5_undo)다. 이 케이스는 v28 호스트가 답하지 않을 때의
+ * 1단계 경로를 시험하므로 window._mogrtDebug.setLegacyV28(false)로 고정하고 끝나면 기본값(null)으로 돌린다.
  * 실행: npm run hard -- s1_9
  */
 const H = require("../lib/hard");
@@ -69,6 +71,7 @@ module.exports = {
 		const { panel, host, assert, log } = api;
 		await H.waitKeys(panel);
 		assert.equal(await panel(H.pageSetMiCast(false)), false, "운영처럼 플래그를 끈다");
+		assert.equal(await panel(H.pageSetLegacyV28(false)), false, "1단계 경로(v27 호스트)를 시험한다");
 		const fx = MOGRT.makeOldLayoutMogrt({});
 		log("옛 구조 MOGRT: " + base(fx.source) + " → " + fx.path + " (" + fx.oldNames.length + "속성, 새 버전 " + fx.newNames.length + "속성)");
 		const P = await pickPresetForMogrt(api, fx.newPath);
@@ -137,9 +140,11 @@ module.exports = {
 			});
 		} finally {
 			await panel(PAGE_UNSTUB);
+			await panel(H.pageSetLegacyV28(null));
 		}
 
 		// ── (2) 옛 8속성 구조 클립 + 15속성 줄 → 안전하게 적용 ──
+		assert.equal(await panel(H.pageSetLegacyV28(false)), false);
 		await H.withScratchSequence(api, "s1_9b", async () => {
 			assert.equal(await host(H.jsxClearVideoTrack(TRACK)), "0", "V3 비우기");
 			assert.equal(await panel(pageSelectTrack(TRACK)), String(TRACK));
@@ -218,6 +223,7 @@ module.exports = {
 			});
 		} finally {
 			await panel(PAGE_UNSTUB);
+			await panel(H.pageSetLegacyV28(null));
 		}
 	}
 };

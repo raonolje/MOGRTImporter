@@ -174,7 +174,7 @@
 		if (!root) return null;
 		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/settings.json";
 	}
-	// last_apply.json (S2-4): 화자별 배치 실행 기록. 시작할 때 {complete: false}로 만들고 청크마다 다시 쓴다 (되돌리기는 S2-5)
+	// last_apply.json (S2-4): 적용 실행 기록 (화자별 배치·레거시 안전 경로). 시작할 때 {complete: false}로 만들고 청크마다 다시 쓴다. 히스토리 ↶가 되돌린다 (S2-5)
 	function _getLastApplyPath() {
 		const root = _getCacheRoot();
 		if (!root) return null;
@@ -3531,6 +3531,117 @@
 			cef: r && typeof r.ef === "number" ? r.ef : op.ef
 		};
 	}
+	// 새로 놓는 자리 확인 (호스트의 자리 확인 occupy와 같은 규칙, 프레임 단위). list = 트랙의 클립 [{id, sf, ef, own}]
+	// (own = 우리가 보호하고 되살릴 수 있는 클립: 머리를 되돌리는 이웃), [sf, ef)에 놓고 [sf, sf + max(ef − sf, D))까지 덮인다.
+	// skipIds: 치울 클립 {id: true} → {conflict: null, ef(맞춘 끝), clamped, guard: [id]} | {conflict: occupied|occupied-own|tail, clip | null(길이 0)}
+	function fitWindow(list, sf, ef, D, skipIds) {
+		const hi = sf + Math.max(ef - sf, D || 0);
+		let efC = ef;
+		let clamped = false;
+		const guard = [];
+		const L = (list || []).slice().sort((a, b) => a.sf - b.sf);
+		for (let i = 0; i < L.length; i++) {
+			const c = L[i];
+			if (skipIds && skipIds[c.id]) continue;
+			if (c.ef <= sf || c.sf >= hi) continue;
+			if (c.sf <= sf) {
+				if (c.ef > sf) return { conflict: c.own ? "occupied-own" : "occupied", clip: c };
+				continue;
+			}
+			if (c.sf < efC) {
+				if (!c.own) return { conflict: "occupied", clip: c };
+				efC = c.sf;
+				clamped = true;
+				guard.push(c.id);
+				continue;
+			}
+			if (!c.own) return { conflict: "tail", clip: c };
+			guard.push(c.id);
+		}
+		if (efC - sf < 1) return { conflict: "occupied", clip: null };
+		return { conflict: null, ef: efC, clamped, guard };
+	}
+	// 작업을 단계 순서로 흉내 낸다 (작업 뒤 범위: planPlacement·buildUndoOps·legacyMiPlan·repairOps 공용, 호스트 placeChunk와 같은 규칙).
+	//   st: {트랙: [{id, sf, ef, own, name}]} (바뀐다), ordered: 단계 순 작업, removals: 먼저 지울 [{track, nodeId}]
+	//   update·adopt → 끝만 (keepTime이 아니면 다음 클립 시작에서 자른다), move → 시작을 덮는 클립이 있으면 충돌, 안쪽 클립에서 끝을 자른다,
+	//   place·replace·moveRegen·legacyMove → fitWindow로 확인하고 옛 클립(own·removeAfter)을 치운 뒤 "new:uid"를 더한다 (op.guard를 정한다)
+	// → {ok: [받은 작업], bad: [{op, why: occupied|occupied-own|tail, clip (null = 길이 0), t: 트랙}]}
+	function simulateOps(st, ordered, removals) {
+		const stOf = (t) => (st[t] = st[t] || []);
+		const drop = (t, id) => {
+			const L = stOf(t);
+			const i = L.findIndex((c) => c.id === id);
+			if (i !== -1) L.splice(i, 1);
+		};
+		(removals || []).forEach((r) => drop(r.track, String(r.nodeId)));
+		const nextStart = (t, fromSf, selfId) => {
+			let best = null;
+			stOf(t).forEach((c) => { if (c.id !== selfId && c.sf > fromSf && (best === null || c.sf < best)) best = c.sf; });
+			return best;
+		};
+		const ok = [];
+		const bad = [];
+		(ordered || []).forEach((op) => {
+			if (op.op === "update" || op.op === "adopt") {
+				const item = stOf(op.own.track).find((c) => c.id === String(op.own.nodeId));
+				if (item && !op.keepTime) {
+					const nx = nextStart(op.own.track, item.sf, item.id);
+					item.ef = nx !== null && nx < op.ef ? nx : op.ef;
+				}
+				ok.push(op);
+				return;
+			}
+			if (op.op === "move") {
+				const item = stOf(op.own.track).find((c) => c.id === String(op.own.nodeId));
+				let ef = op.ef;
+				for (const c of stOf(op.track)) {
+					if (c === item || c.ef <= op.sf || c.sf >= ef) continue;
+					if (c.sf <= op.sf) {
+						if (c.ef > op.sf) {
+							bad.push({ op, why: c.own ? "occupied-own" : "occupied", clip: c, t: op.track });
+							return;
+						}
+						continue;
+					}
+					ef = c.sf;
+				}
+				if (ef - op.sf < 1) {
+					bad.push({ op, why: "occupied", clip: null, t: op.track });
+					return;
+				}
+				if (item) {
+					item.sf = op.sf;
+					item.ef = ef;
+				}
+				ok.push(op);
+				return;
+			}
+			// place · replace · moveRegen · legacyMove: 템플릿 길이 창을 확인하고 옛 클립을 치운 뒤 새 클립을 더한다
+			const skipIds = {};
+			if (op.own && op.own.track === op.track) skipIds[String(op.own.nodeId)] = true;
+			if (op.removeAfter && op.removeAfter.track === op.track) skipIds[String(op.removeAfter.nodeId)] = true;
+			const w = fitWindow(stOf(op.track), op.sf, op.ef, op.D, skipIds);
+			if (w.conflict) {
+				bad.push({ op, why: w.conflict, clip: w.clip, t: op.track });
+				return;
+			}
+			op.guard = w.guard;
+			if (op.own) drop(op.own.track, String(op.own.nodeId));
+			if (op.removeAfter) drop(op.removeAfter.track, String(op.removeAfter.nodeId));
+			stOf(op.track).push({ id: "new:" + op.uid, sf: op.sf, ef: w.ef, own: true, name: op.name || "" });
+			ok.push(op);
+		});
+		return { ok, bad };
+	}
+	// simulateOps 충돌 하나의 설명 ("V3 12.0~14.5 이름", 뒤쪽이면 템플릿 길이, 길이 0)
+	function simConflictText(b, frameTicks) {
+		if (!b || !b.clip) return "길이 0";
+		const ft = Number(frameTicks) || 0;
+		const secOf = (f) => (ft > 0 ? (f * ft) / TICKS_PER_SEC : 0);
+		const c = b.clip;
+		const txt = "V" + (b.t + 1) + " " + secOf(c.sf).toFixed(1) + "~" + secOf(c.ef).toFixed(1) + (c.name ? " " + c.name : "");
+		return b.why === "tail" ? txt + " (템플릿 길이 " + secOf((b.op && b.op.D) || 0).toFixed(1) + "초 안)" : txt;
+	}
 	// 효과·키프레임이 있는 클립인가 (되읽은 deco: 컴포넌트가 프리셋이 배운 기본 수보다 많거나, Motion·Opacity에 키)
 	function decoratedOf(d, preset) {
 		if (!d || !d.deco) return false;
@@ -3930,100 +4041,20 @@
 				if (o.orphans === "all" || (o.orphans !== "none" && pre)) removals.push({ uid, id: c.id, track: c.track, nodeId: c.nodeId, expectName: c.name, g: c.g, why: "orphan" });
 			});
 		}
-		// 순서 (3단계 의존·순환 끊기) → 트랙 점유 흉내 (작업 뒤 범위): 충돌은 빼고, 새로 놓는 작업의 이웃(guard)·끝 맞춤을 정한다
+		// 순서 (3단계 의존·순환 끊기) → 트랙 점유 흉내 (작업 뒤 범위, simulateOps): 충돌은 빼고, 새로 놓는 작업의 이웃(guard)·끝 맞춤을 정한다
 		const ord = orderOps(ops);
 		const allRemovals = removals.concat(ord.removals);
 		const st = {};
 		(scan.tracks || []).forEach((t) => {
 			st[t.i] = (t.clips || []).map((c) => ({ id: String(c.nodeId), sf: c.sf, ef: c.ef, own: !!ownIds[String(c.nodeId)], name: c.name || "" }));
 		});
-		const stOf = (t) => (st[t] = st[t] || []);
-		const drop = (t, id) => {
-			const L = stOf(t);
-			const i = L.findIndex((c) => c.id === id);
-			if (i !== -1) L.splice(i, 1);
-		};
-		allRemovals.forEach((r) => drop(r.track, String(r.nodeId)));
-		const itemText = (t, c) => trackName(t) + " " + secOf(c.sf).toFixed(1) + "~" + secOf(c.ef).toFixed(1) + (c.name ? " " + c.name : "");
-		// 새로 놓는 자리 확인 (호스트의 자리 확인 occupy와 같은 규칙, 프레임 단위)
-		const checkWindow = (t, sf, ef, D, skipIds) => {
-			const hi = sf + Math.max(ef - sf, D || 0);
-			let efC = ef;
-			let clamped = false;
-			const guard = [];
-			const L = stOf(t).slice().sort((a, b) => a.sf - b.sf);
-			for (let i = 0; i < L.length; i++) {
-				const c = L[i];
-				if (skipIds[c.id]) continue;
-				if (c.ef <= sf || c.sf >= hi) continue;
-				if (c.sf <= sf) {
-					if (c.ef > sf) return { conflict: c.own ? "occupied-own" : "occupied", detail: itemText(t, c) };
-					continue;
-				}
-				if (c.sf < efC) {
-					if (!c.own) return { conflict: "occupied", detail: itemText(t, c) };
-					efC = c.sf;
-					clamped = true;
-					guard.push(c.id);
-					continue;
-				}
-				if (!c.own) return { conflict: "tail", detail: itemText(t, c) + " (템플릿 길이 " + secOf(D).toFixed(1) + "초 안)" };
-				guard.push(c.id);
-			}
-			if (efC - sf < 1) return { conflict: "occupied", detail: "길이 0" };
-			return { ef: efC, clamped, guard };
-		};
-		const final = [];
-		const reject = (op, why, detail) => {
-			plan.conflicts.push({ id: op.id, uid: op.uid, why, detail: detail || "" });
-			plan.rowOps[op.id] = { skip: "conflict", why, detail: detail || "" };
-		};
-		const nextStart = (t, fromSf, selfId) => {
-			let best = null;
-			stOf(t).forEach((c) => { if (c.id !== selfId && c.sf > fromSf && (best === null || c.sf < best)) best = c.sf; });
-			return best;
-		};
-		ord.ordered.forEach((op) => {
-			if (op.op === "update" || op.op === "adopt") {
-				const item = stOf(op.own.track).find((c) => c.id === String(op.own.nodeId));
-				if (item && !op.keepTime) {
-					const nx = nextStart(op.own.track, item.sf, item.id);
-					item.ef = nx !== null && nx < op.ef ? nx : op.ef;
-				}
-				final.push(op);
-				return;
-			}
-			if (op.op === "move") {
-				const item = stOf(op.own.track).find((c) => c.id === String(op.own.nodeId));
-				let ef = op.ef;
-				for (const c of stOf(op.track)) {
-					if (c === item || c.ef <= op.sf || c.sf >= ef) continue;
-					if (c.sf <= op.sf) {
-						if (c.ef > op.sf) return reject(op, c.own ? "occupied-own" : "occupied", itemText(op.track, c));
-						continue;
-					}
-					ef = c.sf;
-				}
-				if (ef - op.sf < 1) return reject(op, "occupied", "길이 0");
-				if (item) {
-					item.sf = op.sf;
-					item.ef = ef;
-				}
-				final.push(op);
-				return;
-			}
-			// place · replace · moveRegen · legacyMove: 템플릿 길이 창을 확인하고 옛 클립을 치운 뒤 새 클립을 더한다
-			const skipIds = {};
-			if (op.own && op.own.track === op.track) skipIds[String(op.own.nodeId)] = true;
-			if (op.removeAfter && op.removeAfter.track === op.track) skipIds[String(op.removeAfter.nodeId)] = true;
-			const w = checkWindow(op.track, op.sf, op.ef, op.D, skipIds);
-			if (w.conflict) return reject(op, w.conflict, w.detail);
-			op.guard = w.guard;
-			if (op.own) drop(op.own.track, String(op.own.nodeId));
-			if (op.removeAfter) drop(op.removeAfter.track, String(op.removeAfter.nodeId));
-			stOf(op.track).push({ id: "new:" + op.uid, sf: op.sf, ef: w.ef, own: true, name: op.name || "" });
-			final.push(op);
+		const sim = simulateOps(st, ord.ordered, allRemovals);
+		sim.bad.forEach((b) => {
+			const detail = simConflictText(b, ft);
+			plan.conflicts.push({ id: b.op.id, uid: b.op.uid, why: b.why, detail });
+			plan.rowOps[b.op.id] = { skip: "conflict", why: b.why, detail };
 		});
+		const final = sim.ok;
 		plan.ops = final;
 		plan.removals = allRemovals;
 		final.forEach((op) => { plan.rowOps[op.id] = op; });
@@ -4081,6 +4112,407 @@
 			if (seen > 0 && seen === sample.length && ok / seen >= 0.8 && (!best || sample.length > best.n)) best = { salt: s, n: sample.length };
 		});
 		return { salt: need.length ? null : best ? best.salt : null, need };
+	}
+
+	// ── 마지막 적용 되돌리기 (타임라인만, S2-5) — 계획서 §6.11, spec placement 11 ──
+	// last_apply.json(적용 실행 하나의 기록)을 타임라인에서 거꾸로 돌린다. 자막 목록·후반 작업 값·히스토리는 되돌리지 않는다.
+	// 기록 (spec dataModel 3 + S2-5에서 덧붙인 키): 범주 created·updated·moved·adopted·replaced·removed, 항목마다
+	//   key(uid, 레거시 안전 경로는 "r<id>"·g 0), g, track, sf, nodeId, rh(우리가 쓴 직후 되읽은 텍스트 해시)
+	//   + n(기록 순서), id(줄 id), op(작업), k(작업 뒤 클립 종류), m(작업 뒤 클립의 템플릿 경로), ef, dur(템플릿 길이 초)
+	//   updated.before = 작업 전 속성 전부(type 있는 ParamDef), updated.from = 작업 전 {track, sf, ef, name}
+	//   adopted.from = {name, params, track, sf, ef}, moved·replaced.from = 작업 전 클립 {track, sf, ef, g, name, nodeId, kind, m, pi, params}
+	//   removed = 지운 클립 {track, sf, ef, g, name, kind, m, pi, params, nodeId} + why(stale|orphan|cycle|undo), pa(지우기 전 applied 항목)
+	//   la.prev[key] = 실행 전 줄 기록 {id, ap, mmPrev, mm, a(applied 항목)} — 되돌린 줄의 rs.ap·mmPrev·applied를 되돌린다
+	const UNDO_CATS = ["removed", "created", "updated", "moved", "adopted", "replaced"];
+	// 되돌리지 않는 까닭 (패널이 문구로 바꾼다). 앞의 다섯은 '그 뒤로 바뀜'이다
+	const UNDO_CHANGED = { gone: true, renamed: true, edited: true, kind: true, "moved-track": true };
+	// uid 모양 key ("salt-id") — 태그를 확인한다. 레거시 key "r<id>"는 태그가 없어야 한다
+	function isUidKey(key) {
+		return /^[a-z0-9]{4}-\d+$/.test(String(key == null ? "" : key));
+	}
+	function laKeyId(key, e) {
+		if (e && typeof e.id === "number") return e.id;
+		const m = /^r(\d+)$/.exec(String(key)) || /-(\d+)$/.exec(String(key));
+		return m ? parseInt(m[1], 10) : null;
+	}
+	// 되돌릴 수 있는 기록인가: 이 시퀀스의 것이고, v27 ▶가 덮지 않았고(superseded), 다 되돌리지 않았고, 항목이 있다
+	function laUndoable(la, seqId) {
+		if (!la || typeof la !== "object" || !la.seqId || String(la.seqId) !== String(seqId || "")) return false;
+		if (la.superseded || (la.undone && la.undone.complete)) return false;
+		return UNDO_CATS.some((c) => Array.isArray(la[c]) && la[c].length > 0);
+	}
+	// 이름의 우리 태그(key와 같은 uid)를 gen g로 바꾼다. 태그가 없거나 다른 uid면 그대로
+	function undoRetag(name, key, g) {
+		const s = String(name == null ? "" : name);
+		const t = parseClipTag(s);
+		if (!t || t.uid !== key) return s;
+		return s.replace(CLIP_TAG_RE, makeClipTag(t.salt, t.id, g));
+	}
+	// 항목 하나의 작업 전 클립 (없었으면 null): {nodeId, track, sf, ef(null = 모름), g, name, kind, m, pi, params}
+	function undoOriginOf(cat, e) {
+		const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
+		const str = (v) => (v === undefined || v === null ? null : String(v));
+		if (!e || cat === "created") return null;
+		if (cat === "updated" || cat === "adopted") {
+			const f = e.from || {};
+			return { nodeId: String(e.nodeId == null ? "" : e.nodeId), track: num(f.track) !== null ? f.track : e.track, sf: num(f.sf) !== null ? f.sf : e.sf, ef: num(f.ef), g: null,
+				name: str(f.name), kind: e.k || "", m: str(e.m), pi: null, params: (cat === "updated" ? e.before : f.params) || [] };
+		}
+		const s = cat === "removed" ? e : e.from || {};
+		return { nodeId: str(s.nodeId) || "", track: s.track, sf: s.sf, ef: num(s.ef), g: num(s.g), name: str(s.name), kind: s.kind || e.k || "", m: str(s.m), pi: str(s.pi), params: s.params || [] };
+	}
+	// 기록을 key마다 순서대로 묶는다 (한 실행에서 한 줄이 여러 번 바뀔 수 있다: 이웃이 망가져 다시 놓기, 순환을 끊은 먼저 지우기).
+	// 따로 되놓는 제거(옛 gen·목록에서 빠진 줄의 클립)는 묶지 않는다 → {chains: [{key, id, cats, origin, final}], lone: [removed 항목]}
+	//   origin = 실행 전 클립 (없었으면 null) = 첫 항목의 작업 전 모습
+	//   final  = 실행 뒤 클립 = 마지막 (제거가 아닌) 항목 {nodeId, g, rh, k, m, track}. 없으면 null (순환을 끊고 놓지 못했다)
+	//   fix    = 첫 항목이 이웃 복구(분기 C: 다른 줄의 템플릿 길이에 덮여 사라진 클립을 줄 계획으로 다시 놓음)다 → 실행 전 클립의 모습이 기록에 없다
+	// n이 없는 기록(S2-4)은 범주 순서(제거 먼저)로 본다
+	function undoChains(la) {
+		const all = [];
+		UNDO_CATS.forEach((cat, ci) => {
+			const list = la && Array.isArray(la[cat]) ? la[cat] : [];
+			list.forEach((e, i) => {
+				if (!e || typeof e.key !== "string" || !e.key) return;
+				all.push({ cat, e, n: typeof e.n === "number" ? e.n : (ci - UNDO_CATS.length) * 1e6 + i });
+			});
+		});
+		all.sort((a, b) => a.n - b.n);
+		const groups = new Map();
+		const lone = [];
+		all.forEach((x) => {
+			if (x.cat === "removed" && x.e.why !== "cycle") {
+				lone.push(x.e);
+				return;
+			}
+			if (!groups.has(x.e.key)) groups.set(x.e.key, []);
+			groups.get(x.e.key).push(x);
+		});
+		const chains = [];
+		groups.forEach((list, key) => {
+			const mains = list.filter((x) => x.cat !== "removed");
+			const last = mains.length ? mains[mains.length - 1].e : null;
+			chains.push({
+				key, id: laKeyId(key, list[0].e), cats: list.map((x) => x.cat), origin: undoOriginOf(list[0].cat, list[0].e), fix: list[0].e.fix === true,
+				final: last ? { nodeId: String(last.nodeId == null ? "" : last.nodeId), g: typeof last.g === "number" ? last.g : 0, rh: typeof last.rh === "string" ? last.rh : null,
+					k: last.k || "", m: last.m || null, track: last.track } : null
+			});
+		});
+		return { chains, lone };
+	}
+	// 되돌리기 계획 (순수). inp:
+	//   la       last_apply.json
+	//   scan     호스트 getTracks 결과 (기록의 트랙들)
+	//   details  {nodeId: readClipTexts 결과 {found, kind, texts}}
+	//   durs     {normPath(템플릿): 길이 초} (되놓는 템플릿의 기본 길이 → 이웃 창)
+	//   repairM  {nodeId: 템플릿 경로} 되놓을 때 머리를 보호하고, 통째로 덮이면 스냅숏으로 되살릴 수 있는 클립 (우리 클립·레거시 줄의 클립)
+	//   skipKeys {key 또는 따로 지운 클립의 uid "key#n": true} 이미 되돌린 것 (멈춘 되돌리기를 이어서 할 때)
+	// 모든 되돌리기는 확인한다 (spec: nodeId + g + 지금 텍스트 해시 == 기록한 rh): 마지막 클립(final)이 그 nodeId로 있고,
+	// 이름의 태그가 key·g와 같고(레거시는 태그 없음), AE면 텍스트 해시가 rh와 같아야 한다. 아니면 '그 뒤로 바뀜'으로 건너뛴다.
+	// 네이티브는 Source Text가 늘 ""로 읽혀(S0-3 w) 텍스트로 확인할 수 없다 → nodeId·gen·종류만 보고, 되놓을 때는 기록한 구운 사본 경로(m)를 쓴다.
+	//   origin 없음                  → 지운다 (removeClips, expectName)
+	//   origin이 같은 클립(nodeId)   → 제자리 되돌리기: 자리가 같으면 update(속성 전부 = 작업 전 ParamDef, 이름, 끝), 다르면 move (TrackItem.move)
+	//   origin이 다른 클립           → 옛 템플릿(origin.m)을 옛 자리에 되놓고 지금 클립을 지운다: 같은 트랙이면 replace, 다른 트랙이면 moveRegen.
+	//                                  이름은 태그 gen을 올려(g + 1) 되놓는다 — 지금 클립이 남아도 옛 gen으로 정리되게. 레거시(태그 없음)는 원래 이름
+	//   따로 지운 클립(옛 gen·목록 밖) → 기록한 자리에 되놓는다 (place, 자리가 비어 있어야 한다)
+	// 되놓는 템플릿 경로를 모르면 건너뛴다 (template-unknown). 자리 흉내(simulateOps)에서 막히면 건너뛴다 (occupied·tail).
+	// 첫 기록이 이웃 복구(fix)인 key는 그대로 둔다 (kept: 덮여 사라진 원래 클립을 줄 계획으로 다시 놓은 것 — 지우면 클립이 없어진다).
+	// → {removals, ops (단계 순, guard 포함), acts: {key: 작업 종류}, skipped: [{key, id, why, detail}], kept: [key], needReads (읽고 다시 부른다), chains}
+	function buildUndoOps(inp) {
+		const la = (inp && inp.la) || {};
+		const scan = (inp && inp.scan) || { tracks: [] };
+		const ft = Number(scan.frameTicks) || 0;
+		const details = (inp && inp.details) || {};
+		const durs = (inp && inp.durs) || {};
+		const repairM = (inp && inp.repairM) || {};
+		const out = { removals: [], ops: [], acts: {}, skipped: [], kept: [], needReads: [], chains: [] };
+		const byNode = {};
+		(scan.tracks || []).forEach((t) => (t.clips || []).forEach((c) => {
+			byNode[String(c.nodeId)] = { track: t.i, sf: c.sf, ef: c.ef, nodeId: String(c.nodeId), name: String(c.name == null ? "" : c.name) };
+		}));
+		const need = {};
+		let pending = false;
+		const detailOf = (c) => {
+			const d = details[c.nodeId];
+			if (d) return d.found === false ? false : d;
+			if (!need[c.nodeId]) {
+				need[c.nodeId] = true;
+				out.needReads.push({ track: c.track, nodeId: c.nodeId });
+			}
+			pending = true;
+			return null;
+		};
+		const skip = (key, id, why, detail) => { out.skipped.push({ key, id, why, detail: detail || "" }); };
+		const durOf = (m) => Number(durs[normPath(m)]) || PLACE_DUR_FALLBACK;
+		const Dof = (sec) => (ft > 0 ? Math.round((sec * TICKS_PER_SEC) / ft) : 0);
+		const ops = [];
+		const { chains, lone } = undoChains(la);
+		out.chains = chains;
+		// 옛 자리에 되놓기 (place): 순환을 끊고 놓지 못한 줄, 따로 지운 클립
+		const placeOp = (uid, key, id, o, name, g, kind) => {
+			if (!o.m) return skip(key, id, "template-unknown");
+			const dur = durOf(o.m);
+			const op = { uid, key, id, op: "place", phase: 4, g: g || 0, track: o.track, sf: o.sf, ef: Math.max(o.sf + 1, typeof o.ef === "number" ? o.ef : o.sf + 1), own: null, removeAfter: null,
+				m: o.m, durSec: dur, D: Dof(dur), params: o.params || [], name: name || null, src: null, undo: kind };
+			ops.push(op);
+			return op;
+		};
+		const skipKeys = (inp && inp.skipKeys) || {};
+		chains.forEach((ch) => {
+			if (skipKeys[ch.key]) return;
+			// 덮여 사라진 클립을 다시 놓은 줄: 지우면 그 줄의 클립이 없어진다 → 그대로 둔다
+			if (ch.fix) {
+				out.kept.push(ch.key);
+				return;
+			}
+			const fin = ch.final;
+			const org = ch.origin;
+			const uidKey = isUidKey(ch.key);
+			if (!fin) {
+				if (org) placeOp(ch.key, ch.key, ch.id, org, org.name, org.g, "place");
+				return;
+			}
+			const c = byNode[fin.nodeId];
+			if (!c) return skip(ch.key, ch.id, "gone");
+			const tag = parseClipTag(c.name);
+			if (uidKey ? !tag || tag.uid !== ch.key || tag.g !== fin.g : !!tag) return skip(ch.key, ch.id, "renamed", c.name);
+			const d = detailOf(c);
+			if (d === null) return;
+			if (!d) return skip(ch.key, ch.id, "gone");
+			if (fin.k && d.kind !== fin.k) return skip(ch.key, ch.id, "kind", d.kind);
+			if (d.kind === "ae" && fin.rh !== null && textsHash(d.texts || []) !== fin.rh) return skip(ch.key, ch.id, "edited");
+			const src = { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name, g: fin.g };
+			const own = { track: c.track, sf: c.sf, nodeId: c.nodeId };
+			if (!org) {
+				out.removals.push({ uid: ch.key, key: ch.key, id: ch.id, track: c.track, nodeId: c.nodeId, expectName: c.name, g: fin.g, why: "undo" });
+				out.acts[ch.key] = "remove";
+				return;
+			}
+			if (org.nodeId && org.nodeId === fin.nodeId) {
+				// 같은 클립: 속성 전부·이름·자리를 작업 전으로 (다른 트랙으로 옮겨졌으면 TrackItem.move로 되돌릴 수 없다)
+				if (org.track !== c.track) return skip(ch.key, ch.id, "moved-track", "V" + (c.track + 1));
+				const efT = typeof org.ef === "number" ? Math.max(org.sf + 1, org.ef) : c.ef;
+				const name = org.name && org.name !== c.name ? org.name : null;
+				if (Math.abs(org.sf - c.sf) > 1) {
+					ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: "move", phase: 3, g: fin.g, track: c.track, sf: org.sf, ef: efT, own, removeAfter: null, m: fin.m || org.m,
+						durSec: durOf(fin.m || org.m), D: 0, params: org.params, name, src, alt: { name: org.name || c.name }, undo: "move" });
+				} else {
+					const keep = Math.abs(efT - c.ef) < 1;
+					ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: "update", phase: !keep && efT > c.ef ? 5 : 2, g: fin.g, track: c.track, sf: c.sf, ef: keep ? c.ef : efT, keepTime: keep, own,
+						removeAfter: null, m: fin.m || org.m, params: org.params, name, src, undo: "restore" });
+				}
+				out.acts[ch.key] = ops[ops.length - 1].undo;
+				return;
+			}
+			// 다른 클립: 옛 템플릿을 옛 자리에 되놓고 지금 클립을 지운다
+			if (!org.m) return skip(ch.key, ch.id, "template-unknown");
+			const g2 = uidKey ? Math.max(fin.g, typeof org.g === "number" ? org.g : 0) + 1 : 0;
+			const dur = durOf(org.m);
+			ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: org.track === c.track ? "replace" : "moveRegen", phase: 3, g: g2, track: org.track, sf: org.sf,
+				ef: Math.max(org.sf + 1, typeof org.ef === "number" ? org.ef : org.sf + 1), own: Object.assign({ m: fin.m || null }, own), removeAfter: null, m: org.m, durSec: dur, D: Dof(dur),
+				params: org.params, name: uidKey ? undoRetag(org.name, ch.key, g2) : org.name || null, src, undo: "replace" });
+			out.acts[ch.key] = "replace";
+		});
+		lone.forEach((e, i) => {
+			const uid = e.key + "#" + (typeof e.n === "number" ? e.n : "i" + i);
+			if (skipKeys[uid]) return;
+			const o = undoOriginOf("removed", e);
+			const id = laKeyId(e.key, e);
+			// 같은 이름의 클립이 이미 그 자리에 있다 (사용자가 되살렸다): 또 놓지 않는다
+			const dupe = Object.keys(byNode).some((n) => { const c = byNode[n]; return c.track === o.track && c.name === (o.name || "") && Math.abs(c.sf - o.sf) <= 1; });
+			if (dupe) return skip(e.key, id, "exists");
+			const op = placeOp(uid, e.key, id, o, o.name, o.g, "unremove");
+			if (op) op.entry = e;
+		});
+		if (pending) {
+			out.removals = [];
+			return out;
+		}
+		// 순서 (3단계 의존·순환 끊기) → 작업 뒤 범위로 자리 흉내: 막히면 건너뛴다. 되놓는 클립의 이웃(guard)을 정한다
+		const ord = orderOps(ops);
+		const st = {};
+		(scan.tracks || []).forEach((t) => {
+			st[t.i] = (t.clips || []).map((c) => ({ id: String(c.nodeId), sf: c.sf, ef: c.ef, own: !!repairM[String(c.nodeId)], name: c.name || "" }));
+		});
+		const sim = simulateOps(st, ord.ordered, out.removals.concat(ord.removals));
+		const bad = {};
+		sim.bad.forEach((b) => {
+			bad[b.op.uid] = true;
+			skip(b.op.key, b.op.id, b.why, simConflictText(b, ft));
+			if (out.acts[b.op.key] && b.op.uid === b.op.key) delete out.acts[b.op.key];
+		});
+		// 순환을 끊은 작업이 막혔으면 그 '먼저 지우기'도 하지 않는다
+		out.removals = out.removals.concat(ord.removals.filter((r) => !bad[r.uid]).map((r) => Object.assign({}, r, { key: r.uid })));
+		out.ops = sim.ok;
+		return out;
+	}
+	// 레거시 줄의 클립 (태그 없음): 트랙 스캔에서 줄 자리(ap·mmPrev·지금 시간, ap.t가 없으면 어느 트랙이든) ±1프레임에 시작하는 클립.
+	// rows [{id, track | null, at: [초], m: 템플릿 경로 | null}] (살아 있는 줄·휴지통 항목) → {nodeId: {id, m}} (먼저 맞은 줄)
+	function legacyClipOwners(scan, rows, frameTicks) {
+		const ft = Number(frameTicks || (scan && scan.frameTicks)) || 0;
+		const out = {};
+		const list = (rows || []).map((r) => ({ id: r.id, track: typeof r.track === "number" ? r.track : null, m: r.m || null, fs: (r.at || []).filter((s) => typeof s === "number").map((s) => frameOf(s, ft)) }));
+		((scan && scan.tracks) || []).forEach((t) => (t.clips || []).forEach((c) => {
+			if (parseClipTag(c.name)) return;
+			const hit = list.find((r) => (r.track === null || r.track === t.i) && r.fs.some((f) => Math.abs(f - c.sf) <= 1));
+			if (hit) out[String(c.nodeId)] = { id: hit.id, m: hit.m };
+		}));
+		return out;
+	}
+	// 망가진 이웃 다시 놓기 (분기 C, 되돌리기·레거시 안전 경로): snaps [{nodeId, track, sf, ef, name, g, params, m, durSec}]
+	// (놓기 전에 읽어 둔 스냅숏). 클립이 아직 있으면(머리를 되돌리지 못했다) replace, 없으면 place. 자리 흉내로 이웃(guard)을 정한다.
+	// repairM {nodeId: 템플릿}: 보호할 수 있는 이웃 → {ops, bad: [{op, why, clip}]}
+	function repairOps(snaps, scan, repairM, frameTicks) {
+		const ft = Number(frameTicks || (scan && scan.frameTicks)) || 0;
+		const st = {};
+		const byNode = {};
+		((scan && scan.tracks) || []).forEach((t) => {
+			st[t.i] = (t.clips || []).map((c) => ({ id: String(c.nodeId), sf: c.sf, ef: c.ef, own: !!(repairM || {})[String(c.nodeId)], name: c.name || "" }));
+			(t.clips || []).forEach((c) => { byNode[String(c.nodeId)] = { track: t.i, sf: c.sf, nodeId: String(c.nodeId) }; });
+		});
+		const ops = (snaps || []).filter((s) => s && s.m).slice().sort((a, b) => a.sf - b.sf).map((s) => {
+			const cur = byNode[String(s.nodeId)];
+			const dur = Number(s.durSec) || PLACE_DUR_FALLBACK;
+			const tg = parseClipTag(s.name);
+			return { uid: "fix:" + s.nodeId, key: "fix:" + s.nodeId, id: 0, op: cur ? "replace" : "place", phase: 4, g: tg ? tg.g : 0, track: s.track, sf: s.sf, ef: Math.max(s.sf + 1, s.ef),
+				own: cur ? { track: cur.track, sf: cur.sf, nodeId: cur.nodeId, m: s.m } : null, removeAfter: null, m: s.m, durSec: dur, D: ft > 0 ? Math.round((dur * TICKS_PER_SEC) / ft) : 0,
+				params: s.params || [], name: s.name || null, src: null, snap: s };
+		});
+		const sim = simulateOps(st, ops, []);
+		return { ops: sim.ok, bad: sim.bad };
+	}
+
+	// ── 레거시 안전 경로 (v28 호스트, S2-5) — 계획서 §6.13, spec placement 13 ──
+	// 화자 표가 없는 목록의 바뀐 줄을 태그 없이(name null — 단일 화자 타임라인은 v27과 같은 모습) nodeId로 적용한다:
+	//   문장만 바뀜 → 제자리 갱신(update keepTime), 시간이 바뀜 → TrackItem.move (S0-3 r), 타임라인에 없음 → 새로 놓기(place, 이웃 보호).
+	// 줄의 클립 = 그 트랙에서 마지막 검증 적용(ap) → 병합 전 값(mmPrev) → 지금 시간(applyLocate)의 프레임 ±1에 시작하는 태그 없는 AE 클립 가운데
+	// 줄 문장(ap.cap·mmPrev.cap·캡션·sub.text 중 하나)을 담은 것 하나. 둘 이상이면 ambiguous, 담은 것이 없고 그 자리에 클립이 하나뿐이면
+	// uncertain (확인창에서 고르면 opts.uncertain으로 다시 계획), 없으면 missing → 새로 놓는다.
+	// 보내는 속성: v27에 위험한 줄·되돌린 줄·복구한 줄·새로 놓는 줄·↑(opts.full)은 전부 (호스트가 이름으로 확인해 쓴다),
+	//   문장이 바뀐 줄은 캡션 속성 하나, 시간만 바뀐 줄은 없음. 네이티브 줄(구운 사본)은 이 경로에서 다루지 않는다 (v27 ▶·↑의 굽기 경로).
+	// inp {rows: [{sub, rs, preset, unsafe, track}], scan, details, durs, owners: legacyClipOwners 결과 (다른 줄의 클립: 이웃 보호·복구 대상), opts {uncertain, full}}
+	// → {ops (단계 순, guard 포함), removals (순환 끊기), rowOps {id: {op, …} | {skip, why, detail} | {none: true}}, uncertain: [id], needReads}
+	function legacyMiPlan(inp) {
+		const o = Object.assign({ uncertain: false, full: false }, (inp && inp.opts) || {});
+		const scan = (inp && inp.scan) || { tracks: [] };
+		const ft = Number(scan.frameTicks) || 0;
+		const details = (inp && inp.details) || {};
+		const durs = (inp && inp.durs) || {};
+		const owners = (inp && inp.owners) || {};
+		const out = { ops: [], removals: [], rowOps: {}, uncertain: [], needReads: [] };
+		const byTrack = {};
+		(scan.tracks || []).forEach((t) => {
+			byTrack[t.i] = (t.clips || []).map((c) => ({ track: t.i, sf: c.sf, ef: c.ef, nodeId: String(c.nodeId), name: String(c.name == null ? "" : c.name) }));
+		});
+		const need = {};
+		let pending = false;
+		const detailOf = (c) => {
+			const d = details[c.nodeId];
+			if (d) return d.found === false ? false : d;
+			if (!need[c.nodeId]) {
+				need[c.nodeId] = true;
+				out.needReads.push({ track: c.track, nodeId: c.nodeId });
+			}
+			pending = true;
+			return null;
+		};
+		const skip = (id, why, detail) => { out.rowOps[id] = { skip: why, detail: detail || "" }; };
+		const secOf = (f) => (ft > 0 ? (f * ft) / TICKS_PER_SEC : 0);
+		const clipText = (c) => "V" + (c.track + 1) + " " + secOf(c.sf).toFixed(1) + "~" + secOf(c.ef).toFixed(1);
+		const claimed = {};
+		const ops = [];
+		const FULL_MM = { undone: true, restored: true, new: true };
+		const TEXT_MM = { text: true, both: true, conflict: true, check: true };
+		(inp.rows || []).forEach((r) => {
+			const sub = r.sub;
+			const rs = r.rs || {};
+			const preset = r.preset || null;
+			const id = sub.id;
+			if (!preset) return skip(id, "no-preset");
+			const all = rowSendParams(rs).map((p) => Object.assign({}, p));
+			if (!all.length) return skip(id, "no-params");
+			if (isNativeList(all) || isNativeList(preset.params) || (rs.ap && rs.ap.nk)) return skip(id, "native");
+			const T = r.track;
+			if (!byTrack[T]) return skip(id, "no-track", "V" + (T + 1));
+			const cap = rowCaptionValue(rs, preset);
+			const capFid = captionFid(preset);
+			const capR = capFid ? resolveFid(all, capFid, preset.params) : null;
+			const caps = [];
+			[rs.ap && rs.ap.cap, rs.mmPrev && rs.mmPrev.cap, cap, sub.text].forEach((t) => {
+				const n = normText(t);
+				if (n && caps.indexOf(n) === -1) caps.push(n);
+			});
+			const loc = applyLocate(rs, sub);
+			const fA = frameOf(loc.s, ft);
+			const sf = frameOf(sub.startSec, ft);
+			const ef = Math.max(sf + 1, frameOf(sub.endSec, ft));
+			const cands = byTrack[T].filter((c) => !parseClipTag(c.name) && !claimed[c.nodeId] && Math.abs(c.sf - fA) <= 1);
+			let clip = null;
+			if (cands.length) {
+				const ds = cands.map((c) => ({ c, d: detailOf(c) }));
+				if (ds.some((x) => x.d === null)) return;
+				const ae = ds.filter((x) => x.d && x.d.kind === "ae");
+				const hits = ae.filter((x) => (x.d.texts || []).some((t) => {
+					const n = normText(t);
+					return !!n && caps.some((cp) => n.indexOf(cp) !== -1);
+				}));
+				if (hits.length > 1) return skip(id, "ambiguous", "문장이 맞는 클립 " + hits.length + "개");
+				if (hits.length === 1) clip = hits[0].c;
+				else if (ae.length === 1) {
+					if (!o.uncertain) {
+						out.uncertain.push(id);
+						return skip(id, "uncertain", clipText(ae[0].c));
+					}
+					clip = ae[0].c;
+				} else if (ae.length > 1) return skip(id, "ambiguous", "같은 자리 클립 " + ae.length + "개");
+			}
+			// 보낼 속성
+			const unsafe = !!r.unsafe;
+			const capChanged = !!rs.ap && typeof rs.ap.cap === "string" && cap !== null && normText(rs.ap.cap) !== normText(cap);
+			let params;
+			if (!clip || o.full || unsafe || FULL_MM[rs.mm]) params = all;
+			else if (TEXT_MM[rs.mm] || capChanged) {
+				if (!capR || !capR.param) return skip(id, "no-caption");
+				params = [capR.param];
+			} else params = [];
+			const uid = "r" + id;
+			const durSec = Number(preset.mogrtDurSec) || Number(durs[normPath(preset.mogrtPath)]) || PLACE_DUR_FALLBACK;
+			const D = ft > 0 ? Math.round((durSec * TICKS_PER_SEC) / ft) : 0;
+			const base = { uid, key: uid, id, g: 0, track: T, m: preset.mogrtPath, durSec, D, name: null, removeAfter: null, presetId: rs.presetId || "", kind: "ae" };
+			if (!clip) {
+				ops.push(Object.assign({}, base, { op: "place", phase: 4, sf, ef, own: null, params, src: null }));
+				return;
+			}
+			claimed[clip.nodeId] = true;
+			const own = { track: clip.track, sf: clip.sf, nodeId: clip.nodeId };
+			const src = { track: clip.track, sf: clip.sf, ef: clip.ef, nodeId: clip.nodeId, name: clip.name, g: 0 };
+			const moved = rowTimeChanged(rs, sub) && (Math.abs(clip.sf - sf) > 1 || Math.abs(clip.ef - ef) > 1);
+			if (moved) {
+				ops.push(Object.assign({}, base, { op: "move", phase: 3, sf, ef, own, params, src, alt: { params: all } }));
+				return;
+			}
+			if (!params.length) {
+				out.rowOps[id] = { none: true, nodeId: clip.nodeId };
+				return;
+			}
+			ops.push(Object.assign({}, base, { op: "update", phase: 2, sf: clip.sf, ef: clip.ef, keepTime: true, own, params, src }));
+		});
+		if (pending) return out;
+		const ord = orderOps(ops);
+		const st = {};
+		(scan.tracks || []).forEach((t) => {
+			st[t.i] = (t.clips || []).map((c) => {
+				const w = owners[String(c.nodeId)];
+				return { id: String(c.nodeId), sf: c.sf, ef: c.ef, own: !!(w && w.m) || !!claimed[String(c.nodeId)], name: c.name || "" };
+			});
+		});
+		const sim = simulateOps(st, ord.ordered, ord.removals);
+		sim.bad.forEach((b) => { out.rowOps[b.op.id] = { skip: "conflict", why: b.why, detail: simConflictText(b, ft) }; });
+		const bad = {};
+		sim.bad.forEach((b) => { bad[b.op.uid] = true; });
+		out.removals = ord.removals.filter((x) => !bad[x.uid]);
+		out.ops = sim.ok;
+		out.ops.forEach((op) => { out.rowOps[op.id] = op; });
+		return out;
 	}
 	// app.js 원문에서 //#region <name> 본문을 잘라낸다 (표식 줄 제외, 줄바꿈 LF). 없으면 null.
 	// tests/lib/loadRegions.js의 sliceRegion과 같은 규칙: coreHash = fnv1a32(이 region 본문)
@@ -8386,10 +8818,17 @@ var modalState = {
 		// 남겨 두면 updateClipAtTime이 그 클립을 찾아 AE 속성을 쓰려 하고(네이티브 분기, 아무것도 안 됨) 성공으로 끝난다.
 		// 새 클립은 템플릿 길이 창을 차지하므로 네이티브 줄과 같은 계획(연쇄·위험 표시)으로 놓는다 (S1-11, src/mi/apply.ts)
 		if (rs.ap && rs.ap.nk) return _nativeUpdateAe(sub, rs, preset, params);
+		// v27에 위험하거나 시간이 바뀐 줄: v28 호스트가 답하면 레거시 안전 경로 (nodeId로 찾아 제자리 갱신·이동·새로 놓기, 태그 없음, S2-5)
+		if ((unsafe || timeChanged) && (await _legacyV28Ok())) {
+			await _legacySafeApply([sub.id], { single: true, full: true });
+			return;
+		}
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
 		_setStatus("클립 업데이트 중...", "info");
 		const seq = _importSeqToken();
+		// v27 호스트로 쓴다: 마지막 적용 기록(last_apply)은 더 이상 되돌리지 않는다
+		_supersedeLastApply();
 		let res;
 		try {
 			res = await host.updateClipAtTime({
@@ -9469,6 +9908,15 @@ var modalState = {
 			if (!res || (res.ok !== true && !res.runId && res.error)) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
 			return _cmdOk(_cmdClone(res));
 		},
+		// 마지막 적용 되돌리기 (타임라인만) = 히스토리 맨 위 '↶ 마지막 적용 되돌리기'와 같다 (확인창 없이). args {runId?: 그 기록일 때만}.
+		// agent는 승인 카드(M5.4) 전까지 needs-approval → {removed, restored, moved, replaced, placed, partial, changed, skipped, failed, repaired, lost, runId}
+		undo: async (args, ctx) => {
+			if (ctx.source === "agent") return _cmdErr("needs-approval", "되돌리기는 패널에서 승인해야 합니다");
+			if (args.runId !== undefined && typeof args.runId !== "string") return _cmdErr("bad-args", "runId는 문자열");
+			const res = await _miUndo({ runId: args.runId });
+			if (!res || (res.ok !== true && !res.runId && res.error)) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
+			return _cmdOk(_cmdClone(res));
+		},
 		// 병합(가져오기)을 넣는다: 가져오기 창의 [가져오기]와 같다 (안전 지점 하나 → 적용 → 자동 항목 하나, 변화가 없으면 아무것도 쓰지 않는다).
 		// args는 mergePreview와 같다. agent는 승인 카드(M5.4) 전까지 needs-approval
 		mergeCommit: (args, ctx) => {
@@ -9618,7 +10066,9 @@ var modalState = {
 	//     지금 방식으로 전체 적용 = _legacyApply: 위험한 줄만 namedParams, 나머지는 v27 바이트.
 	// v27 결과는 실패가 있어도 SUCCESS다 → "(실패"가 없을 때만 검증된 적용으로 보고 ap를 적고 mm을 지운다.
 	// ↑(updateSingleClip)는 위험하거나 시간이 바뀐 줄만 이름으로 쓴다 (subtitleList).
-	// S2-5부터는 MI_ 호스트의 nodeId 기준 레거시 안전 경로가 이 단계를 대신한다.
+	// S2-5: v28 호스트가 답하면(같은 빌드, 이 시퀀스) [안전하게 적용]과 ↑(위험하거나 시간이 바뀐 줄)는 nodeId 기준 레거시 안전 경로
+	// _legacySafeApply(아래 '레거시 안전 경로')를 쓴다 — 시간 변경은 옮기고 새 줄은 놓는다. _legacySafeUpdateV27은 v28 호스트가 답하지 않을 때만.
+	// v27 호스트로 타임라인을 바꾸면(▶ 지금 방식·↑·1단계 안전 적용·네이티브 교체) 마지막 적용 기록은 되돌리지 않는다 (_supersedeLastApply).
 	// ─────────────────────────────────────────────────────────────
 	// 건너뛴 까닭 (줄 표시 .sub-res와 상태 줄)
 	const LEGACY_WHY = {
@@ -9683,6 +10133,8 @@ var modalState = {
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
 		const seq = _importSeqToken();
+		// v27 ▶는 마지막 적용 기록(last_apply)의 클립을 다시 놓거나 바꿀 수 있다 → 그 기록은 되돌리지 않는다 (S2-5)
+		_supersedeLastApply();
 		// 네이티브 줄이 없는 목록은 기다리지 않고 v27 그대로 (굽기·지우기 없음)
 		const nat = _hasNativeWork(targetSubs) ? await _nativePrepare(targetSubs, trackIndex, seq) : null;
 		if (nat === false) return;
@@ -9759,28 +10211,48 @@ var modalState = {
 			else setStatus(res.replace("SUCCESS:", "").trim() + note.text, note.err ? "err" : "ok");
 		} else setStatus(res.replace("ERROR:", "").trim() + note.text, "err");
 	}
-	// ▶ 확인창: 바뀐 줄·구조가 바뀐 줄이 있을 때 (flagged = _legacyFlagged(targetSubs))
-	function _legacyApplyChoice(targetSubs, flagged) {
-		const neighbors = legacyNeighbors(state.subtitles, state.rowStates, state.trashBin);
-		const plan = legacySafePlan(flagged, neighbors);
-		const count = (why) => plan.filter((p) => p.why === why).length;
+	// ▶ 확인창: 바뀐 줄·구조가 바뀐 줄이 있을 때 (flagged = _legacyFlagged(targetSubs)).
+	// v28 호스트가 답하면(같은 빌드, 이 시퀀스) [안전하게 적용]은 레거시 안전 경로 _legacySafeApply (nodeId로 찾아 갱신·이동·새로 놓기, S2-5),
+	// 아니면 1단계 경로 _legacySafeUpdateV27 (updateClipAtTime 제자리 갱신만)
+	async function _legacyApplyChoice(targetSubs, flagged) {
+		const seq = _importSeqToken();
+		const v28 = await _legacyV28Ok();
+		if (seq !== _importSeqToken()) {
+			setStatus("시퀀스가 바뀌어 적용을 취소했습니다", "err");
+			return;
+		}
 		const changed = flagged.filter((t) => t.rs.mm);
 		const timeN = changed.filter((t) => rowTimeChanged(t.rs, t.sub)).length;
 		const unsafeN = flagged.filter((t) => t.unsafe).length;
-		const sendN = plan.filter((p) => p.op === "update").length;
 		const parts = [];
 		if (changed.length) parts.push("바뀐 줄 " + changed.length + "개" + (timeN ? "(시간 변경 " + timeN + "개 포함)" : ""));
 		if (unsafeN) parts.push("구조가 바뀐 줄 " + unsafeN + "개");
-		const lines = [parts.join("와 ") + "가 있습니다.", "",
-			"안전하게 적용: 이 줄들만 제자리에서 속성 이름으로 갱신합니다. 클립을 새로 놓거나 밀거나 옮기지 않습니다."];
-		if (count("time")) lines.push("  · 시간이 바뀐 줄 " + count("time") + "개는 이 버전에서 자동으로 옮길 수 없습니다.");
-		if (count("new")) lines.push("  · 새 줄 " + count("new") + "개는 아직 타임라인에 없습니다 (↑로 한 줄씩 놓을 수 있습니다).");
-		if (count("near")) lines.push("  · 0.5초 안에 다른 줄이 있는 " + count("near") + "개는 건너뜁니다.");
-		const other = plan.filter((p) => p.op === "skip" && ["time", "new", "near"].indexOf(p.why) === -1).length;
-		if (other) lines.push("  · 그 밖에 " + other + "개는 건너뜁니다 (줄에 까닭이 표시됩니다).");
-		lines.push("", "지금 방식으로 전체 적용: 대상 " + targetSubs.length + "줄을 지금까지처럼 다시 적용합니다. 기존 클립을 찾지 못한 줄은 새로 놓여 다음 자막의 앞부분을 자를 수 있습니다.");
+		const lines = [parts.join("와 ") + "가 있습니다.", ""];
+		let sendN = 0;
+		let safeRun = null;
 		const ids = flagged.map((t) => t.sub.id);
-		const seq = _importSeqToken();
+		if (v28) {
+			const nat = flagged.filter((t) => !t.preset || _isNativePreset(t.preset) || (t.rs.ap && t.rs.ap.nk)).length;
+			const newN = flagged.filter((t) => t.rs.mm === "new" && !t.rs.ap).length;
+			sendN = flagged.length - nat;
+			lines.push("안전하게 적용: 이 줄들의 클립만 타임라인에서 찾아(nodeId) 제자리 갱신·시간 이동·새로 놓기를 합니다. 다른 줄의 클립은 건드리지 않고, 클립 이름에 태그를 붙이지 않습니다.");
+			if (timeN) lines.push("  · 시간이 바뀐 줄 " + timeN + "개는 클립을 새 시간으로 옮깁니다.");
+			if (newN) lines.push("  · 새 줄 " + newN + "개는 새로 놓습니다 (뒤 클립의 앞부분을 보호합니다).");
+			if (nat) lines.push("  · 네이티브·프리셋 없는 줄 " + nat + "개는 건너뜁니다 (지금 방식으로 전체 적용·↑가 교체합니다).");
+			safeRun = () => _legacySafeApply(ids);
+		} else {
+			const plan = legacySafePlan(flagged, legacyNeighbors(state.subtitles, state.rowStates, state.trashBin));
+			const count = (why) => plan.filter((p) => p.why === why).length;
+			sendN = plan.filter((p) => p.op === "update").length;
+			lines.push("안전하게 적용: 이 줄들만 제자리에서 속성 이름으로 갱신합니다. 클립을 새로 놓거나 밀거나 옮기지 않습니다.");
+			if (count("time")) lines.push("  · 시간이 바뀐 줄 " + count("time") + "개는 이 버전에서 자동으로 옮길 수 없습니다.");
+			if (count("new")) lines.push("  · 새 줄 " + count("new") + "개는 아직 타임라인에 없습니다 (↑로 한 줄씩 놓을 수 있습니다).");
+			if (count("near")) lines.push("  · 0.5초 안에 다른 줄이 있는 " + count("near") + "개는 건너뜁니다.");
+			const other = plan.filter((p) => p.op === "skip" && ["time", "new", "near"].indexOf(p.why) === -1).length;
+			if (other) lines.push("  · 그 밖에 " + other + "개는 건너뜁니다 (줄에 까닭이 표시됩니다).");
+			safeRun = () => _legacySafeUpdateV27(ids);
+		}
+		lines.push("", "지금 방식으로 전체 적용: 대상 " + targetSubs.length + "줄을 지금까지처럼 다시 적용합니다. 기존 클립을 찾지 못한 줄은 새로 놓여 다음 자막의 앞부분을 자를 수 있습니다.");
 		const guard = (fn) => () => {
 			if (seq !== _importSeqToken()) {
 				setStatus("시퀀스가 바뀌어 적용을 취소했습니다", "err");
@@ -9789,7 +10261,7 @@ var modalState = {
 			fn();
 		};
 		showChoice(lines.join("\n"), [
-			{ label: "안전하게 적용 (" + sendN + ")", run: guard(() => _legacySafeUpdateV27(ids)) },
+			{ label: "안전하게 적용 (" + sendN + ")", run: guard(safeRun) },
 			{ label: "지금 방식으로 전체 적용", run: guard(() => _legacyApply(targetSubs)) },
 			{ label: "취소", run: () => setStatus("타임라인 적용 취소", "") }
 		]);
@@ -9815,6 +10287,7 @@ var modalState = {
 		});
 		const todo = plan.filter((p) => p.op === "update");
 		const seq = _importSeqToken();
+		if (todo.length) _supersedeLastApply();
 		const run = { stop: false };
 		_legacyRun = run;
 		const btnApply = document.getElementById("btnApply");
@@ -10320,6 +10793,7 @@ var modalState = {
 	// updateClipAtTime은 쓰지 않는다: 시작 ±0.5초 안의 다른 줄 클립을 잡아 속성만 쓰거나(네이티브 사본은 빈 목록 → 아무것도 안 함),
 	// 클립을 못 찾으면 insertClip(뒤 클립을 민다)·importMGT로 놓는다. applyToTimeline은 같은 시작(10ms 키)만 보고, 없으면 덮어 놓는다
 	async function _nativeReplaceOne(sub, item, plan, trackIndex, seq, seqId, book, doneText) {
+		_supersedeLastApply();
 		const rm = await _nativeRemoveFor(plan, seqId);
 		if (_nativeSeqChanged(seq, rm)) return;
 		if (!rm.ok) {
@@ -10515,6 +10989,21 @@ var modalState = {
 		const path = _getLastApplyPath();
 		const d = path ? _fsRead(path) : null;
 		return d && typeof d === "object" && !Array.isArray(d) ? d : null;
+	}
+	// 새 실행 기록 (실행을 시작할 때 complete false로 쓴다). legacy: 레거시 안전 경로 (태그 없는 작업, key "r<id>", g 0)
+	function _laNew(seqId, salt, rows, legacy) {
+		const la = { v: 1, runId: "r" + Date.now(), ts: Date.now(), seqId, salt: salt || "", complete: false, chunksDone: 0, rows, superseded: false,
+			created: [], updated: [], moved: [], adopted: [], replaced: [], removed: [], prev: {} };
+		if (legacy) la.legacy = true;
+		return la;
+	}
+	// v27 호스트로 타임라인을 바꿨다 (▶ 지금 방식·↑·안전하게 적용 v27): 마지막 기록은 더 이상 되돌릴 수 없다 (superseded: true).
+	// 기록이 없으면 아무것도 쓰지 않는다 (단일 화자 목록은 파일이 생기지 않는다)
+	function _supersedeLastApply() {
+		const la = _readLastApply();
+		if (!la || la.superseded) return;
+		la.superseded = true;
+		_writeLastApply(la);
 	}
 	// salt가 비었을 때 (화자 줄은 있다): 스캔의 태그 클립으로 문장까지 확인해 받거나(remapped가 아닐 때만), 새로 만든다
 	async function _miEnsureSalt(scan, all, ctx) {
@@ -10829,6 +11318,7 @@ var modalState = {
 			if (opCreates(op)) ctx.created[op.uid] = String(r.nodeId);
 			ctx.nodeToUid[String(r.nodeId)] = op.uid;
 		}
+		_laTouch(ctx.la, op.uid, op.id);
 		state.mi.applied[op.uid] = appliedEntryOf(op, r, state.mi.applied[op.uid]);
 		const T = op.intent ? op.intent.t : op.track;
 		if (sub && rs) {
@@ -10843,14 +11333,48 @@ var modalState = {
 		}
 		if (opCreates(op) && preset && !isNativeList(preset.params)) _miLearn(preset, op, r, res, ctx);
 		ctx.spkOk[op.K] = true;
-		const base = { key: op.uid, g: typeof r.g === "number" ? r.g : op.g, track: r.track, sf: r.sf, nodeId: String(r.nodeId || ""), rh: textsHash(r.texts || []) };
-		const cat = op.op === "place" ? "created" : op.op === "update" ? "updated" : op.op === "adopt" ? "adopted" : op.op === "replace" ? "replaced" : "moved";
-		if (cat === "created") ctx.la.created.push(base);
-		else if (cat === "updated") ctx.la.updated.push(Object.assign(base, { before: r.before || null }));
-		else if (cat === "adopted") ctx.la.adopted.push(Object.assign(base, { from: { name: op.srcName || "", params: r.before || [] } }));
-		else ctx.la[cat].push(Object.assign(base, { from: Object.assign({ nodeId: op.own ? String(op.own.nodeId) : op.removeAfter ? String(op.removeAfter.nodeId) : "" }, r.before || {}) }));
+		_laRecord(ctx, op, r);
+		const cat = _laCat(op);
 		ctx.stats[cat]++;
 		if (partial) ctx.stats.partial++;
+	}
+	// last_apply 범주 (작업 → created·updated·adopted·replaced·moved)
+	function _laCat(op) {
+		return op.op === "place" ? "created" : op.op === "update" ? "updated" : op.op === "adopt" ? "adopted" : op.op === "replace" ? "replaced" : "moved";
+	}
+	// 실행 전 줄 기록을 처음 건드릴 때 한 번 남긴다 (la.prev[key] = {id, ap, mmPrev, mm, a}): 되돌리기가 줄의 rs.ap·mmPrev와 applied를 되돌린다
+	function _laTouch(la, key, id) {
+		if (!la || !key) return;
+		if (!la.prev) la.prev = {};
+		if (la.prev[key]) return;
+		const rs = typeof id === "number" ? state.rowStates[id] : null;
+		const a = state.mi && state.mi.applied ? state.mi.applied[key] : null;
+		const cl = (v) => (v ? JSON.parse(JSON.stringify(v)) : null);
+		la.prev[key] = { id: typeof id === "number" ? id : null, ap: cl(rs && rs.ap), mmPrev: cl(rs && rs.mmPrev), mm: (rs && rs.mm) || null, a: cl(a) };
+	}
+	// 작업 결과 하나를 last_apply에 적는다 (spec dataModel 3 + S2-5 덧붙임: n·id·op·k·m·ef·dur, updated·adopted의 작업 전 자리·이름).
+	// 되돌리기(buildUndoOps)는 key마다 첫 항목의 작업 전 모습(origin)과 마지막 항목의 클립(final)을 본다
+	function _laRecord(ctx, op, r) {
+		const la = ctx.la;
+		const base = { key: op.uid, g: typeof r.g === "number" ? r.g : op.g, track: r.track, sf: r.sf, nodeId: String(r.nodeId || ""), rh: textsHash(r.texts || []),
+			n: ctx.laN++, id: op.id, op: op.op, k: r.kind || op.kind || "", m: op.m || "", ef: r.ef, dur: op.durSec || 0 };
+		if (ctx.repairing) base.fix = true;
+		const srcPos = op.src ? { track: op.src.track, sf: op.src.sf, ef: op.src.ef, name: op.src.name || "" } : null;
+		const cat = _laCat(op);
+		if (cat === "created") la.created.push(base);
+		else if (cat === "updated") la.updated.push(Object.assign(base, { before: r.before || null, from: srcPos }));
+		else if (cat === "adopted") la.adopted.push(Object.assign(base, { from: Object.assign({}, srcPos || {}, { name: op.srcName || (srcPos && srcPos.name) || "", params: r.before || [] }) }));
+		else {
+			const from = Object.assign({ nodeId: op.own ? String(op.own.nodeId) : op.removeAfter ? String(op.removeAfter.nodeId) : "" }, r.before || {});
+			// 되놓을 템플릿: 호스트가 모르면(own.m 없음) 이동·다시 놓기는 같은 템플릿, 나눈 레거시 목록의 옛 클립은 줄의 프리셋 템플릿으로 본다
+			if (!from.m && cat === "moved") from.m = op.m || null;
+			la[cat].push(Object.assign(base, { from }));
+		}
+	}
+	// 적용 기록의 nodeId를 바꾼다 (망가진 이웃을 스냅숏으로 다시 놓아 nodeId가 바뀌었다 → 되돌리기가 그 클립을 찾게)
+	function _laRemap(la, oldId, newId) {
+		if (!la) return;
+		UNDO_CATS.forEach((c) => (Array.isArray(la[c]) ? la[c] : []).forEach((e) => { if (e && String(e.nodeId) === String(oldId)) e.nodeId = String(newId); }));
 	}
 	function _miProgress(op, ctx) {
 		const K = op && op.K;
@@ -10870,7 +11394,13 @@ var modalState = {
 				if (!rm) return;
 				if (r && r.status === "removed") {
 					ctx.stats.removed++;
-					ctx.la.removed.push(Object.assign({ key: rm.uid, g: rm.g }, r.before || {}, { nodeId: String(rm.nodeId), why: rm.why }));
+					// 되놓을 템플릿(호스트 removeClips는 경로를 모른다) = 그 uid의 applied.m. 목록에서 빠진 줄은 지우기 전 applied 항목(pa)도 둔다
+					const a = state.mi.applied[rm.uid] || null;
+					_laTouch(ctx.la, rm.uid, rm.id);
+					const e = Object.assign({ key: rm.uid, g: rm.g }, r.before || {}, { nodeId: String(rm.nodeId), why: rm.why, n: ctx.laN++, id: rm.id });
+					if (!e.m && a && a.m) e.m = a.m;
+					if (rm.why === "orphan" && a) e.pa = JSON.parse(JSON.stringify(a));
+					ctx.la.removed.push(e);
 					if (rm.why === "orphan") delete state.mi.applied[rm.uid];
 				} else ctx.stats.removeFailed++;
 			});
@@ -11009,8 +11539,8 @@ var modalState = {
 				ctx.tracksAdded = r.added || 0;
 				_miNumTracks = r.after;
 			}
-			ctx.la = { v: 1, runId: "r" + Date.now(), ts: Date.now(), seqId: ctx.seqId, salt: state.mi.salt, complete: false, chunksDone: 0, rows: subs.length, superseded: false,
-				created: [], updated: [], moved: [], adopted: [], replaced: [], removed: [] };
+			ctx.la = _laNew(ctx.seqId, state.mi.salt, subs.length, false);
+			ctx.laN = 0;
 			_writeLastApply(ctx.la);
 			ctx.totalOps = plan.ops.length;
 			plan.ops.forEach((op) => { ctx.spkTotal[op.K] = (ctx.spkTotal[op.K] || 0) + 1; });
@@ -11027,7 +11557,13 @@ var modalState = {
 				ctx.totalOps += p2.ops.length;
 				p2.ops.forEach((op) => { ctx.spkTotal[op.K] = (ctx.spkTotal[op.K] || 0) + 1; });
 				_miMarkRows(p2);
-				await _miExecute(p2, ctx);
+				// 이 기록(fix)은 되돌리기가 지우지 않는다: 덮여 사라진 원래 클립을 되살린 것이다 (실행 전 모습은 기록에 없다)
+				ctx.repairing = true;
+				try {
+					await _miExecute(p2, ctx);
+				} finally {
+					ctx.repairing = false;
+				}
 				ctx.repaired = (ctx.repaired || 0) + p2.ops.length;
 			}
 		} catch (e) {
@@ -11084,6 +11620,702 @@ var modalState = {
 			skipped: Object.keys(plan.rowOps).filter((k) => plan.rowOps[k] && plan.rowOps[k].skip).map((k) => ({ id: Number(k), why: plan.rowOps[k].skip, detail: plan.rowOps[k].detail || "" }))
 		};
 	}
+	// ─────────────────────────────────────────────────────────────
+	// 호스트 작업 실행 공용 (마지막 적용 되돌리기·레거시 안전 경로, S2-5)
+	//   _miRunOps  제거(removeClips) → 청크(placeChunk). 청크를 보내기 전에 그 청크가 보호할 이웃(guard)의 스냅숏(속성 전부·이름·자리)을
+	//              읽어 둔다 (_miSnapRead, 템플릿은 ctx.repairM). 새로 놓은 클립은 보낸 속성으로 스냅숏을 만들고, 제자리에서 바꾼 클립은
+	//              스냅숏을 버린다 (다음에 필요하면 다시 읽는다)
+	//   _miRepair  통째로 덮였거나 머리를 되돌리지 못한 이웃(damaged)을 그 스냅숏으로 다시 놓는다 (분기 C, 최대 DAMAGE_ROUNDS번).
+	//              화자별 배치(_miApply)는 줄 계획으로 다시 놓는다 (S2-4) — 이 경로는 줄 의도가 아니라 원래 모습 그대로 되살린다
+	// ctx (_miRunCtx): {seqId, ft, seqTok, details, created, snaps, repairM, nodeTrack, durs, damaged, lost, byId, stats, la, laN, …}
+	// ─────────────────────────────────────────────────────────────
+	function _miRunCtx(seqId, ft) {
+		const ctx = { seqId, ft, seqTok: _importSeqToken(), details: {}, created: {}, snaps: {}, repairM: {}, nodeTrack: {}, durs: {}, damaged: [], lost: [], byId: {},
+			stats: { created: 0, updated: 0, moved: 0, removed: 0, restored: 0, replaced: 0, placed: 0, partial: 0, conflict: 0, failed: 0, repaired: 0, skipped: 0, changed: 0 },
+			doneOps: 0, totalOps: 0, la: null, laN: 0, stopped: false, aborted: false, error: null };
+		state.subtitles.forEach((s) => { ctx.byId[s.id] = s; });
+		return ctx;
+	}
+	// 스캔한 클립의 트랙 (스냅숏 되읽기에 쓴다)
+	function _miNoteScan(ctx, scan) {
+		((scan && scan.tracks) || []).forEach((t) => (t.clips || []).forEach((c) => { ctx.nodeTrack[String(c.nodeId)] = t.i; }));
+	}
+	function _miDurOf(ctx, m) {
+		return (m && Number(ctx.durs[normPath(m)])) || PLACE_DUR_FALLBACK;
+	}
+	// 템플릿 경로들의 기본 길이 {normPath: 초}: 그 템플릿을 쓰는 프리셋의 mogrtDurSec, 없으면 definition.json (_templateDurSec, 못 읽으면 0)
+	async function _miDursFor(paths) {
+		const out = {};
+		for (const p of paths || []) {
+			if (!p) continue;
+			const k = normPath(p);
+			if (out[k] !== undefined) continue;
+			const pr = Object.values(state.presets || {}).find((x) => x && normPath(x.mogrtPath) === k && Number(x.mogrtDurSec) > 0);
+			out[k] = pr ? Number(pr.mogrtDurSec) : (await _templateDurSec(p)) || 0;
+		}
+		return out;
+	}
+	// 이웃 스냅숏 읽기: 보호할 수 있는(repairM) 클립 가운데 아직 없는 것만, 40개씩 (속성 전부 = MI__readParams)
+	async function _miSnapRead(ids, ctx) {
+		const want = [];
+		const seen = {};
+		(ids || []).forEach((x) => {
+			const id = String(x);
+			if (!id || id.indexOf("new:") === 0 || seen[id] || ctx.snaps[id] || !ctx.repairM[id] || typeof ctx.nodeTrack[id] !== "number") return;
+			seen[id] = true;
+			want.push({ track: ctx.nodeTrack[id], nodeId: id });
+		});
+		for (let i = 0; i < want.length; i += READ_BATCH) {
+			const part = want.slice(i, i + READ_BATCH);
+			const r = await _miCallWatch(() => host.mi.readTexts({ seqId: ctx.seqId, items: part, want: { texts: false, lay: false, deco: false, params: true } }));
+			if (!r || r.ok !== true) throw _miHostFail("readClipTexts", r);
+			(r.results || []).forEach((x) => {
+				if (!x || !x.found) return;
+				const id = String(x.nodeId);
+				const m = ctx.repairM[id];
+				ctx.snaps[id] = { nodeId: id, track: x.track, sf: x.sf, ef: x.ef, name: x.name || "", kind: x.kind || "", params: x.params || [], m, durSec: _miDurOf(ctx, m) };
+			});
+		}
+	}
+	// 청크 하나를 떼어 낸다 (chunkOps). 같은 청크 안에서 제자리로 바꾼 클립을 뒤 작업이 이웃으로 보호하면 그 앞에서 끊는다
+	// (보호할 스냅숏은 청크를 보내기 전에 읽으므로, 바뀐 뒤의 모습을 읽게)
+	function _miChunk(queue) {
+		const first = chunkOps(queue, PLACE_CHUNK)[0] || [];
+		const touched = {};
+		for (let k = 0; k < first.length; k++) {
+			const op = first[k];
+			if (k > 0 && (op.guard || []).some((g) => touched[String(g)])) return first.slice(0, k);
+			if (op.own && !opCreates(op)) touched[String(op.own.nodeId)] = true;
+		}
+		return first;
+	}
+	// h: {busy(kind, a, b) → 진행 문구, removed(항목, 결과), result(작업, 결과), chunk()}
+	async function _miRunOps(ctx, removals, ops, h) {
+		const list = removals || [];
+		for (let i = 0; i < list.length; i += 200) {
+			if (_miCancel) { ctx.stopped = true; return; }
+			if (ctx.seqTok !== _importSeqToken()) { ctx.aborted = true; return; }
+			const part = list.slice(i, i + 200);
+			_miShowBusy(h.busy("remove", part.length));
+			const res = await _miCallWatch(() => host.mi.removeClips({ seqId: ctx.seqId, items: part.map((x) => ({ key: x.uid, track: x.track, nodeId: x.nodeId, expectName: x.expectName || null })) }));
+			if (!res || res.ok !== true) throw _miHostFail("removeClips", res);
+			(res.results || []).forEach((r, k) => { if (part[k]) h.removed(part[k], r || {}); });
+			if (h.chunk) h.chunk();
+		}
+		let queue = (ops || []).slice();
+		while (queue.length) {
+			if (_miCancel) { ctx.stopped = true; return; }
+			if (ctx.seqTok !== _importSeqToken()) { ctx.aborted = true; return; }
+			const chunk = _miChunk(queue);
+			queue = queue.slice(chunk.length);
+			const items = chunk.map((op) => hostItemOf(op, ctx.created));
+			await _miSnapRead(items.reduce((a, it) => a.concat(it.guard || []), []), ctx);
+			_miShowBusy(h.busy("ops", ctx.doneOps, ctx.totalOps));
+			const res = await _miCallWatch(() => host.mi.placeChunk({ seqId: ctx.seqId, frameTicks: ctx.ft, budgetMs: MI_BUDGET_MS, items }));
+			if (!res || res.ok !== true) throw _miHostFail("placeChunk", res);
+			const done = Math.max(0, Math.min(chunk.length, parseInt(res.done, 10) || 0));
+			if (!done) throw _miHostFail("placeChunk", { error: "done 0", detail: "호스트가 작업을 하나도 하지 않았다" });
+			for (let k = 0; k < done; k++) {
+				const op = chunk[k];
+				const r = (res.results || [])[k] || {};
+				const st = String(r.status || "");
+				if ((PLACE_OK[st] || st === "partial") && r.nodeId) {
+					const nid = String(r.nodeId);
+					ctx.nodeTrack[nid] = r.track;
+					if (opCreates(op)) {
+						ctx.created[op.uid] = nid;
+						// 새로 놓은 클립의 스냅숏 = 보낸 속성·이름 (뒤 작업이 덮으면 이것으로 다시 놓는다)
+						if (op.m) {
+							ctx.repairM[nid] = op.m;
+							ctx.snaps[nid] = { nodeId: nid, track: r.track, sf: r.sf, ef: r.ef, name: op.name !== null && op.name !== undefined ? op.name : r.name || "", kind: r.kind || "",
+								params: op.params || [], m: op.m, durSec: op.durSec || _miDurOf(ctx, op.m) };
+						}
+					} else delete ctx.snaps[nid];
+				}
+				ctx.doneOps++;
+				h.result(op, r, res);
+			}
+			if (done < chunk.length) queue = chunk.slice(done).concat(queue);
+			(res.damaged || []).forEach((id) => { if (ctx.damaged.indexOf(String(id)) === -1) ctx.damaged.push(String(id)); });
+			if (h.chunk) h.chunk();
+		}
+	}
+	// 망가진 이웃을 스냅숏으로 다시 놓는다. h.remap(옛 nodeId, 새 nodeId): 다시 놓은 클립을 기록에서 따라가게
+	async function _miRepair(ctx, h) {
+		for (let round = 0; round < DAMAGE_ROUNDS && ctx.damaged.length && !ctx.stopped && !ctx.aborted; round++) {
+			const ids = ctx.damaged.splice(0);
+			const snaps = [];
+			ids.forEach((id) => {
+				const s = ctx.snaps[id];
+				if (s && s.m) snaps.push(s);
+				else ctx.lost.push(id);
+			});
+			if (!snaps.length) break;
+			const tracks = [];
+			let lo = Infinity;
+			let hi = -Infinity;
+			snaps.forEach((s) => {
+				if (tracks.indexOf(s.track) === -1) tracks.push(s.track);
+				lo = Math.min(lo, s.sf);
+				hi = Math.max(hi, s.ef, s.sf + frameOf(s.durSec || PLACE_DUR_FALLBACK, ctx.ft));
+			});
+			const pad = frameOf(SCAN_PAD_SEC, ctx.ft);
+			_miShowBusy("덮인 이웃 클립 다시 놓는 중… (" + snaps.length + "개)");
+			const scan = await _miCallWatch(() => host.mi.getTracks({ seqId: ctx.seqId, tracks: tracks.sort((a, b) => a - b), fromFrame: Math.max(0, lo - pad), toFrame: hi + pad }));
+			if (!scan || scan.ok !== true) throw _miHostFail("getTracks", scan);
+			_miNoteScan(ctx, scan);
+			const rp = repairOps(snaps, scan, ctx.repairM, ctx.ft);
+			rp.bad.forEach((b) => ctx.lost.push(b.op.snap.nodeId));
+			ctx.totalOps += rp.ops.length;
+			await _miRunOps(ctx, [], rp.ops, {
+				busy: (k, a, b) => "덮인 이웃 클립 다시 놓는 중… " + a + "/" + b,
+				removed: () => {},
+				result: (op, r) => {
+					const st = String(r.status || "");
+					if ((PLACE_OK[st] || st === "partial") && r.nodeId) {
+						ctx.stats.repaired++;
+						if (h && h.remap) h.remap(op.snap.nodeId, String(r.nodeId));
+					} else ctx.lost.push(op.snap.nodeId);
+				},
+				chunk: h && h.chunk
+			});
+		}
+		if (ctx.damaged.length) ctx.lost = ctx.lost.concat(ctx.damaged.splice(0));
+	}
+	// DEV·하드 테스트: false면 레거시 안전 경로를 1단계 경로(v27 호스트, _legacySafeUpdateV27·↑ 이름 쓰기)로 고정한다.
+	// null(기본)이면 v28 호스트가 답할 때 v28 경로 (window._mogrtDebug.setLegacyV28, s1_9·s1_10 하드 케이스가 1단계 경로를 시험한다)
+	var _legacyV28Force = null;
+	// v28 호스트 경로를 쓸 수 있는가: 같은 빌드의 v28 호스트가 답하고, 활성 시퀀스가 패널 시퀀스이며 프리뷰가 아니다
+	async function _legacyV28Ok() {
+		if (!_keysResolved || _legacyV28Force === false) return false;
+		const hk = await _miHostOk();
+		return !!(hk.ok && hk.ping && !hk.ping.isPreview && hk.ping.seqId && String(hk.ping.seqId) === String(state.currentSequenceId) && Number(hk.ping.frameTicks) > 0);
+	}
+	// 실행 시작: 호스트 확인(ping) → {ok, ping} | {ok: false, error}. 실패하면 상태 줄에 알린다 (_miApply와 같은 확인)
+	async function _miStartCheck(seqTok0) {
+		const hk = await _miHostOk();
+		if (!hk.ok) {
+			setStatus(hk.msg, "err");
+			return { ok: false, error: hk.why === "build" ? "build-mismatch" : "no-host", detail: hk.msg };
+		}
+		const ping = hk.ping;
+		if (ping.isPreview) {
+			setStatus("프리뷰 시퀀스가 활성입니다 — 작업 시퀀스를 연 뒤 다시 적용하세요", "err");
+			return { ok: false, error: "preview-active" };
+		}
+		if (!ping.seqId || String(ping.seqId) !== String(state.currentSequenceId) || seqTok0 !== _importSeqToken()) {
+			setStatus("Premiere의 활성 시퀀스가 패널의 시퀀스와 다릅니다 — 패널이 따라간 뒤 다시 적용하세요", "err");
+			return { ok: false, error: "seq-mismatch" };
+		}
+		if (!(Number(ping.frameTicks) > 0)) {
+			setStatus("시퀀스 프레임 정보를 읽지 못했습니다", "err");
+			return { ok: false, error: "exception", detail: "frameTicks" };
+		}
+		return { ok: true, ping };
+	}
+
+	// ─────────────────────────────────────────────────────────────
+	// 레거시 안전 경로 (v28 호스트, S2-5) — 계획서 §6.13, spec placement 13
+	// 화자 표가 없는 목록의 ▶ [안전하게 적용]과 ↑(v27에 위험하거나 시간이 바뀐 줄)는 v28 호스트가 답하면 이 경로를 쓴다
+	// (답하지 않으면 1단계 경로 _legacySafeUpdateV27). 태그를 쓰지 않는다(name null) → 단일 화자 타임라인은 v27과 같은 모습이다.
+	//   1) 줄 트랙(ap.t, 없으면 #trackSel)을 줄 자리 ±30초로 스캔 (MI_getTracks)
+	//   2) 줄 자리(ap → mmPrev → 지금 시간) ±1프레임의 태그 없는 클립을 되읽어 core legacyMiPlan: 문장만 바뀜 → update(nodeId),
+	//      시간이 바뀜 → move (TrackItem.move), 없음 → place (뒤 클립 머리 보호). 문장이 다른 한 클립(uncertain)은 확인창에서 고른다
+	//   3) last_apply.json {legacy: true, key "r<id>", g 0}을 쓰고 청크로 보낸다. 덮인 이웃 클립은 스냅숏으로 다시 놓는다
+	//   4) 검증된 줄은 ap를 적고 mm을 지운다 (markApplied). 일부 속성만 쓴 줄은 자리(ap)만 적고 mm을 남긴다
+	// ─────────────────────────────────────────────────────────────
+	const LEGACY_MI_WHY = Object.assign({}, LEGACY_WHY, {
+		ambiguous: "같은 자리에 문장이 맞는 클립이 여럿 — 건너뜀",
+		uncertain: "같은 자리 클립의 문장이 다름 (확인 필요)",
+		"no-track": "트랙 없음"
+	});
+	// 레거시 줄의 클립 주인 (core legacyClipOwners 입력): 살아 있는 줄과 휴지통 항목의 자리·트랙·템플릿(AE 프리셋)
+	function _legacyOwnerRows() {
+		const one = (sub, rs) => {
+			const preset = rs && rs.presetId ? state.presets[rs.presetId] || null : null;
+			const ok = !!(preset && preset.mogrtPath && !_isNativePreset(preset) && !(rs && rs.ap && rs.ap.nk));
+			const at = [];
+			[rs && rs.ap, rs && rs.mmPrev].forEach((x) => { if (x && typeof x.s === "number") at.push(x.s); });
+			if (typeof sub.startSec === "number") at.push(sub.startSec);
+			return { id: sub.id, track: rs && rs.ap && typeof rs.ap.t === "number" ? rs.ap.t : null, at, m: ok ? preset.mogrtPath : null };
+		};
+		const out = [];
+		state.subtitles.forEach((s) => { if (s && !s.spk) out.push(one(s, state.rowStates[s.id])); });
+		(state.trashBin || []).forEach((t) => { if (t && t.sub && !t.sub.spk) out.push(one(t.sub, t.state)); });
+		return out;
+	}
+	// 문장이 다른 한 클립이 있는 줄 → "include" | "skip" | null (취소)
+	function _legacyUncertainChoice(ids) {
+		return new Promise((resolve) => {
+			const labels = ids.slice(0, 8).map((id) => rowLabel(state.subtitles.find((s) => s.id === id), false)).join(", ");
+			showChoice("같은 자리에 클립이 있지만 문장이 다른 줄 " + ids.length + "개가 있습니다 (" + labels + (ids.length > 8 ? " …" : "") + ").\n\n" +
+				"포함해서 적용: 그 클립을 이 줄의 클립으로 보고 갱신합니다 (클립의 문장을 덮어씁니다).\n빼고 적용: 이 줄들은 건너뜁니다.", [
+				{ label: "포함해서 적용", run: () => resolve("include") },
+				{ label: "빼고 적용", run: () => resolve("skip") },
+				{ label: "취소", run: () => resolve(null) }
+			]);
+		});
+	}
+	// 계획의 줄 표시: 건너뛴 줄은 까닭, 보낼 줄은 지난 표시를 지운다, 그대로인 줄(클립을 찾았고 보낼 것이 없다)은 검증된 적용으로 본다
+	function _legacyMarkPlan(plan, targets) {
+		targets.forEach((t) => {
+			const ro = plan.rowOps[t.sub.id];
+			if (!ro) return;
+			if (ro.skip) _setRowRes(t.sub.id, (LEGACY_MI_WHY[ro.skip] || ro.skip) + (ro.detail && ro.skip !== "ambiguous" ? ": " + ro.detail : ""));
+			else {
+				_setRowRes(t.sub.id, null);
+				if (ro.none && t.rs) markApplied(t.rs, t.sub, t.preset, t.track);
+			}
+			_refreshRowMarks(t.sub);
+		});
+	}
+	// 레거시 안전 경로 실행. ids: 목록 줄 id (화자 줄은 뺀다), opts {single (↑), full (속성 전부)}
+	// → {ok, stopped, error, created, updated, moved, partial, conflict, failed, skipped, repaired, lost, runId} | {ok: false, error}
+	async function _legacySafeApply(ids, opts) {
+		const o = opts || {};
+		if (_miBusy || _legacyRun) {
+			setStatus("타임라인 적용이 이미 실행 중입니다", "err");
+			return { ok: false, error: "busy" };
+		}
+		if (!_keysResolved) {
+			setStatus("시퀀스를 열면 적용할 수 있습니다", "err");
+			return { ok: false, error: "no-sequence" };
+		}
+		_miBusy = true;
+		_miCancel = false;
+		const seqTok0 = _importSeqToken();
+		let ctx = null;
+		let plan = null;
+		try {
+			const chk = await _miStartCheck(seqTok0);
+			if (!chk.ok) return chk;
+			const ft = Number(chk.ping.frameTicks);
+			const want = _idSet(ids);
+			const targets = _legacyTargets(state.subtitles.filter((s) => want[s.id] && !s.spk));
+			if (!targets.length) {
+				setStatus("적용할 줄이 없습니다", "err");
+				return { ok: false, error: "no-rows" };
+			}
+			ctx = _miRunCtx(String(chk.ping.seqId), ft);
+			_miShowBusy("타임라인 읽는 중…");
+			const tracks = [];
+			let lo = Infinity;
+			let hi = -Infinity;
+			targets.forEach((t) => {
+				if (tracks.indexOf(t.track) === -1) tracks.push(t.track);
+				const loc = applyLocate(t.rs, t.sub);
+				[loc.s, loc.e, t.sub.startSec, t.sub.endSec].forEach((x) => {
+					const f = frameOf(x, ft);
+					if (isFinite(f)) {
+						lo = Math.min(lo, f);
+						hi = Math.max(hi, f);
+					}
+				});
+			});
+			const pad = frameOf(SCAN_PAD_SEC + PLACE_DUR_FALLBACK * 2, ft);
+			const scan = await _miCallWatch(() => host.mi.getTracks({ seqId: ctx.seqId, tracks: tracks.sort((a, b) => a - b), fromFrame: Math.max(0, lo - pad), toFrame: hi + pad }));
+			if (!scan || scan.ok !== true) throw _miHostFail("getTracks", scan);
+			_miNumTracks = scan.numVideoTracks;
+			_miNoteScan(ctx, scan);
+			const owners = legacyClipOwners(scan, _legacyOwnerRows(), ft);
+			ctx.durs = await _miDursFor(targets.map((t) => t.preset && t.preset.mogrtPath));
+			const planFor = async (uncertain) => {
+				let p = null;
+				for (let it = 0; it < 4; it++) {
+					p = legacyMiPlan({ rows: targets, scan, details: ctx.details, durs: ctx.durs, owners, opts: { uncertain, full: !!o.full } });
+					const reads = p.needReads.filter((r) => !ctx.details[r.nodeId]);
+					if (!reads.length) break;
+					_miShowBusy("클립 읽는 중… (" + reads.length + "개)");
+					await _miReadDetails(reads, ctx.details, ctx.seqId);
+				}
+				return p;
+			};
+			plan = await planFor(false);
+			if (plan.uncertain.length) {
+				_miHideBusy();
+				const pick = await _legacyUncertainChoice(plan.uncertain);
+				if (pick === null) {
+					setStatus("타임라인 적용 취소", "");
+					return { ok: false, error: "cancelled" };
+				}
+				if (ctx.seqTok !== _importSeqToken()) {
+					setStatus("시퀀스가 바뀌어 적용을 취소했습니다", "err");
+					return { ok: false, error: "seq-mismatch" };
+				}
+				if (pick === "include") plan = await planFor(true);
+			}
+			// 보호·복구할 수 있는 클립: 다른 줄의 클립(주인 줄의 프리셋 템플릿), 이 실행이 찾은 줄 클립(그 줄의 프리셋 템플릿)
+			Object.keys(owners).forEach((n) => { if (owners[n].m) ctx.repairM[n] = owners[n].m; });
+			plan.ops.forEach((op) => { if (op.own && op.m) ctx.repairM[String(op.own.nodeId)] = op.m; });
+			_legacyMarkPlan(plan, targets);
+			if (!plan.ops.length && !plan.removals.length) {
+				saveSessionToStorage();
+				updateMultiSelect();
+				const sk = Object.keys(plan.rowOps).filter((k) => plan.rowOps[k] && plan.rowOps[k].skip).length;
+				setStatus("안전하게 적용: 보낼 줄이 없습니다" + (sk ? " (건너뜀 " + sk + ")" : ""), sk ? "err" : "ok");
+				return { ok: true, created: 0, updated: 0, moved: 0, skipped: sk };
+			}
+			ctx.la = _laNew(ctx.seqId, "", targets.length, true);
+			ctx.laN = 0;
+			_writeLastApply(ctx.la);
+			ctx.totalOps = plan.ops.length;
+			const h = {
+				busy: (k, a, b) => (k === "remove" ? "옛 클립 지우는 중… (" + a + "개)" : "안전하게 적용 중… " + a + "/" + b),
+				removed: (x, r) => {
+					if (r.status !== "removed") return;
+					_laTouch(ctx.la, x.uid, x.id);
+					const tgt = targets.find((t) => t.sub.id === x.id);
+					const e = Object.assign({ key: x.uid, g: 0 }, r.before || {}, { nodeId: String(x.nodeId), why: x.why, n: ctx.laN++, id: x.id });
+					if (!e.m && tgt && tgt.preset) e.m = tgt.preset.mogrtPath;
+					ctx.la.removed.push(e);
+				},
+				result: (op, r) => _legacyOnResult(ctx, op, r),
+				chunk: () => {
+					ctx.la.chunksDone++;
+					_writeLastApply(ctx.la);
+				},
+				remap: (a, b) => _laRemap(ctx.la, a, b)
+			};
+			await _miRunOps(ctx, plan.removals, plan.ops, h);
+			await _miRepair(ctx, h);
+		} catch (e) {
+			if (ctx) ctx.error = (e && e.message) || String(e);
+			console.error("[MOGRT] 레거시 안전 경로 멈춤:", e);
+			setStatus(MI_STOPPED_MSG + ": " + ((e && e.message) || e), "err");
+			if (!ctx || !ctx.la) return { ok: false, error: "exception", detail: (e && e.message) || String(e) };
+		} finally {
+			try {
+				if (ctx && ctx.la) _legacyFinish(ctx, plan);
+			} finally {
+				_miBusy = false;
+				_miCancel = false;
+				_miHideBusy();
+			}
+		}
+		return _legacyReport(ctx, plan);
+	}
+	// 작업 결과 하나 → 줄 기록(ap·mm)·줄 표시·last_apply
+	function _legacyOnResult(ctx, op, r) {
+		const st = String((r && r.status) || "");
+		const sub = ctx.byId[op.id] || null;
+		const rs = sub ? state.rowStates[sub.id] : null;
+		const preset = rs && rs.presetId ? state.presets[rs.presetId] || null : null;
+		if (!PLACE_OK[st] && st !== "partial") {
+			if (st === "conflict" || st === "locked" || st === "ambiguous") ctx.stats.conflict++;
+			else ctx.stats.failed++;
+			_setRowRes(op.id, _miResultText(st, r || {}));
+			if (sub) _refreshRowMarks(sub);
+			return;
+		}
+		_laTouch(ctx.la, op.uid, op.id);
+		_laRecord(ctx, op, r);
+		ctx.stats[op.op === "place" ? "created" : op.op === "move" ? "moved" : "updated"]++;
+		if (sub && rs) {
+			if (st === "partial") {
+				// 일부 속성을 쓰지 못했다 (옛 버전 클립·키프레임): 클립이 있는 자리는 적고 병합 표시는 남긴다
+				ctx.stats.partial++;
+				rs.ap = apRecord(sub, rs, preset, op.track);
+				_setRowRes(op.id, "속성 " + ((r.skipped || []).length + (r.keyed || []).length) + "개 적용 안 됨" + ((r.keyed || []).length ? " (키프레임)" : " (옛 버전)"));
+			} else {
+				markApplied(rs, sub, preset, op.track);
+				_setRowRes(op.id, null);
+			}
+			_refreshRowMarks(sub);
+		}
+	}
+	function _legacyReport(ctx, plan) {
+		if (!ctx) return { ok: false, error: "exception" };
+		const s = ctx.stats;
+		const skipped = plan ? Object.keys(plan.rowOps).filter((k) => plan.rowOps[k] && plan.rowOps[k].skip).length : 0;
+		return { ok: !ctx.error && !ctx.aborted, stopped: !!ctx.stopped, error: ctx.error || null, created: s.created, updated: s.updated, moved: s.moved, partial: s.partial,
+			conflict: s.conflict, failed: s.failed, skipped, repaired: s.repaired, lost: ctx.lost.length, runId: ctx.la ? ctx.la.runId : null };
+	}
+	function _legacyFinish(ctx, plan) {
+		ctx.la.complete = !ctx.stopped && !ctx.error && !ctx.aborted;
+		_writeLastApply(ctx.la);
+		const s = ctx.stats;
+		const n = s.created + s.updated + s.moved;
+		if (ctx.seqTok === _importSeqToken()) {
+			saveSessionToStorage();
+			if (n) _saveHistoryOnAction("안전하게 적용 (" + n + "개)");
+			updateMultiSelect();
+		}
+		const rep = _legacyReport(ctx, plan);
+		const parts = [];
+		[["updated", "갱신"], ["moved", "옮김"], ["created", "놓음"]].forEach(([k, t]) => { if (rep[k]) parts.push(t + " " + rep[k]); });
+		if (rep.partial) parts.push("일부 속성 빠짐 " + rep.partial);
+		if (rep.conflict) parts.push("충돌 " + rep.conflict);
+		if (rep.failed) parts.push("실패 " + rep.failed);
+		if (rep.skipped) parts.push("건너뜀 " + rep.skipped);
+		if (rep.repaired) parts.push("덮인 이웃 다시 놓음 " + rep.repaired);
+		if (rep.lost) parts.push("덮인 이웃 " + rep.lost + "개 되살리지 못함");
+		const text = "안전하게 적용: " + (parts.join(" · ") || "보낸 줄 없음");
+		if (ctx.error) setStatus(MI_STOPPED_MSG + ": " + ctx.error + " — " + text, "err");
+		else if (ctx.aborted) setStatus("시퀀스가 바뀌어 멈췄습니다 — " + text, "err");
+		else if (ctx.stopped) setStatus("중지함 — " + text, "err");
+		else setStatus(text, rep.conflict || rep.failed || rep.skipped || rep.partial || rep.lost ? "err" : "ok");
+	}
+
+	// ─────────────────────────────────────────────────────────────
+	// 마지막 적용 되돌리기 (타임라인만, S2-5) — 계획서 §6.11, spec placement 11
+	// 히스토리 맨 위 '↶ 마지막 적용 되돌리기'(확인창)와 명령 undo. last_apply.json을 core buildUndoOps로 거꾸로 돌린다:
+	//   만든 클립 → 지운다, 제자리 작업(update·adopt·move) → 작업 전 속성 전부·이름·자리로, 다시 놓은 클립(moveRegen·legacyMove·replace) →
+	//   옛 템플릿(기록한 경로 m)을 옛 자리에 되놓고 지금 클립을 지운다, 지운 클립(옛 gen·목록에서 빠진 줄) → 기록한 자리에 되놓는다.
+	// 모든 작업은 nodeId + gen + 지금 텍스트 해시 == 기록한 rh로 확인하고, 다르면 '그 뒤로 바뀜'으로 건너뛴다
+	// (네이티브는 Source Text가 늘 ""로 읽혀 텍스트로 확인할 수 없다 → nodeId·gen·종류만 보고, 되놓을 때는 기록한 구운 사본 경로를 쓴다).
+	// 자막 목록·후반 작업 값·히스토리는 되돌리지 않는다. 되돌린 줄은 mm "undone"(변경 줄)이 되고 줄의 ap·mmPrev와 applied는
+	// 실행 전 기록(la.prev)으로 돌아간다. 중단된 적용은 기록된 청크만 되돌린다. 끝나면 기록에 undone {ts, complete, keys}를 적는다.
+	// 새로 만든 비디오 트랙은 지우지 않는다.
+	// ─────────────────────────────────────────────────────────────
+	const UNDO_CONFIRM_MSG = "타임라인만 되돌립니다. 자막 목록과 후반 작업 값은 그대로이며, 되돌린 줄은 '변경 줄'로 표시됩니다.";
+	const UNDO_WHY_TEXT = {
+		gone: "클립이 없음", renamed: "클립 이름(태그)이 바뀜", edited: "Premiere에서 문장을 고침", kind: "템플릿 종류가 바뀜", "moved-track": "다른 트랙으로 옮겨짐",
+		"template-unknown": "되놓을 템플릿을 모름", exists: "그 자리에 같은 클립이 있음", occupied: "되놓을 자리가 막힘", "occupied-own": "되놓을 자리가 막힘", tail: "되놓을 자리 뒤가 막힘",
+		locked: "잠긴 트랙", ambiguous: "같은 태그 클립이 여럿", "stale-plan": "계획 뒤 타임라인이 바뀜", misplaced: "다른 트랙에 놓여 지움", failed: "실패"
+	};
+	// 실패로 세는 까닭 (나머지는 건너뜀)
+	const UNDO_FAILS = { failed: true, "stale-plan": true, misplaced: true, exception: true };
+	function _undoWhyText(why, detail) {
+		const t = UNDO_WHY_TEXT[why] || why;
+		return "되돌리지 않음 — " + (UNDO_CHANGED[why] ? "그 뒤로 바뀜 (" + t + ")" : t) + (detail && !UNDO_CHANGED[why] ? ": " + detail : "");
+	}
+	// 히스토리 항목 문구 "↶ 마지막 적용 되돌리기 (12:03 · 120줄)" + 중단된 적용
+	function _undoLabel(la) {
+		const d = new Date(la.ts || 0);
+		const hm = d.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+		return "↶ 마지막 적용 되돌리기 (" + hm + " · " + (la.rows || 0) + "줄)" + (la.complete ? "" : " (중단된 적용)");
+	}
+	// 보호·복구할 수 있는 클립 {nodeId: 템플릿}: 우리 salt 태그 클립(applied.m), 기록의 마지막 클립(작업 뒤 m), 레거시 줄 자리의 태그 없는 클립(줄 프리셋)
+	function _undoRepairM(scan, la, ft) {
+		const out = {};
+		const salt = String(la.salt || state.mi.salt || "");
+		((scan && scan.tracks) || []).forEach((t) => (t.clips || []).forEach((c) => {
+			const tg = parseClipTag(c.name);
+			if (!tg || !salt || tg.salt !== salt) return;
+			const a = state.mi.applied[tg.uid];
+			if (a && a.m) out[String(c.nodeId)] = a.m;
+		}));
+		undoChains(la).chains.forEach((ch) => {
+			if (ch.final && ch.final.m && ch.final.nodeId && !out[ch.final.nodeId]) out[ch.final.nodeId] = ch.final.m;
+		});
+		const owners = legacyClipOwners(scan, _legacyOwnerRows(), ft);
+		Object.keys(owners).forEach((n) => { if (owners[n].m && !out[n]) out[n] = owners[n].m; });
+		return out;
+	}
+	// 되돌린 key 하나 → applied·줄 기록(ap·mmPrev)을 실행 전으로, 줄은 mm "undone"
+	function _undoDone(ctx, key, act, r, partial) {
+		ctx.undo.done[key] = act;
+		ctx.stats[act === "remove" ? "removed" : act === "replace" || act === "place" ? "replaced" : act === "move" ? "moved" : "restored"]++;
+		if (partial) ctx.stats.partial++;
+		const p = ctx.la.prev ? ctx.la.prev[key] : null;
+		if (isUidKey(key) && p) {
+			const a = p.a ? JSON.parse(JSON.stringify(p.a)) : null;
+			// 되놓은 클립은 태그 gen을 올렸다 (지금 클립이 남아도 옛 gen으로 정리되게)
+			if (a && (act === "replace" || act === "place") && r && typeof r.g === "number") a.g = r.g;
+			if (a) state.mi.applied[key] = a;
+			else delete state.mi.applied[key];
+		}
+		const id = p && typeof p.id === "number" ? p.id : laKeyId(key);
+		const sub = ctx.byId[id] || null;
+		const rs = sub ? state.rowStates[sub.id] : null;
+		if (!sub || !rs) return;
+		if (p) {
+			if (p.ap) rs.ap = JSON.parse(JSON.stringify(p.ap));
+			else delete rs.ap;
+			if (p.mmPrev) rs.mmPrev = JSON.parse(JSON.stringify(p.mmPrev));
+			else delete rs.mmPrev;
+		}
+		rs.mm = "undone";
+		_setRowRes(sub.id, partial ? "되돌림: 일부 속성을 되돌리지 못함" : null);
+		_miRowStatus[sub.id] = { st: "undone", why: act, detail: "" };
+		_refreshRowMarks(sub);
+	}
+	// 되돌리지 않은 key → 줄 표시
+	function _undoSkip(ctx, key, why, detail) {
+		ctx.undo.why[key] = { why, detail: detail || "" };
+		if (UNDO_CHANGED[why]) ctx.stats.changed++;
+		else if (UNDO_FAILS[why]) ctx.stats.failed++;
+		else ctx.stats.skipped++;
+		const p = ctx.la.prev ? ctx.la.prev[key] : null;
+		const id = p && typeof p.id === "number" ? p.id : laKeyId(key);
+		const sub = ctx.byId[id] || null;
+		if (!sub) return;
+		_setRowRes(sub.id, _undoWhyText(why, detail));
+		_miRowStatus[sub.id] = { st: "undo-skipped", why, detail: detail || "" };
+		_refreshRowMarks(sub);
+	}
+	// 마지막 적용 되돌리기. opts {runId: 확인창을 연 기록 (그 사이 다른 적용이 기록을 바꿨으면 하지 않는다)}
+	// → {ok, stopped, error, removed, restored, moved, replaced, placed, partial, changed, skipped, failed, repaired, lost} | {ok: false, error}
+	async function _miUndo(opts) {
+		const o = opts || {};
+		if (_miBusy || _legacyRun) {
+			setStatus("타임라인 적용이 이미 실행 중입니다", "err");
+			return { ok: false, error: "busy" };
+		}
+		if (!_keysResolved) {
+			setStatus("시퀀스를 열면 되돌릴 수 있습니다", "err");
+			return { ok: false, error: "no-sequence" };
+		}
+		const la = _readLastApply();
+		if (!laUndoable(la, state.currentSequenceId) || (o.runId && la.runId !== o.runId)) {
+			setStatus("되돌릴 마지막 적용이 없습니다", "err");
+			return { ok: false, error: "not-found" };
+		}
+		if (!la.legacy && la.salt && state.mi.salt && la.salt !== state.mi.salt) {
+			setStatus("마지막 적용 기록이 지금 목록의 것이 아닙니다 (salt가 다름) — 되돌리지 않습니다", "err");
+			return { ok: false, error: "salt-mismatch" };
+		}
+		_miBusy = true;
+		_miCancel = false;
+		const seqTok0 = _importSeqToken();
+		let ctx = null;
+		try {
+			const chk = await _miStartCheck(seqTok0);
+			if (!chk.ok) return chk;
+			const ft = Number(chk.ping.frameTicks);
+			ctx = _miRunCtx(String(chk.ping.seqId), ft);
+			ctx.la = la;
+			ctx.undo = { done: Object.assign({}, (la.undone && la.undone.keys) || {}), why: {} };
+			const already = Object.assign({}, ctx.undo.done);
+			// 스캔: 기록의 트랙들, 작업 뒤 자리와 작업 전 자리 ±30초 (+ 템플릿 길이)
+			const tracks = [];
+			let lo = Infinity;
+			let hi = -Infinity;
+			const paths = [];
+			UNDO_CATS.forEach((c) => (Array.isArray(la[c]) ? la[c] : []).forEach((e) => {
+				if (!e) return;
+				[e, e.from].forEach((x) => {
+					if (!x || typeof x.track !== "number") return;
+					if (tracks.indexOf(x.track) === -1) tracks.push(x.track);
+					if (typeof x.sf === "number") {
+						lo = Math.min(lo, x.sf);
+						hi = Math.max(hi, typeof x.ef === "number" ? x.ef : x.sf);
+					}
+					if (x.m) paths.push(x.m);
+				});
+			}));
+			if (!tracks.length) throw new Error("기록에 트랙이 없다");
+			const pad = frameOf(SCAN_PAD_SEC + PLACE_DUR_FALLBACK * 2, ft);
+			_miShowBusy("타임라인 읽는 중…");
+			const scan = await _miCallWatch(() => host.mi.getTracks({ seqId: ctx.seqId, tracks: tracks.sort((a, b) => a - b), fromFrame: Math.max(0, lo - pad), toFrame: hi + pad }));
+			if (!scan || scan.ok !== true) throw _miHostFail("getTracks", scan);
+			_miNoteScan(ctx, scan);
+			ctx.durs = await _miDursFor(paths);
+			UNDO_CATS.forEach((c) => (Array.isArray(la[c]) ? la[c] : []).forEach((e) => {
+				if (e && e.m && Number(e.dur) > 0 && !(Number(ctx.durs[normPath(e.m)]) > 0)) ctx.durs[normPath(e.m)] = Number(e.dur);
+			}));
+			ctx.repairM = _undoRepairM(scan, la, ft);
+			let plan = null;
+			for (let it = 0; it < 4; it++) {
+				plan = buildUndoOps({ la, scan, details: ctx.details, durs: ctx.durs, repairM: ctx.repairM, skipKeys: already });
+				const reads = plan.needReads.filter((r) => !ctx.details[r.nodeId]);
+				if (!reads.length) break;
+				_miShowBusy("클립 확인 중… (" + reads.length + "개)");
+				await _miReadDetails(reads, ctx.details, ctx.seqId);
+			}
+			plan.skipped.forEach((s) => _undoSkip(ctx, s.key, s.why, s.detail));
+			ctx.stats.kept = plan.kept.length;
+			ctx.totalOps = plan.ops.length;
+			const opsByKey = {};
+			plan.ops.forEach((op) => { opsByKey[op.uid] = op; });
+			await _miRunOps(ctx, plan.removals, plan.ops, {
+				busy: (k, a, b) => (k === "remove" ? "되돌리는 중… 만든 클립 지우기 (" + a + "개)" : "되돌리는 중… " + a + "/" + b),
+				removed: (x, r) => {
+					// 순환을 끊는 '먼저 지우기'는 그 작업(놓기)이 끝나야 되돌린 것이다
+					if (x.why !== "undo") return;
+					if (r.status === "removed") _undoDone(ctx, x.key || x.uid, "remove", r, false);
+					else if (r.status === "notOurs") _undoSkip(ctx, x.key || x.uid, "renamed", r.name || "");
+					else if (r.status === "notFound") _undoSkip(ctx, x.key || x.uid, "gone");
+					else _undoSkip(ctx, x.key || x.uid, r.status === "locked" ? "locked" : "failed", r.status + (r.reason ? " " + r.reason : ""));
+				},
+				result: (op, r) => {
+					const st = String((r && r.status) || "");
+					if (PLACE_OK[st] || st === "partial") {
+						if (op.undo === "unremove") {
+							ctx.stats.placed++;
+							ctx.undo.done[op.uid] = "unremove";
+							const e = op.entry || {};
+							// 목록에서 빠진 줄의 클립을 되놓았다: 그 uid의 applied도 지우기 전으로
+							if (e.why === "orphan" && e.pa && isUidKey(e.key) && !state.mi.applied[e.key]) state.mi.applied[e.key] = JSON.parse(JSON.stringify(e.pa));
+						} else _undoDone(ctx, op.key, op.undo, r, st === "partial");
+						return;
+					}
+					_undoSkip(ctx, op.key, st === "conflict" ? r.reason || "occupied" : UNDO_WHY_TEXT[st] ? st : "failed", _miResultText(st, r || {}));
+				},
+				chunk: () => {
+					la.undone = { ts: Date.now(), complete: false, keys: ctx.undo.done };
+					_writeLastApply(la);
+				}
+			});
+			await _miRepair(ctx, {});
+		} catch (e) {
+			if (ctx) ctx.error = (e && e.message) || String(e);
+			console.error("[MOGRT] 되돌리기 멈춤:", e);
+			setStatus(MI_STOPPED_MSG + ": " + ((e && e.message) || e), "err");
+			if (!ctx) return { ok: false, error: "exception", detail: (e && e.message) || String(e) };
+		} finally {
+			try {
+				if (ctx) _undoFinish(ctx);
+			} finally {
+				_miBusy = false;
+				_miCancel = false;
+				_miHideBusy();
+			}
+		}
+		return _undoReport(ctx);
+	}
+	function _undoReport(ctx) {
+		if (!ctx) return { ok: false, error: "exception" };
+		const s = ctx.stats;
+		return { ok: !ctx.error && !ctx.aborted, stopped: !!ctx.stopped, error: ctx.error || null, removed: s.removed, restored: s.restored, moved: s.moved, replaced: s.replaced,
+			placed: s.placed, partial: s.partial, changed: s.changed, skipped: s.skipped, kept: s.kept || 0, failed: s.failed, repaired: s.repaired, lost: ctx.lost.length, runId: ctx.la ? ctx.la.runId : null };
+	}
+	function _undoFinish(ctx) {
+		const la = ctx.la;
+		la.undone = { ts: Date.now(), complete: !ctx.stopped && !ctx.error && !ctx.aborted, keys: ctx.undo.done };
+		_writeLastApply(la);
+		const rep = _undoReport(ctx);
+		const n = rep.removed + rep.restored + rep.moved + rep.replaced + rep.placed;
+		if (ctx.seqTok === _importSeqToken()) {
+			saveSessionToStorage();
+			if (n) _saveHistoryOnAction("마지막 적용 되돌리기 (" + n + "개)");
+			updateMultiSelect();
+		}
+		const parts = [];
+		[["removed", "지움"], ["restored", "되돌림"], ["moved", "옮김"], ["replaced", "다시 놓음"], ["placed", "되놓음"]].forEach(([k, t]) => { if (rep[k]) parts.push(t + " " + rep[k]); });
+		if (rep.partial) parts.push("일부 속성 못 되돌림 " + rep.partial);
+		if (rep.changed) parts.push("그 뒤로 바뀜 " + rep.changed + " (건너뜀)");
+		if (rep.skipped) parts.push("건너뜀 " + rep.skipped);
+		if (rep.kept) parts.push("덮여서 다시 놓은 이웃 " + rep.kept + "개는 그대로");
+		if (rep.failed) parts.push("실패 " + rep.failed);
+		if (rep.repaired) parts.push("덮인 이웃 다시 놓음 " + rep.repaired);
+		if (rep.lost) parts.push("덮인 이웃 " + rep.lost + "개 되살리지 못함");
+		const text = "마지막 적용 되돌리기: " + (parts.join(" · ") || "되돌린 것 없음");
+		if (ctx.error) setStatus(MI_STOPPED_MSG + ": " + ctx.error + " — " + text, "err");
+		else if (ctx.aborted) setStatus("시퀀스가 바뀌어 멈췄습니다 — " + text, "err");
+		else if (ctx.stopped) setStatus("중지함 — " + text, "err");
+		else setStatus(text, rep.changed || rep.skipped || rep.failed || rep.partial || rep.lost ? "err" : "ok");
+	}
+	// 히스토리 항목을 눌렀다: 확인창 → 되돌리기 (확인창을 연 시퀀스·기록이 그대로일 때만)
+	function _confirmUndoApply(la) {
+		const seq = _importSeqToken();
+		const runId = la.runId;
+		showConfirm(UNDO_CONFIRM_MSG + (la.complete ? "" : "\n\n중단된 적용입니다: 기록된 청크만 되돌립니다."), () => {
+			if (seq !== _importSeqToken()) {
+				setStatus("시퀀스가 바뀌어 되돌리기를 취소했습니다", "err");
+				return;
+			}
+			_miUndo({ runId });
+		}, null, { yes: "되돌리기" });
+	}
+	// DEV·하드 테스트 훅: 되돌리기(확인창 없이)·레거시 안전 경로·마지막 적용 기록
+	window._mogrtDebug.undoApply = (opts) => _miUndo(opts || {});
+	window._mogrtDebug.legacySafeApply = (ids, opts) => _legacySafeApply(ids, opts || {});
+	window._mogrtDebug.lastApply = () => _readLastApply();
+	window._mogrtDebug.setLegacyV28 = (v) => {
+		_legacyV28Force = v === false ? false : null;
+		return _legacyV28Force;
+	};
 	// DEV·하드 테스트 훅: [중지]와 같다
 	window._mogrtDebug.miStop = () => { if (_miBusy) _miCancel = true; return _miBusy; };
 	window._mogrtDebug.miBusy = () => _miBusy;
@@ -11632,7 +12864,7 @@ var modalState = {
 		if (_castMode() || state.subtitles.some((s) => s.spk)) return _miApply(targetSubs);
 		const flagged = _legacyFlagged(targetSubs);
 		if (!flagged.length) return _legacyApply(targetSubs);
-		_legacyApplyChoice(targetSubs, flagged);
+		return _legacyApplyChoice(targetSubs, flagged);
 	}
 	document.getElementById("btnAddPreset")?.addEventListener("click", () => {
 		openPresetModal(null);
@@ -12076,17 +13308,24 @@ var modalState = {
 			const autoList = _loadHistoryList(false);
 			const manualList = _loadHistoryList(true);
 			const safetyList = _loadHistoryList("safety");
-			// ── 마지막 화자별 배치 (last_apply.json, S2-4): 맨 위에 기록만 보인다. 타임라인 되돌리기는 다음 단계(S2-5)에서 켠다 ──
+			// ── 마지막 적용 되돌리기 (last_apply.json, S2-5): 맨 위. 이 시퀀스의 기록이고 v27 ▶가 덮지 않았고 아직 되돌리지 않았을 때.
+			// 누르면 확인창 → 타임라인만 되돌린다 (src/mi/apply.ts _miUndo). 히스토리 항목 복원과 달리 목록은 그대로다 ──
 			const la = _readLastApply();
-			if (la && la.seqId && String(la.seqId) === String(state.currentSequenceId) && !la.superseded) {
-				const d = new Date(la.ts || 0);
-				const hm = d.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+			if (laUndoable(la, state.currentSequenceId)) {
 				const item = document.createElement("div");
 				item.id = "btnUndoApply";
 				item.className = "history-item last-apply" + (la.complete ? "" : " partial");
-				item.title = "마지막 화자별 배치 기록 (last_apply.json). 타임라인만 되돌리는 기능은 아직 쓸 수 없습니다";
-				item.innerHTML = '<span class="hist-label">' + escapeHtml("↶ 마지막 적용 되돌리기 (" + hm + " · " + (la.rows || 0) + "줄)" + (la.complete ? "" : " (중단된 적용)")) + '</span>';
-				item.addEventListener("click", (e) => e.stopPropagation());
+				item.title = "마지막 적용을 타임라인에서만 되돌립니다 (자막 목록·후반 작업 값은 그대로, 되돌린 줄은 '변경 줄'로 표시)";
+				item.innerHTML = '<span class="hist-label">' + escapeHtml(_undoLabel(la)) + '</span>';
+				item.addEventListener("click", (e) => {
+					e.stopPropagation();
+					dropdown.classList.remove("open");
+					if (_miBusy || _legacyRun) {
+						setStatus("타임라인 적용이 이미 실행 중입니다", "err");
+						return;
+					}
+					_confirmUndoApply(la);
+				});
 				dropdown.appendChild(item);
 			}
 			// ── 수동저장 섹션 (항상 표시) ──

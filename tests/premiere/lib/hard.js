@@ -168,6 +168,14 @@ function pageSetMiCast(on) {
 }
 
 /**
+ * 레거시 안전 경로를 1단계(v27 호스트) 경로로 고정한다 (false) / 코드 기본값으로 돌린다 (null: v28 호스트가 답하면 v28 경로, S2-5).
+ * 1단계 경로는 v28 호스트가 답하지 않을 때(캐시된 옛 호스트) 여전히 쓰인다 — s1_9·s1_10이 그 경로를 시험한다 → 적용된 값
+ */
+function pageSetLegacyV28(on) {
+	return "window._mogrtDebug.setLegacyV28(" + (on === false ? "false" : "null") + ")";
+}
+
+/**
  * 'SRT 가져오기' 창: {open, rows: [{file, key, name, preset, count, action, dup}], ok, okText, error, stats, info, legacy}
  * action은 이미 있는 화자면 선택 값(merge|replace), 아니면 칸의 글자(새 화자·병합·건너뜀). legacy는 분배 모드일 때만
  */
@@ -445,7 +453,7 @@ async function devCacheRoot(panel) {
 module.exports = {
 	sleep, waitFor, ticksToFrame,
 	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed, jsxDeletePreviewSequence, jsxCloneActiveAsScratch, jsxDropScratch, withScratchSequence, SCRATCH_PREFIX,
-	pageDropSrt, pageDropSrts, pageSetMiCast, pageLoadWork, pageCmd, pageSetRowPreset, pageImportPresetsText,
+	pageDropSrt, pageDropSrts, pageSetMiCast, pageSetLegacyV28, pageLoadWork, pageCmd, pageSetRowPreset, pageImportPresetsText,
 	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS, PAGE_RECORD_HOST_CALLS, PAGE_IMPORT_MODAL,
 	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot,
 	jsxTrackProps, propValue, jsxPlaceMogrt, waitConfirm, PAGE_CLEAR_STATUS, pageSelectTrack, pageCheckRow, pageTypeField,

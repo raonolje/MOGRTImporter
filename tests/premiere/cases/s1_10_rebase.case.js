@@ -11,6 +11,8 @@
  *       텍스트가 아닌 속성('박스 색상' 등)은 이름으로 쓴 줄 값이어야 한다: 새 구조 클립(참조)을 따로 놓고 같은 줄 값을
  *       v27 index로 써서(새 구조에서는 index가 맞다) 같은 이름의 값과 비교하고, 줄이 보내지 않은 속성은 그대로인지 본다
  *   (3) v1.1.7 배포는 선택이라 여기서 하지 않는다 (운영 설치·캐시는 건드리지 않는다)
+ * S2-5부터 v28 호스트가 답하면 [안전하게 적용]은 레거시 안전 경로(nodeId)다. (2)는 1단계 경로(v27 호스트 이름 쓰기)를 시험하므로
+ * window._mogrtDebug.setLegacyV28(false)로 고정하고 끝나면 기본값(null)으로 돌린다.
  * 실행: npm run hard -- s1_10
  */
 const H = require("../lib/hard");
@@ -106,6 +108,7 @@ module.exports = {
 		const P15 = await H.pickPresetForMogrt(api, fx.newPath);
 		const CAP = P15.params.find((x) => x.index === P15.textParamIndex).displayName;
 		assert.ok(fx.oldNames.indexOf(CAP) !== -1, "캡션 '" + CAP + "'이 옛 구조에도 있다");
+		assert.equal(await panel(H.pageSetLegacyV28(false)), false, "1단계 경로(v27 호스트)를 시험한다");
 		await H.withScratchSequence(api, "s1_10b", async () => {
 			assert.equal(await host(H.jsxClearVideoTrack(TRACK)), "0", "V3 비우기");
 			assert.equal(await panel(H.pageSelectTrack(TRACK)), String(TRACK));
@@ -201,6 +204,6 @@ module.exports = {
 				if (got !== p[1]) changed.push(p[0] + " " + p[1] + " → " + got);
 			});
 			log("(2) 텍스트가 아닌 속성: " + (changed.length ? "줄 값으로 바뀜 " + changed.join(" · ") : "모두 그대로 (줄 값 = 옛 클립 값)"));
-		});
+		}).finally(() => panel(H.pageSetLegacyV28(null)));
 	}
 };
