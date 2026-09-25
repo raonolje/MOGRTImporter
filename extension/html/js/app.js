@@ -625,6 +625,17 @@
 		}
 	}
 
+	// fn(호스트 호출)을 부르고, 그 사이 활성 시퀀스가 바뀌었으면 되돌린다. fn이 던지면 되돌린 뒤 다시 던진다.
+	async function _keepActiveSequence(fn) {
+		let before = null;
+		try { before = await host.getActiveSequenceInfo(); } catch (_) {}
+		try {
+			return await fn();
+		} finally {
+			await _restoreActiveSequence(before);
+		}
+	}
+
 	function _callNoArgs(funcName) {
 		return _invoke(funcName, `${funcName}()`);
 	}
@@ -667,25 +678,19 @@
 		// 프리뷰 시퀀스/클립이 아직 없을 때 ERROR를 돌려주는 것이 정상이다 → quiet
 		getPreviewClipParams: () => _callJson("getPreviewClipParams", _callNoArgs("getPreviewClipParams"), true),
 		getSystemFonts: () => _callJson("getSystemFonts", _callNoArgs("getSystemFonts")),
-		getMogrtParams: (mogrtPath) => _callJson("getMogrtParams", _callWithArgs("getMogrtParams", mogrtPath)),
+		getMogrtParams: (mogrtPath) => _keepActiveSequence(() => _callJson("getMogrtParams", _callWithArgs("getMogrtParams", mogrtPath))),
 		scanMogrtFolder: (folderPath) => _callJson("scanMogrtFolder", _callWithArgs("scanMogrtFolder", folderPath)),
 		syncAllClipsFromTimeline: (trackIndex) => _callJson("syncAllClipsFromTimeline", _callWithArgs("syncAllClipsFromTimeline", Number(trackIndex))),
 
 		// ── 문자열 프로토콜 반환. "SUCCESS:..." / "ERROR:..." / "CANCEL" 해석은 호출부 몫 ──
 		applyToTimeline: (payload) => _callWithPayload("applyToTimeline", payload),
 		updateClipAtTime: (payload) => _callWithPayload("updateClipAtTime", payload),
-		// 프리뷰 시퀀스를 새로 만들 때 v27 호스트가 작업 시퀀스 대신 프로젝트의 첫 시퀀스를 활성으로 되돌린다
-		// (qe.newSequence 뒤에 저장해 둔 activeSequence가 프리뷰를 가리키게 되기 때문. 2026-09-25 실측).
-		// 호스트는 바꾸지 않고, 부르기 전 시퀀스 ID를 기억했다가 달라졌으면 되돌린다.
-		setupPreviewSequence: async (payload) => {
-			let before = null;
-			try { before = await host.getActiveSequenceInfo(); } catch (_) {}
-			const r = await _callWithPayload("setupPreviewSequence", payload);
-			await _restoreActiveSequence(before);
-			return r;
-		},
-		applyPreviewParams: (payload) => _callWithPayload("applyPreviewParams", payload),
-		capturePreviewFrame: (payload) => _callWithPayload("capturePreviewFrame", payload),
+		// 프리뷰 시퀀스를 쓰는 v27 호스트 함수들은 끝날 때 작업 시퀀스를 제대로 되돌리지 못한다
+		// (저장해 둔 activeSequence가 프리뷰를 가리키게 되어 프리뷰에 머물거나 프로젝트의 첫 시퀀스로 간다. 2026-09-25 실측).
+		// 호스트는 바꾸지 않고, 부르기 전 시퀀스 ID를 기억했다가 달라졌으면 되돌린다 (_keepActiveSequence).
+		setupPreviewSequence: (payload) => _keepActiveSequence(() => _callWithPayload("setupPreviewSequence", payload)),
+		applyPreviewParams: (payload) => _keepActiveSequence(() => _callWithPayload("applyPreviewParams", payload)),
+		capturePreviewFrame: (payload) => _keepActiveSequence(() => _callWithPayload("capturePreviewFrame", payload)),
 		seekToClip: (payload) => _callWithPayload("seekToClip", payload),
 		previewParamsOnFirstClip: (payload) => _callWithPayload("previewParamsOnFirstClip", payload),
 		saveTextFile: (payload) => _callWithPayload("saveTextFile", payload),
@@ -4962,7 +4967,23 @@ var modalState = {
 	function initModal(setStatus) {
 		_setStatus$1 = setStatus;
 	}
+	// 프리셋 창이 열려 있는 동안 v27 호스트(역방향 동기화 getPreviewClipParams 등)가 활성 시퀀스를
+	// __MOGRT_PREVIEW__로 바꿔 둔 채 끝날 수 있다(4K 템플릿에서 실측). 창을 열 때의 작업 시퀀스를 기억했다가
+	// 창을 닫을 때(저장·취소) 되돌린다. 호스트 호출은 차례대로 실행되므로 진행 중인 폴링 뒤에 되돌린다.
+	var _modalSeqBefore = null;
+	function _rememberModalSequence() {
+		if (_modalSeqBefore) return;
+		host.getActiveSequenceInfo().then((i) => {
+			if (i && i.seqId && i.seqName !== "__MOGRT_PREVIEW__" && !_modalSeqBefore) _modalSeqBefore = i;
+		}).catch(() => {});
+	}
+	function _restoreModalSequence() {
+		const b = _modalSeqBefore;
+		_modalSeqBefore = null;
+		if (b) _restoreActiveSequence(b);
+	}
 	function openPresetModal(presetId) {
+		_rememberModalSequence();
 		const modal = document.getElementById("defaultModal");
 		const modalBody = document.getElementById("defaultModalBody");
 		const mogrtSel = document.getElementById("defaultMogrtSel");
@@ -5469,6 +5490,7 @@ var modalState = {
 
 		function closeModal() {
 			modal.classList.remove("open");
+			_restoreModalSequence();
 		}
 		// ─── 역방향 동기화: PP 프로퍼티스 → 프리셋 편집 UI ────────────────────────────────
 		var _reverseSyncTimer = null;
@@ -5553,6 +5575,8 @@ var modalState = {
 			if (editModal) editModal.classList.remove("open");
 			const previewArea = document.getElementById("modalPreviewArea");
 			if (previewArea) previewArea.innerHTML = "";
+			// 1차 창(defaultModal)이 이미 닫혀 있으면 여기서 되돌린다 (편집 버튼으로 바로 연 경우)
+			if (!document.getElementById("defaultModal")?.classList.contains("open")) _restoreModalSequence();
 		}
 		function openPresetEdit(path) {
 			const editModal = document.getElementById("presetEditModal");
