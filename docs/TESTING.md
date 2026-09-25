@@ -27,7 +27,8 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - `tests/unit/legacy_parseSRT.test.js`는 v27 골든이다. 깨지면 단일 화자 가져오기가 v27과 달라진 것이다.
 - `tests/lib/panelHarness.js` (S1-3): **app.js 전체**(IIFE)를 node:vm에서 부팅한다. 브라우저가 아니라 app.js가 지나가는 만큼만 흉내 낸다.
   - DOM: `index.html`을 작은 파서로 읽은 트리(id·class·label 부모·select 옵션, innerHTML 마크업도 파싱). 선택자는 `tag#id.class[attr=v]:checked`, 자손, 쉼표만.
-  - 호스트: `CSInterface.evalScript`의 함수 이름으로 `h.host.handlers[이름](...인자)`를 부르고 `h.host.calls`에 남긴다. 처리기가 없으면 빈 응답(전송 실패).
+  - 호스트: `CSInterface.evalScript`의 함수 이름으로 `h.host.handlers[이름](...인자)`를 부르고 `h.host.calls`에 남긴다. 처리기가 없으면 빈 응답(전송 실패). 패널이 보내는 ExtendScript 식은 맨 앞 주석 `/*host:이름 인자JSON*/`의 이름으로 부른다(S1-11 `removeNativeClipsAt`, 기본 처리기 `"SUCCESS: 0"`).
+  - Node (S1-11): `bootPanel({node: {files: {경로: 바이트|{data, mtimeMs}}}})`이면 `require("fs"|"zlib"|"path")`와 `jszip.min.js`를 넣는다. fs는 메모리(`h.nodeFs.files`, 쓰기 `h.nodeFs.writes`, 지우기 `h.nodeFs.unlinks`), zlib는 진짜다. JSZip은 진짜 `setImmediate`로 돌아 `h.flush()`를 여러 번 불러야 끝난다. 없으면 require·JSZip이 없다(굽기는 `no-node`로 실패).
   - `cep.fs`: 메모리(`h.fs.files`, 쓰기 기록 `h.fs.writes`, 읽기 실패 흉내 `h.fs.unreadable`, 옮기기 실패 흉내 `h.fs.renameFails`). `readdir`·`rename`도 있다. 캐시 경로는 `cachePaths`로 만든다.
   - 시계: 타이머는 `await h.advance(ms)`로만 돈다(부팅 2초 재확인, 100 ms 폴러, 30초 재스캔). `Date`는 진짜라 5분 무작업 자동저장은 저절로 돌지 않는다. 자동저장을 시험할 때는 `h.win.Date.now`를 멈춘 시계로 바꾸고 `window._mogrtDebug.idleAutosaveTick()`(1분 타이머가 부르는 무작업 확인, S1-4)을 부른다. 하드 케이스도 같은 방법을 쓴다(`s1_4_safety.case.js`).
   - 클립보드: `window.navigator.clipboard.writeText`가 쓴 글자는 `h.clipboard`에 남는다(S1-6 배지 복사). `delete h.win.navigator.clipboard` 뒤 `h.doc.execCommand`를 두면 대체 경로를 시험한다. 설치 폴더의 `html/…`(예: `html/js/app.js`)는 저장소 파일을 읽는다(S1-5 coreHash).
@@ -37,6 +38,8 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - `tests/fixtures/mogrt/make_old_mogrt.js` (S1-9): '옛 버전 MOGRT' 하드 픽스처. 사용자 템플릿이 들어 있어 **커밋하지 않고** 테스트할 때마다 설치된 MOGRT에서 저장소 밖 임시 폴더(`<os.tmpdir()>/mi_mogrt_fixtures`)로 만든다(저장소 안 폴더는 거부, `*.mogrt`는 `.gitignore`).
   - `makeOldLayoutMogrt({newName})`: 새 버전(기본 '자동 줄바꿈 박스')과 텍스트 컨트롤 이름이 순서대로 같고 구조가 다른 옛 버전(이 PC에서는 `Project_MOGRT/기본 자막.mogrt`, 8속성)을 찾아 바이트 그대로 복사한다. `MI_OLD_MOGRT`로 원본을 직접 지정할 수 있다.
   - `makeRenamedMogrt(src, {옛: 새}, out)`: 같은 capsuleID로 컨트롤 이름만 바꾼 사본(S0-3 x ②). zip 읽기·쓰기는 의존성 없이 이 파일에 있다(`tests/unit/fixtures_mogrt.test.js`는 합성 템플릿으로만 본다).
+- `tests/fixtures/mogrt/make_native_mogrt.js` (S1-11): 합성 네이티브 MOGRT(definition.json, gzip .prproj를 담은 project.prgraphic·project_ko_KR.prgraphic, 썸네일)와 구운 사본 읽기(`readNativeMogrt`). 설치된 Premiere 템플릿(2018 형식)의 모양을 따른다: Source Text 블롭 = 8바이트 LE 길이 + UTF-16LE JSON, 지역화 파일은 속성 이름이 '소스 텍스트', 같은 블롭은 빈 요소 `<… BinaryHash="h"/>`로 가리킨다. `format: "binary"`는 새 Premiere(apiVersion 2.x)의 이진 Source Text(굽지 못함).
+- `tests/compat/native_bake_real.test.js` (S1-11): 설치된 MOGRT 폴더(`MI_MOGRT_ROOT`, 기본 `%APPDATA%/Adobe/Common/Motion Graphics Templates`)가 있으면 돈다. 읽기 전용(메모리에서만 굽는다). Classic Lower Third Two Lines를 굽고, 모든 네이티브 템플릿의 prgraphic마다 Source Text 수가 TextLayer 수와 같거나 0(새 형식)인지 본다.
 - `tests/compat/` (S1-5부터, `preset_refs.test.js`는 S1-2 리뷰 반영): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지). 출력은 숫자·id만.
   - `realcache.test.js` (S1-5): 비어 있지 않은 session.json을 하네스(메모리 cep.fs)에 넣고 불러와 다시 저장해도 JSON이 같고 키 4개(mi 없음)인지, 히스토리 항목을 드롭다운으로 복원해도 목록·rowStates·휴지통이 같은지, 캡션 T-ID가 모든 줄에서 캡션 필드로 해석되고 isV27Unsafe가 옛 구조 줄과 정확히 같은지 본다. 실행: `MI_REAL_CACHE="$APPDATA/Adobe/CEP/extensions/CEP_MogrtImporter/cache" node --test tests/compat/realcache.test.js`
 - `runCommand` (S1-5, `//#region src/mi/commands.ts`): 하드 케이스는 `await window._mogrtDebug.cmd(op, args)`(약속)로 부른다 (`hard.js`의 `pageCmd`). 읽기 명령 status·rows·resolve·presets·cast.get·session.snapshot.

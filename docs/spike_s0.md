@@ -82,6 +82,12 @@
   - 비용: 줄마다 `.mogrt` 사본 1개 + 프로젝트 항목 1개("Motion Graphics Template Media" 빈). 텍스트를 바꾸려면 클립을 **교체**해야 한다(제자리 갱신 불가).
   - 남은 확인: ①과 ② 중 무엇이 필수인지, 굽기 사본의 정리 정책, 한 프로젝트 항목 수백 개일 때 성능.
   - 스크립트: `tests/premiere/spikes/native_bake.py`(굽기), `native_bake_probe.jsx`.
+  - S1-11 구현에서 더 본 것 (설치된 템플릿 61개, `tests/compat/native_bake_real.test.js`):
+    - 지역화 `project_xx_XX.prgraphic`에도 Source Text 블롭이 있다. 속성 이름이 번역되어 있을 뿐이다(`<Name>소스 텍스트</Name>`) → 이름이 아니라 블롭 내용(`mTextParam.mStyleSheet.mText`)으로 찾아 모든 prgraphic을 굽는다.
+    - 블롭에는 `BinaryHash`가 있고, Premiere는 같은 내용을 한 번만 적고 뒤에서는 빈 요소(`<StartKeyframeValue … BinaryHash="h"/>`)로 가리킨다. 구운 블롭에는 새 해시(같은 모양, 끝 8자리 = 길이 + 12)를 주고, 텍스트 블롭을 가리키던 빈 요소는 제 내용으로 채운다.
+    - 네이티브 문구의 줄바꿈은 CR(`\r`)이다(여러 줄 기본 문구). definition.json에는 int64(`ticksperframe` 9223372036854775807)가 있어 숫자 글자를 그대로 지켜 다시 쓴다.
+    - 새 Premiere가 저장한 템플릿(apiVersion 2.2, 예: 사용자의 `MOGRT샘플.mogrt`)은 Source Text가 이진(FlatBuffers 모양) 블롭이라 굽지 못한다 → 그 줄은 놓지 않고 까닭을 적는다(definition만 고친 사본이 그려지는지는 미확인).
+    - 네이티브 클립은 `projectItem`이 null이라 v27 applyToTimeline은 같은 시작의 네이티브 클립을 '같은 MOGRT'로 보고 속성만 쓴다 → 문구가 바뀐 줄은 패널이 먼저 그 클립을 지운다(ExtendScript 식 `removeNativeClipsAt`, v27 호스트는 그대로).
 
 ## 4. 사용자가 할 일 (수동)
 

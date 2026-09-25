@@ -214,10 +214,11 @@ const PAGE_STATUS = "(() => { const s = document.getElementById('statusBar'); re
 /**
  * 패널이 부르는 호스트 함수 이름을 순서대로 window.__hostCalls에 남기기 시작한다 (기록을 비운다).
  * CSInterface.prototype.evalScript를 감싼다. 케이스의 host()가 보내는 (function(){…})() 식은 이름이 없어 빠진다.
+ * 패널의 ExtendScript 식은 맨 앞 주석 /*host:이름 …*\/의 이름으로 남는다 (S1-11 removeNativeClipsAt)
  */
 const PAGE_RECORD_HOST_CALLS = "(() => { window.__hostCalls = []; if (!window.__hostCallsHooked) { window.__hostCallsHooked = true;" +
 	" const orig = CSInterface.prototype.evalScript; CSInterface.prototype.evalScript = function (script, cb) {" +
-	"  const m = /^\\s*([A-Za-z_$][\\w$]*)\\s*\\(/.exec(String(script)); if (m) window.__hostCalls.push(m[1]); return orig.call(this, script, cb); }; }" +
+	"  const m = /^\\s*(?:\\/\\*host:([A-Za-z_$][\\w$]*)|([A-Za-z_$][\\w$]*)\\s*\\()/.exec(String(script)); if (m) window.__hostCalls.push(m[1] || m[2]); return orig.call(this, script, cb); }; }" +
 	" return true; })()";
 
 /** 행 select로 프리셋 하나를 행 하나에 건다 (체크된 행이 없을 때 = 한 줄 경로) */
