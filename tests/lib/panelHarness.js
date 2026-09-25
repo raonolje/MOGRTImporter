@@ -512,7 +512,7 @@ async function bootPanel(opts = {}) {
 			error: (...a) => logs.push(["error", a.map((x) => (x && x.stack) || String(x)).join(" ")]),
 			debug: () => {}
 		},
-		TextDecoder, TextEncoder, URL,
+		TextDecoder, TextEncoder, URL, atob, btoa,
 		setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
 		setInterval: clock.setInterval, clearInterval: clock.clearInterval,
 		requestAnimationFrame: (fn) => clock.setTimeout(fn, 16),
@@ -573,10 +573,20 @@ async function bootPanel(opts = {}) {
 		$: (id) => doc.getElementById(id),
 		status: () => ({ text: doc.getElementById("statusBar").textContent, cls: doc.getElementById("statusBar").className }),
 		rows: () => doc.querySelectorAll("#listWrap .sub-row"),
-		/** #srtInput에 파일을 넣고 change를 보낸다 (FileReader는 마이크로태스크) */
-		async dropSrt(name, text) {
+		/** #srtInput에 파일을 넣고 change를 보낸다 (FileReader는 마이크로태스크). content: 문자열(UTF-8) 또는 바이트(Buffer·Uint8Array) */
+		async dropSrt(name, content) {
+			return h.dropSrts([{ name, content }]);
+		},
+		/** 여러 파일: [{name, content, path?, lastModified?}] */
+		async dropSrts(list) {
 			const input = doc.getElementById("srtInput");
-			input.files = [{ name, _text: text, size: Buffer.byteLength(text) }];
+			input.files = list.map((f) => {
+				const bytes = typeof f.content === "string" ? null : Buffer.from(f.content);
+				const o = bytes ? { name: f.name, _bytes: bytes, size: bytes.length } : { name: f.name, _text: f.content, size: Buffer.byteLength(f.content) };
+				if (f.path !== undefined) o.path = f.path;
+				if (f.lastModified !== undefined) o.lastModified = f.lastModified;
+				return o;
+			});
 			dispatch(input, makeEvent("change", { bubbles: true }));
 			await flush();
 		},

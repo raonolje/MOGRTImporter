@@ -139,10 +139,11 @@ test("verifyDev: MI_ 가 남거나 신원이 운영이면 잡는다", () => {
 	assert.ok(p.some((x) => /@@BUILD@@/.test(x)));
 });
 
-test("stageDev: 지금의 v27 사본도 통과한다 (MI_ 없음, 스탬프 없음, 벤더 js 포함)", () => {
+test("stageDev: 지금 사본도 통과한다 (MI_ → MID_ 말고는 그대로, 스탬프 없음, 벤더 js 포함)", () => {
 	assert.deepEqual(S.verifyDev(D.v27, EXT), []);
 	assert.equal(read("jsx/hostscript.jsx", D.v27), read("jsx/hostscript.jsx"));
-	assert.equal(read("html/js/app.js", D.v27), read("html/js/app.js"));
+	// 패널 상수 MI_CAST_ENABLED(S1-7)도 DEV에서는 MID_CAST_ENABLED가 된다 (파일 안에서 한결같이 바뀐다)
+	assert.equal(read("html/js/app.js", D.v27), S.rewriteMiPrefix(read("html/js/app.js")));
 	assert.equal(read("html/CSInterface.js", D.v27), read("html/CSInterface.js"));
 });
 

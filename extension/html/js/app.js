@@ -28,6 +28,11 @@
 	var _keysResolved = false, _filtersReady = false, _sessionReadFailed = false;
 	// 활성 시퀀스 표시(#activeSeqLabel)의 마지막 정보. 세션 읽기 실패 경고를 다시 그릴 때 쓴다
 	var _seqLabelInfo = null;
+	// 여러 SRT 가져오기(다화자) 플래그. S2-4(화자별 배치)까지 false: 운영은 v27처럼 SRT 한 개만 연다.
+	// DEV·하드 테스트는 코드를 고치지 않고 window._mogrtDebug.setMiCast(true)로 켠다 (_miCastEnabled)
+	const MI_CAST_ENABLED = false;
+	// 화자 줄의 ▶·↑ 안내 (화자별 트랙 배치는 S2-4. 그 전에는 v27 한 트랙 경로로 보내지 않는다)
+	const CAST_APPLY_PENDING_MSG = "화자별 배치는 개발 중입니다";
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -1326,6 +1331,160 @@
 		return mi;
 	}
 
+	// ── SRT 가져오기 (여러 파일, 캡션 트랙 번호 → 화자) ──
+
+	// 자동으로 휴지통에 들어간 항목(why "merge"|"replace")의 세션당 상한. 오래된(at) 것부터 버린다.
+	// 사용자가 지운 항목(why 없음)은 v27처럼 제한이 없다
+	const TRASH_AUTO_MAX = 300;
+	// 화자 색 개수 (0..7)
+	const CAST_COLORS = 8;
+
+	// 디코딩 결과 인코딩의 표시 이름 (확인창·가져오기 창)
+	function encodingLabel(enc) {
+		const e = String(enc == null ? "" : enc).toLowerCase();
+		if (e === "euc-kr") return "CP949";
+		if (e === "utf-16le") return "UTF-16 LE";
+		if (e === "utf-16be") return "UTF-16 BE";
+		if (e === "utf-8") return "UTF-8";
+		return String(enc == null ? "" : enc);
+	}
+	// 레거시 경로에서 목록을 바꾸기 전에 확인을 받아야 하는가 (UTF-8이 아니거나 깨진 글자가 있다)
+	function needsEncodingConfirm(dec) {
+		return !!dec && (dec.encoding !== "utf-8" || dec.replaced > 0);
+	}
+	// "C12" → 12, 형식이 아니면 0
+	function castKeyNum(k) {
+		const m = /^C(\d+)$/.exec(String(k == null ? "" : k));
+		return m ? parseInt(m[1], 10) : 0;
+	}
+	// 화자 키를 C번호 순으로 (새 배열)
+	function sortCastKeys(keys) {
+		return (keys || []).slice().sort((a, b) => (castKeyNum(a) - castKeyNum(b)) || (a < b ? -1 : a > b ? 1 : 0));
+	}
+	// 아직 아무 화자도 쓰지 않은 첫 색 (0..7). 모두 쓰였으면 화자 수 % 8
+	function castColorFree(cast) {
+		const used = {};
+		const keys = cast && typeof cast === "object" ? Object.keys(cast) : [];
+		keys.forEach((k) => { if (cast[k] && typeof cast[k].color === "number") used[cast[k].color] = true; });
+		for (let c = 0; c < CAST_COLORS; c++) if (!used[c]) return c;
+		return keys.length % CAST_COLORS;
+	}
+	// SRT 열기 경로 (계획서 §3.4)
+	//   o.castEnabled  여러 파일 가져오기 플래그
+	//   o.files        [{key, ambiguous}] (parseCaptionKey 결과)
+	//   o.castEmpty    화자 표가 비었다
+	//   o.legacyLive   화자(spk) 없는 살아 있는 줄 수
+	// → "legacy"      첫 파일 하나를 v27 교체 본문으로
+	//   "modal"       'SRT 가져오기' 창
+	//   "distribute"  C번호 파일 + 화자 없는 기존 줄 (기존 목록 나누기)
+	function srtImportRoute(o) {
+		const files = (o && o.files) || [];
+		if (!o || !o.castEnabled || !files.length) return "legacy";
+		const f0 = files[0] || {};
+		if (files.length === 1 && !f0.key && !f0.ambiguous && o.castEmpty) return "legacy";
+		if (o.legacyLive > 0) return "distribute";
+		return "modal";
+	}
+	// 줄 목록을 (시작 시각, 화자 순서)로 안정 정렬한다 (제자리). 화자 없는 줄은 화자 줄보다 앞
+	function sortRowsByTime(subtitles, castOrder) {
+		const order = castOrder || [];
+		const rank = (s) => (s && s.spk ? order.indexOf(s.spk) : -1);
+		return subtitles.sort((a, b) => ((a.startSec || 0) - (b.startSec || 0)) || (rank(a) - rank(b)));
+	}
+	// 화자 K(없으면 null = 화자 없는 줄)의 줄 번호(index)를 목록 순서대로 1..n으로 다시 매긴다 (제자리)
+	function renumberRows(subtitles, key) {
+		let n = 0;
+		subtitles.forEach((s) => { if (s && (key ? s.spk === key : !s.spk)) s.index = ++n; });
+	}
+	// 자동 휴지통 항목(why merge|replace)이 max를 넘으면 오래된(at) 것부터 버린다 (제자리). → 버린 수
+	function trimAutoTrash(trashBin, max) {
+		const lim = typeof max === "number" ? max : TRASH_AUTO_MAX;
+		const auto = trashBin.filter((t) => t && (t.why === "merge" || t.why === "replace"));
+		if (auto.length <= lim) return 0;
+		const drop = auto.slice().sort((a, b) => (a.at || 0) - (b.at || 0)).slice(0, auto.length - lim);
+		for (let i = trashBin.length - 1; i >= 0; i--) if (drop.indexOf(trashBin[i]) !== -1) trashBin.splice(i, 1);
+		return drop.length;
+	}
+	// 화자 K의 살아 있는 줄을 모두 휴지통으로 (why, at). position은 옮기기 전 자리 → 옮긴 줄 수
+	function moveKeyToTrash(data, key, why, now) {
+		const hit = [];
+		data.subtitles.forEach((s, i) => { if (s && (key ? s.spk === key : !s.spk)) hit.push(i); });
+		hit.forEach((i) => {
+			const s = data.subtitles[i];
+			const st = data.rowStates[s.id] || { presetId: "", params: [], _allParams: [], open: false, checked: false };
+			data.trashBin.push({ sub: s, state: st, position: i, why, at: now });
+		});
+		for (let k = hit.length - 1; k >= 0; k--) {
+			const s = data.subtitles[hit[k]];
+			data.subtitles.splice(hit[k], 1);
+			delete data.rowStates[s.id];
+		}
+		return hit.length;
+	}
+	// 파싱한 자막(parseSRT opts 결과)을 화자 K의 새 줄로 넣는다. id = nextId++. → 새 id 배열
+	// 줄 모양은 v27 {index…text, id} 뒤에 spk, srtNo (index는 호출한 쪽이 다시 매긴다)
+	function addCueRows(data, key, cues, presetId, extra) {
+		const ids = [];
+		(cues || []).forEach((c) => {
+			const id = data.nextId++;
+			const sub = { index: c.index, startTime: c.startTime, endTime: c.endTime, startSec: c.startSec, endSec: c.endSec, text: c.text, id };
+			if (key) sub.spk = key;
+			if (c.srtNo !== undefined && c.srtNo !== null) sub.srtNo = c.srtNo;
+			data.subtitles.push(sub);
+			data.rowStates[id] = Object.assign({ presetId: presetId || "", params: [], _allParams: [], open: false, checked: false }, extra || {});
+			ids.push(id);
+		});
+		return ids;
+	}
+	// 가져오기 작업을 세션 데이터에 적용한다. data를 바꾼다 (호출한 쪽이 사본을 넘기고, 바뀌었으면 상태에 넣는다).
+	//   data  {subtitles, rowStates, trashBin, nextId, mi}
+	//   job   {files: [{key, name, presetId, action: "new"|"replace", file: {name, path, size, mtime}, cues}]}
+	//         cues = parseSRT(text, {keepNo, stripTags}). 키가 없거나 자막이 0개인 파일은 건너뛴다
+	//   ctx   {now, salt: mi.salt가 비었을 때 쓸 값, presets: 살아 있는 프리셋 (없는 presetId는 쓰지 않는다)}
+	// 화자 만들기: 이름 = 입력 > 키, 트랙 자동(null), 색 = 비어 있는 첫 색, castOrder는 C번호 순.
+	// 이미 있는 화자의 "replace"는 그 화자의 살아 있는 줄을 휴지통(why "replace")으로 보내고 새로 넣는다.
+	// → {files: [{key, action, count, name}]}
+	function importIntoData(data, job, ctx) {
+		const c = ctx || {};
+		const now = typeof c.now === "number" ? c.now : 0;
+		const mi = data.mi;
+		const presetOk = (pid) => !!pid && (!c.presets || !!c.presets[pid]);
+		const report = { files: [] };
+		const files = ((job && job.files) || []).filter((f) => f && f.key && Array.isArray(f.cues) && f.cues.length > 0);
+		if (!files.length) return report;
+		if (!mi.salt) mi.salt = c.salt || "";
+		const touched = {};
+		files.forEach((f) => {
+			const K = f.key;
+			const nm = String(f.name == null ? "" : f.name).trim();
+			const fi = f.file || {};
+			let cast = mi.cast[K];
+			const exists = !!cast;
+			if (!exists) {
+				cast = { name: nm || K, track: null, autoTrack: null, presetId: presetOk(f.presetId) ? f.presetId : "", color: castColorFree(mi.cast),
+					file: fi.name || "", path: fi.path || null, size: typeof fi.size === "number" ? fi.size : null, mtime: typeof fi.mtime === "number" ? fi.mtime : null, pos: null };
+				mi.cast[K] = cast;
+			} else {
+				if (nm) cast.name = nm;
+				if (f.presetId !== undefined) cast.presetId = presetOk(f.presetId) ? f.presetId : "";
+				cast.file = fi.name || cast.file || "";
+				cast.path = fi.path || null;
+				cast.size = typeof fi.size === "number" ? fi.size : null;
+				cast.mtime = typeof fi.mtime === "number" ? fi.mtime : null;
+			}
+			if (mi.castOrder.indexOf(K) === -1) mi.castOrder.push(K);
+			if (exists) moveKeyToTrash(data, K, "replace", now);
+			addCueRows(data, K, f.cues, cast.presetId);
+			touched[K] = true;
+			report.files.push({ key: K, action: exists ? "replace" : "new", count: f.cues.length, name: cast.name });
+		});
+		mi.castOrder = sortCastKeys(mi.castOrder);
+		sortRowsByTime(data.subtitles, mi.castOrder);
+		Object.keys(touched).forEach((K) => renumberRows(data.subtitles, K));
+		trimAutoTrash(data.trashBin, TRASH_AUTO_MAX);
+		return report;
+	}
+
 	// ── 표시·시간 ──
 
 	// 사람이 읽는 줄 주소: 단일 화자 "#12", 다화자 "C2·12". 파싱할 때마다 바뀌므로 쓰기 주소로 쓰지 않는다
@@ -1674,6 +1833,9 @@
 		msgEl.textContent = message;
 		btnYes.textContent = (opts && opts.yes) || "확인";
 		btnNo.textContent = (opts && opts.no) || "취소";
+		// 세 번째 버튼(#confirmAlt)은 showChoice만 쓴다
+		const btnAlt = document.getElementById("confirmAlt");
+		if (btnAlt) { btnAlt.style.display = "none"; btnAlt.onclick = null; }
 		overlay.classList.add("open");
 		const cleanup = () => {
 			overlay.classList.remove("open");
@@ -1690,6 +1852,44 @@
 		};
 		btnYes.onclick = yesHandler;
 		btnNo.onclick = noHandler;
+	}
+	// 선택지가 둘이나 셋인 확인창. buttons: [{label, run}] 앞에서부터
+	//   첫째 → #confirmYes (주 버튼), (셋이면) 둘째 → #confirmAlt, 마지막 → #confirmNo (취소 자리)
+	// 예: showChoice("이미 후반 작업(프리셋)이 있는 자막 목록입니다.", [{label: "병합 (후반 작업 유지)", run: a}, {label: "교체 (지금까지 방식)", run: b}, {label: "취소", run: c}])
+	// 창이 없으면(테스트 DOM 등) 브라우저 confirm으로 첫째/마지막만 고른다.
+	function showChoice(message, buttons) {
+		const list = (buttons || []).filter(Boolean).slice(0, 3);
+		const run = (b) => { if (b && typeof b.run === "function") b.run(); };
+		const overlay = document.getElementById("confirmModal");
+		const msgEl = document.getElementById("confirmMessage");
+		const btnYes = document.getElementById("confirmYes");
+		const btnNo = document.getElementById("confirmNo");
+		const btnAlt = document.getElementById("confirmAlt");
+		if (!overlay || !msgEl || !btnYes || !btnNo || !btnAlt || list.length < 2) {
+			if (confirm(message)) run(list[0]);
+			else run(list[list.length - 1]);
+			return;
+		}
+		const first = list[0];
+		const last = list[list.length - 1];
+		const mid = list.length === 3 ? list[1] : null;
+		msgEl.textContent = message;
+		btnYes.textContent = first.label;
+		btnNo.textContent = last.label;
+		btnAlt.textContent = mid ? mid.label : "";
+		btnAlt.style.display = mid ? "" : "none";
+		overlay.classList.add("open");
+		const done = (b) => () => {
+			overlay.classList.remove("open");
+			btnYes.textContent = "확인";
+			btnNo.textContent = "취소";
+			btnAlt.style.display = "none";
+			btnAlt.onclick = null;
+			run(b);
+		};
+		btnYes.onclick = done(first);
+		btnNo.onclick = done(last);
+		btnAlt.onclick = mid ? done(mid) : null;
 	}
 	function showAlert(message, onOk) {
 		const overlay = document.getElementById("alertModal");
@@ -4583,7 +4783,8 @@ var modalState = {
 		chkWrap.appendChild(chk);
 		const numEl = document.createElement("span");
 		numEl.className = "sub-num";
-		numEl.textContent = String(sub.index);
+		// 화자 줄은 "C2·12" (번호는 화자 안에서 매긴다). 화자 없는 줄은 v27 그대로 "12"
+		numEl.textContent = sub.spk && _castMode() ? rowLabel(sub, true) : String(sub.index);
 		const timeEl = document.createElement("span");
 		timeEl.className = "sub-time";
 		timeEl.textContent = sub.startTime + " → " + sub.endTime;
@@ -4903,6 +5104,11 @@ var modalState = {
 	}
 	async function updateSingleClip(sub) {
 		const rs = state.rowStates[sub.id];
+		// 화자 줄은 v27 한 트랙 경로로 보내지 않는다 (화자별 트랙 배치는 S2-4)
+		if (sub.spk) {
+			_setStatus(CAST_APPLY_PENDING_MSG, "err");
+			return;
+		}
 		if (!rs.presetId) {
 			_setStatus("프리셋이 선택되지 않았습니다.", "err");
 			return;
@@ -5048,6 +5254,443 @@ var modalState = {
 		return false;
 	}
 	//#endregion
+	//#region src/ui/importDialog.ts
+	// ─────────────────────────────────────────────────────────────
+	// SRT 열기 라우터와 'SRT 가져오기' 창 (#importModal)
+	//
+	// #srtInput에서 고른 파일은 모두 _onSrtFilesChosen을 지난다:
+	//   readAsArrayBuffer → decodeSrtBytes → parseSRT(text, {keepNo, stripTags}) → parseCaptionKey
+	// 경로는 core srtImportRoute (계획서 §3.4):
+	//   legacy      플래그 꺼짐(운영), 또는 C번호 없는 파일 하나 + 화자 표 없음.
+	//               첫 파일 하나를 v27 교체 본문(_legacyReplace, parseSRT opts 없음)으로 읽는다.
+	//               UTF-8이 아니거나 깨진 글자가 있으면 목록을 바꾸기 전에 첫 자막 미리보기와 함께 묻는다
+	//   modal       2개 이상 | C번호 | 화자 표 있음 → 'SRT 가져오기' 창 → _importIntoCast
+	//   distribute  C번호 파일 + 화자 없는 기존 줄 → 기존 목록 나누기 (S1-8). 이 커밋에서는 거부한다
+	// 여러 파일 가져오기는 S2-4까지 플래그(MI_CAST_ENABLED) 뒤에 있다. DEV·하드 테스트는
+	// 코드를 고치지 않고 window._mogrtDebug.setMiCast(true)로 켠다.
+	// 화자 이름은 파일 이름에서 가져오지 않는다 (입력 > 키).
+	// ─────────────────────────────────────────────────────────────
+	function _miCastEnabled() {
+		return MI_CAST_ENABLED || !!(window._mogrtDebug && window._mogrtDebug.miCast === true);
+	}
+	// #srtInput의 multiple을 플래그에 맞춘다 (플래그가 꺼져 있으면 속성 없음 = v27)
+	function _syncSrtInputMultiple() {
+		const input = document.getElementById("srtInput");
+		if (input) input.multiple = _miCastEnabled();
+	}
+	window._mogrtDebug.setMiCast = (on) => {
+		window._mogrtDebug.miCast = on === true;
+		_syncSrtInputMultiple();
+		return _miCastEnabled();
+	};
+	// File → {name, path, size, mtime, bytes}. path는 CEP의 File.path(없으면 null, 슬래시로), mtime은 lastModified(ms)
+	function _readSrtFile(file) {
+		return new Promise((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = (ev) => {
+				const p = typeof file.path === "string" && file.path ? file.path.replace(/\\/g, "/") : null;
+				const bytes = new Uint8Array(ev.target.result);
+				resolve({ name: String(file.name || ""), path: p, size: typeof file.size === "number" ? file.size : bytes.length, mtime: typeof file.lastModified === "number" ? file.lastModified : null, bytes });
+			};
+			reader.onerror = () => reject(new Error("SRT 읽기 실패: " + file.name));
+			reader.readAsArrayBuffer(file);
+		});
+	}
+	// 읽은 파일 하나 → {file: {name, path, size, mtime}, dec: {encoding, replaced}, text, cues, capKey}
+	function _analyzeSrt(f) {
+		const d = decodeSrtBytes(f.bytes);
+		return {
+			file: { name: f.name, path: f.path || null, size: typeof f.size === "number" ? f.size : f.bytes.length, mtime: typeof f.mtime === "number" ? f.mtime : null },
+			dec: { encoding: d.encoding, replaced: d.replaced },
+			text: d.text,
+			cues: parseSRT(d.text, { keepNo: true, stripTags: true }),
+			capKey: parseCaptionKey(f.name)
+		};
+	}
+	// #srtInput 처리기: 파일을 읽어 경로대로 보낸다. 플래그가 꺼져 있으면 첫 파일 하나만 읽는다
+	async function _onSrtFilesChosen(files) {
+		// 부팅 게이트: 시퀀스 키가 정해지기 전에는 열지 않는다 (label은 disabled지만 이중으로 막는다)
+		if (!_keysResolved) {
+			setStatus("시퀀스를 열면 SRT를 열 수 있습니다", "err");
+			return null;
+		}
+		const list = Array.from(files || []).filter(Boolean);
+		if (!list.length) return null;
+		let read;
+		try {
+			read = await Promise.all((_miCastEnabled() ? list : list.slice(0, 1)).map(_readSrtFile));
+		} catch (e) {
+			setStatus("SRT 읽기 실패", "err");
+			return null;
+		}
+		return _routeSrtImport(read);
+	}
+	// 읽은 파일들 → 경로를 정해 처리를 시작한다 (확인창·가져오기 창은 열기만 하고 돌아온다)
+	// → {route, files: [{name, key, ambiguous, encoding, replaced, cues}]}
+	function _routeSrtImport(read) {
+		const ans = read.map(_analyzeSrt);
+		const legacyLive = state.subtitles.filter((s) => !s.spk).length;
+		const route = srtImportRoute({ castEnabled: _miCastEnabled(), files: ans.map((a) => a.capKey), castEmpty: !_castMode(), legacyLive });
+		const summary = {
+			route,
+			files: ans.map((a) => ({ name: a.file.name, key: a.capKey.key, ambiguous: a.capKey.ambiguous, encoding: a.dec.encoding, replaced: a.dec.replaced, cues: a.cues.length }))
+		};
+		if (route === "legacy") _legacyImport(ans[0]);
+		else if (route === "distribute") {
+			// 기존 목록(화자 없는 줄)을 화자로 나누는 분배는 S1-8. 그 전에는 목록을 건드리지 않는다
+			setStatus("기존 목록 나누기는 다음 단계에서 지원", "err");
+			showAlert("기존 목록 나누기는 다음 단계에서 지원합니다.\n\n지금 목록에 화자 없는 자막 " + legacyLive + "줄이 있어 캡션 트랙 번호(C1, C2…) 파일을 더할 수 없습니다. 목록은 그대로입니다.");
+		} else _openImportModal(ans);
+		return summary;
+	}
+
+	// ── 레거시 경로 (v27) ──
+
+	// 한 줄 미리보기 (확인창)
+	function _cuePreview(text, max) {
+		const t = String(text == null ? "" : text).replace(/\r\n?|\n|[\u2028\u2029]/g, " / ");
+		const n = max || 60;
+		return t.length > n ? t.slice(0, n - 1) + "…" : t;
+	}
+	// 인코딩 확인 문구: "‘인터뷰.srt’를 CP949로 읽었습니다." / "‘인터뷰.srt’에 깨진 글자 3개가 있습니다 (UTF-8로 읽음)." + 첫 자막
+	function _encodingMessage(an) {
+		const q = "‘" + an.file.name + "’";
+		const lines = [];
+		if (an.dec.encoding !== "utf-8") {
+			lines.push(q + "를 " + encodingLabel(an.dec.encoding) + "로 읽었습니다.");
+			if (an.dec.replaced > 0) lines.push("깨진 글자 " + an.dec.replaced + "개가 있습니다.");
+		} else lines.push(q + "에 깨진 글자 " + an.dec.replaced + "개가 있습니다 (UTF-8로 읽음).");
+		const first = parseSRT(an.text)[0];
+		lines.push("", "첫 자막: " + (first ? first.startTime + "  " + _cuePreview(first.text) : "(자막 없음)"), "", "이대로 가져올까요? (지금 목록은 바뀝니다)");
+		return lines.join("\n");
+	}
+	// 레거시 가져오기: UTF-8이 아니거나 깨진 글자가 있으면 목록을 바꾸기 전에 묻는다
+	function _legacyImport(an) {
+		const go = () => _legacyReplace(an.file.name, an.text);
+		if (!needsEncodingConfirm(an.dec)) {
+			go();
+			return;
+		}
+		showChoice(_encodingMessage(an), [
+			{ label: "가져오기", run: go },
+			{ label: "취소", run: () => setStatus("SRT 가져오기 취소: " + an.file.name, "") }
+		]);
+	}
+	// v27 교체 본문: 목록·휴지통을 새 파일로 바꾼다 (parseSRT opts 없음 → v27과 같은 줄).
+	// 바꾸기 전에 안전 지점을 남기고(빈 목록이면 남기지 않는다), nextId는 되돌리지 않는다
+	function _legacyReplace(fileName, text) {
+		const parsed = parseSRT(text);
+		// 지금 목록(과 휴지통)을 비우기 전에 안전 지점을 남긴다 (히스토리 드롭다운 '안전 지점'에서 되돌린다)
+		_saveSafety("SRT 가져오기 전: " + fileName);
+		// 아래 push 루프와 rowStates 구성이 끝난 뒤 saveSessionToStorage()가
+		// 한 번 돈다. 여기서 저장하면 빈 배열이 먼저 쓰인다.
+		// nextId는 되돌리지 않는다: 같은 시퀀스에서 id(→ 클립 태그·applied)가 다시 쓰이지 않게
+		setSubtitles([], { reason: "SRT 로드", persist: false });
+		state.rowStates = {};
+		state.trashBin = [];
+		parsed.forEach((p) => {
+			const id = state.nextId++;
+			state.subtitles.push({
+				...p,
+				id
+			});
+			state.rowStates[id] = {
+				presetId: "",
+				params: [],
+				_allParams: [],
+				open: false,
+				checked: false
+			};
+		});
+		_raiseHwm();
+		renderAll();
+		renderTrash();
+		updateMultiSelect();
+		saveSessionToStorage();
+		_saveHistoryOnAction("SRT 로드: " + fileName);
+		setStatus("SRT 로드: " + fileName + " (" + state.subtitles.length + "개)", "ok");
+	}
+
+	// ── 'SRT 가져오기' 창 ──
+
+	// 창 상태: {entries: [{an, key, name, presetId, action, nameTouched, presetTouched}]} | null
+	var _imp = null;
+	// 캡션 트랙 선택지는 적어도 C1..C12 (화자 표·파일 이름에 더 큰 번호가 있으면 거기까지)
+	const IMP_KEYS_MIN = 12;
+	const IMP_ACTION_LABEL = { new: "새 화자", replace: "교체", skip: "건너뜀" };
+	function _openImportModal(ans) {
+		const modal = document.getElementById("importModal");
+		if (!modal) {
+			setStatus("가져오기 창이 없습니다", "err");
+			return;
+		}
+		_imp = {
+			entries: ans.map((an) => {
+				const en = { an, key: an.capKey.key || "", name: "", presetId: "", action: "", nameTouched: false, presetTouched: false };
+				_impDefaults(en);
+				return en;
+			})
+		};
+		_renderImportModal();
+		modal.classList.add("open");
+	}
+	function _closeImportModal() {
+		const modal = document.getElementById("importModal");
+		if (modal) modal.classList.remove("open");
+		_imp = null;
+	}
+	// 키를 고를 때마다: 이미 있는 화자면 그 이름·기본 프리셋을 기본값으로, 처리는 새 화자 / 교체 / 건너뜀
+	function _impDefaults(en) {
+		const cast = en.key ? state.mi.cast[en.key] : null;
+		if (!en.nameTouched) en.name = cast ? String(cast.name || "") : "";
+		if (!en.presetTouched) en.presetId = cast ? String(cast.presetId || "") : "";
+		en.action = !en.an.cues.length ? "skip" : !en.key ? "" : cast ? "replace" : "new";
+	}
+	// 기본 프리셋 선택지: 캡션 필드('T' 버튼)가 있는 프리셋만 → [[id, 이름]]
+	function _impPresetChoices() {
+		return Object.keys(state.presets).filter((id) => captionFid(state.presets[id]) !== null).map((id) => [id, state.presets[id].name || id]);
+	}
+	function _impKeyChoices() {
+		let max = IMP_KEYS_MIN;
+		const see = (k) => { const n = castKeyNum(k); if (n > max) max = n; };
+		Object.keys(state.mi.cast || {}).forEach(see);
+		_imp.entries.forEach((en) => {
+			see(en.key);
+			(en.an.capKey.nums || []).forEach((n) => see("C" + n));
+		});
+		const out = [];
+		for (let i = 1; i <= max; i++) out.push("C" + i);
+		return out;
+	}
+	// 파일 칸의 인코딩 표시 ("CP949로 읽음" / "깨진 글자 N개")
+	function _impEncodingHint(dec) {
+		const parts = [];
+		if (dec.encoding !== "utf-8") parts.push(encodingLabel(dec.encoding) + "로 읽음");
+		if (dec.replaced > 0) parts.push("깨진 글자 " + dec.replaced + "개");
+		return parts.join(" · ");
+	}
+	// 파일 아래 줄의 안내 (키 없음·모호, 교체될 줄 수)
+	function _impInfo(en) {
+		if (!en.an.cues.length) return "";
+		if (!en.key) {
+			return en.an.capKey.ambiguous
+				? "파일 이름에 캡션 트랙 번호가 여럿입니다 (" + en.an.capKey.nums.map((n) => "C" + n).join("·") + ") — 하나를 고르세요"
+				: "파일 이름에 캡션 트랙 번호(C1, C2…)가 없습니다 — 고르세요";
+		}
+		if (en.action === "replace") {
+			const n = state.subtitles.filter((s) => s.spk === en.key).length;
+			return "지금 " + en.key + " 줄 " + n + "개는 휴지통으로 갑니다 (병합은 다음 단계에서 지원)";
+		}
+		return "";
+	}
+	// → {ok, error, dup: {키: true}}
+	function _validateImport() {
+		const out = { ok: false, error: "", dup: {} };
+		if (!_imp) return out;
+		const live = _imp.entries.filter((en) => en.an.cues.length > 0);
+		const count = {};
+		live.forEach((en) => { if (en.key) count[en.key] = (count[en.key] || 0) + 1; });
+		const dupKeys = sortCastKeys(Object.keys(count).filter((k) => count[k] > 1));
+		dupKeys.forEach((k) => { out.dup[k] = true; });
+		const missing = live.filter((en) => !en.key);
+		if (!live.length) out.error = "가져올 자막이 없습니다 (자막 없는 파일은 건너뜁니다)";
+		else if (dupKeys.length) out.error = dupKeys.join(", ") + "가 " + (dupKeys.some((k) => count[k] > 2) ? "여러" : "두") + " 파일에 지정되었습니다";
+		else if (missing.length) out.error = "캡션 트랙을 고르세요: " + missing.map((en) => en.an.file.name).join(", ");
+		out.ok = !out.error;
+		return out;
+	}
+	function _renderImportModal() {
+		const body = document.getElementById("impBody");
+		if (!body || !_imp) return;
+		body.innerHTML = "";
+		const v = _validateImport();
+		const keys = _impKeyChoices();
+		const presets = _impPresetChoices();
+		const cell = (cls) => {
+			const td = document.createElement("td");
+			if (cls) td.className = cls;
+			return td;
+		};
+		const option = (sel, value, text) => {
+			const o = document.createElement("option");
+			o.value = value;
+			o.textContent = text;
+			sel.appendChild(o);
+		};
+		_imp.entries.forEach((en, i) => {
+			const empty = !en.an.cues.length;
+			const tr = document.createElement("tr");
+			tr.className = "imp-row" + (!empty && v.dup[en.key] ? " imp-dup" : "") + (empty ? " imp-empty" : "");
+			tr.dataset.idx = String(i);
+			// 파일
+			const tdF = cell("imp-file");
+			tdF.title = en.an.file.path || en.an.file.name;
+			const fname = document.createElement("span");
+			fname.textContent = en.an.file.name;
+			tdF.appendChild(fname);
+			const hint = _impEncodingHint(en.an.dec);
+			if (hint) {
+				const h = document.createElement("span");
+				h.className = "imp-hint";
+				h.textContent = hint;
+				tdF.appendChild(h);
+			}
+			// 캡션 트랙
+			const tdK = cell();
+			const selK = document.createElement("select");
+			selK.className = "imp-key";
+			option(selK, "", "-- 선택 --");
+			keys.forEach((k) => option(selK, k, k));
+			selK.value = en.key;
+			selK.disabled = empty;
+			selK.addEventListener("change", () => {
+				en.key = selK.value;
+				_impDefaults(en);
+				_renderImportModal();
+			});
+			tdK.appendChild(selK);
+			// 화자 이름 (비우면 키)
+			const tdN = cell();
+			const inp = document.createElement("input");
+			inp.type = "text";
+			inp.className = "imp-name";
+			inp.placeholder = "화자 이름";
+			inp.value = en.name;
+			inp.disabled = empty;
+			inp.addEventListener("input", () => {
+				en.name = inp.value;
+				en.nameTouched = true;
+			});
+			tdN.appendChild(inp);
+			// 기본 프리셋 (캡션 필드가 있는 프리셋만)
+			const tdP = cell();
+			const selP = document.createElement("select");
+			selP.className = "imp-preset";
+			option(selP, "", "-- 없음 --");
+			presets.forEach(([id, name]) => option(selP, id, name));
+			if (!presets.some((p) => p[0] === en.presetId)) en.presetId = "";
+			selP.value = en.presetId;
+			selP.disabled = empty;
+			selP.addEventListener("change", () => {
+				en.presetId = selP.value;
+				en.presetTouched = true;
+			});
+			tdP.appendChild(selP);
+			// 줄 수, 처리
+			const tdC = cell("imp-count");
+			tdC.textContent = empty ? "자막 없음" : en.an.cues.length + "줄";
+			const tdA = cell("imp-action");
+			tdA.textContent = IMP_ACTION_LABEL[en.action] || "";
+			[tdF, tdK, tdN, tdP, tdC, tdA].forEach((td) => tr.appendChild(td));
+			body.appendChild(tr);
+			const info = _impInfo(en);
+			if (info) {
+				const tr2 = document.createElement("tr");
+				tr2.className = "imp-detail";
+				const td = cell();
+				td.colSpan = 6;
+				const sp = document.createElement("span");
+				sp.className = "imp-info";
+				sp.textContent = info;
+				td.appendChild(sp);
+				tr2.appendChild(td);
+				body.appendChild(tr2);
+			}
+		});
+		const err = document.getElementById("impError");
+		if (err) err.textContent = v.error;
+		const ok = document.getElementById("impOk");
+		if (ok) {
+			ok.disabled = !v.ok;
+			ok.textContent = "가져오기";
+		}
+	}
+	function _onImportOk() {
+		if (!_imp) return;
+		const v = _validateImport();
+		if (!v.ok) {
+			_renderImportModal();
+			return;
+		}
+		const job = {
+			files: _imp.entries.filter((en) => en.an.cues.length > 0 && en.key).map((en) => ({
+				key: en.key, name: en.name, presetId: en.presetId, action: en.action, file: en.an.file, cues: en.an.cues
+			}))
+		};
+		_closeImportModal();
+		_importIntoCast(job);
+	}
+	document.getElementById("impOk")?.addEventListener("click", _onImportOk);
+	document.getElementById("impCancel")?.addEventListener("click", () => {
+		_closeImportModal();
+		setStatus("SRT 가져오기 취소", "");
+	});
+
+	// ── 적용 ──
+
+	// 세션 데이터 사본 (가져오기 계산은 사본에서 하고, 바뀌었을 때만 상태에 넣는다)
+	function _sessionClone() {
+		return JSON.parse(JSON.stringify({ subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi }));
+	}
+	// 바뀌었는가를 가르는 서명 (salt만 새로 만든 것은 바뀐 것이 아니다)
+	function _sessionDataSig(d) {
+		const mi = d.mi || {};
+		return stableJson({ s: d.subtitles, r: d.rowStates, t: d.trashBin, c: mi.cast, o: mi.castOrder, l: mi.legacyTrack });
+	}
+	// 사본을 상태에 넣고 그리고 저장한다 (session.json + cast.json)
+	function _commitSessionData(data, reason) {
+		setSubtitles(data.subtitles, { reason, persist: false });
+		state.rowStates = data.rowStates;
+		state.trashBin = data.trashBin;
+		state.nextId = data.nextId;
+		state.mi = data.mi;
+		_raiseHwm();
+		renderAll();
+		renderTrash();
+		updateMultiSelect();
+		saveSessionToStorage();
+	}
+	// 4자 [a-z0-9] salt (uid = salt-id, 클립 태그의 앞부분)
+	function _mintSalt() {
+		const abc = "abcdefghijklmnopqrstuvwxyz0123456789";
+		const buf = new Uint8Array(4);
+		try {
+			window.crypto.getRandomValues(buf);
+		} catch (_) {
+			for (let i = 0; i < 4; i++) buf[i] = Math.floor(Math.random() * 256);
+		}
+		let s = "";
+		for (let i = 0; i < 4; i++) s += abc[buf[i] % 36];
+		return s;
+	}
+	// salt가 비었을 때 쓸 값: 쓸 만한 cast.json의 salt(v27이 mi를 버리고 저장한 뒤 등), 없으면 새로 만든다
+	function _saltForImport() {
+		try {
+			const path = _getCastPath();
+			const side = path ? _fsRead(path) : null;
+			if (side && /^[a-z0-9]{4}$/.test(String(side.salt || "")) && castSidecarUsable({ subtitles: state.subtitles }, side)) return side.salt;
+		} catch (_) {}
+		return _mintSalt();
+	}
+	// 가져오기 창의 결과를 화자 표·목록에 넣는다 (새 화자 / 교체).
+	// 안전 지점 하나(바꾸기 전) → 사본에 적용 → 상태·session.json·cast.json → 자동 항목 하나(바꾼 뒤)
+	function _importIntoCast(job) {
+		const data = _sessionClone();
+		const before = _sessionDataSig(data);
+		const report = importIntoData(data, job, { now: Date.now(), salt: state.mi.salt || _saltForImport(), presets: state.presets });
+		if (_sessionDataSig(data) === before) {
+			setStatus("변경 없음", "");
+			return report;
+		}
+		const files = job.files.slice().sort((a, b) => castKeyNum(a.key) - castKeyNum(b.key));
+		_saveSafety("SRT 가져오기 전: " + files.map((f) => f.key + " " + f.file.name).join(" · "));
+		_commitSessionData(data, "SRT 가져오기");
+		const label = "SRT 가져오기: " + report.files.slice().sort((a, b) => castKeyNum(a.key) - castKeyNum(b.key)).map((f) => f.key + " " + f.name + "(" + f.count + ")").join(" · ");
+		_saveHistoryOnAction(label);
+		setStatus(label, "ok");
+		return report;
+	}
+	//#endregion
 	//#region src/mi/commands.ts
 	// ─────────────────────────────────────────────────────────────
 	// 헤드리스 명령: runCommand(op, args, ctx) → Promise<{ok:true, data} | {ok:false, error, detail}>
@@ -5173,8 +5816,41 @@ var modalState = {
 			return _cmdOk(_cmdClone({ salt: mi.salt, castOrder: mi.castOrder, cast: mi.cast, legacyTrack: mi.legacyTrack, stack: mi.stack, stackDy: mi.stackDy, remapped: mi.remapped }));
 		},
 		// 세션 전체 사본 (읽기 전용)
-		"session.snapshot": () => _cmdOk(_cmdClone({ projKey: state.currentProjectKey, seqKey: state.currentSequenceKey, subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi }))
+		"session.snapshot": () => _cmdOk(_cmdClone({ projKey: state.currentProjectKey, seqKey: state.currentSequenceKey, subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi })),
+		// SRT 가져오기 = #srtInput에서 그 파일들을 고른 것과 같다 (경로에 따라 v27 교체·인코딩 확인창·가져오기 창).
+		// args {files: [{name, b64}]} → {route: legacy|modal|distribute, files: [{name, key, ambiguous, encoding, replaced, cues}]}
+		// 플래그가 꺼져 있으면 첫 파일 하나만 본다. agent는 승인 카드(M5.4) 전까지 needs-approval
+		importSrt: (args, ctx) => {
+			if (ctx.source === "agent") return _cmdErr("needs-approval", "SRT 가져오기는 패널에서 승인해야 합니다");
+			const read = _cmdReadFiles(args.files);
+			if (read.error) return _cmdErr("bad-args", read.error);
+			if (!_keysResolved) return _cmdErr("no-sequence", "시퀀스를 열면 SRT를 열 수 있습니다");
+			return _cmdOk(_cmdClone(_routeSrtImport(_miCastEnabled() ? read.files : read.files.slice(0, 1))));
+		}
 	};
+	// base64 → Uint8Array
+	function _b64ToBytes(b64) {
+		const bin = atob(String(b64).replace(/\s+/g, ""));
+		const out = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+		return out;
+	}
+	// 명령 인자 files: [{name, b64}] → {files: [{name, path, size, mtime, bytes}]} | {error}
+	function _cmdReadFiles(files) {
+		if (!Array.isArray(files) || !files.length) return { error: "files는 [{name, b64}] 배열" };
+		const out = [];
+		for (const f of files) {
+			if (!f || typeof f.name !== "string" || !f.name || typeof f.b64 !== "string") return { error: "files[]는 {name, b64}" };
+			let bytes;
+			try {
+				bytes = _b64ToBytes(f.b64);
+			} catch (_) {
+				return { error: "b64를 풀지 못했다: " + f.name };
+			}
+			out.push({ name: f.name, path: null, size: bytes.length, mtime: null, bytes });
+		}
+		return { files: out };
+	}
 	async function runCommand(op, args, ctx) {
 		const source = ctx && ctx.source !== undefined ? ctx.source : "ui";
 		if (!CMD_SOURCES[source]) return _cmdErr("bad-args", "ctx.source는 ui|test|agent");
@@ -5188,6 +5864,8 @@ var modalState = {
 		}
 	}
 	window._mogrtDebug.cmd = (op, args) => runCommand(op, args, { source: "test" });
+	// 다른 출처로 부른다 (agent가 needs-approval을 받는지 시험할 때)
+	window._mogrtDebug.cmdAs = (source, op, args) => runCommand(op, args, { source });
 	//#endregion
 	//#region src/main.ts
 	function setStatus(msg, cls) {
@@ -5203,54 +5881,15 @@ var modalState = {
 	bindModalEvents();
 	bindTrashEvents();
 	bindPresetViewToggle();
+	// SRT 열기 → 라우터 (src/ui/importDialog.ts). 파일 목록을 먼저 받아 두고 입력을 비운다 (같은 파일을 다시 고를 수 있게)
 	document.getElementById("srtInput")?.addEventListener("change", (e) => {
 		const input = e.target;
-		const file = input.files?.[0];
-		if (!file) return;
-		// 부팅 게이트: 시퀀스 키가 정해지기 전에는 열지 않는다 (label은 disabled지만 이중으로 막는다)
-		if (!_keysResolved) {
-			input.value = "";
-			setStatus("시퀀스를 열면 SRT를 열 수 있습니다", "err");
-			return;
-		}
-		const reader = new FileReader();
-		reader.onload = (ev) => {
-			const text = ev.target?.result;
-			const parsed = parseSRT(text);
-			// 지금 목록(과 휴지통)을 비우기 전에 안전 지점을 남긴다 (히스토리 드롭다운 '안전 지점'에서 되돌린다)
-			_saveSafety("SRT 가져오기 전: " + file.name);
-			// 아래 push 루프와 rowStates 구성이 끝난 뒤 saveSessionToStorage()가
-			// 한 번 돈다. 여기서 저장하면 빈 배열이 먼저 쓰인다.
-			// nextId는 되돌리지 않는다: 같은 시퀀스에서 id(→ 클립 태그·applied)가 다시 쓰이지 않게
-			setSubtitles([], { reason: "SRT 로드", persist: false });
-			state.rowStates = {};
-			state.trashBin = [];
-			parsed.forEach((p) => {
-				const id = state.nextId++;
-				state.subtitles.push({
-					...p,
-					id
-				});
-				state.rowStates[id] = {
-					presetId: "",
-					params: [],
-					_allParams: [],
-					open: false,
-					checked: false
-				};
-			});
-			_raiseHwm();
-			renderAll();
-			renderTrash();
-			updateMultiSelect();
-			saveSessionToStorage();
-			_saveHistoryOnAction("SRT 로드: " + file.name);
-			setStatus("SRT 로드: " + file.name + " (" + state.subtitles.length + "개)", "ok");
-		};
-		reader.onerror = () => setStatus("SRT 읽기 실패", "err");
-		reader.readAsText(file, "UTF-8");
+		const files = input.files ? Array.from(input.files) : [];
 		input.value = "";
+		if (!files.length) return;
+		_onSrtFilesChosen(files);
 	});
+	_syncSrtInputMultiple();
 	// MOGRT 스캔 중복 실행 방지 플래그
 	var _scanInProgress = false;
 	function doScanMogrt(silent) {
@@ -5720,6 +6359,11 @@ var modalState = {
 		}
 		if (state.subtitles.length === 0) {
 			setStatus("먼저 SRT 파일을 열어주세요.", "err");
+			return;
+		}
+		// 화자 줄이 있으면 v27 한 트랙 경로로 보내지 않는다 (화자마다 전용 트랙에 놓는 것은 S2-4)
+		if (state.subtitles.some((s) => s.spk)) {
+			setStatus(CAST_APPLY_PENDING_MSG, "err");
 			return;
 		}
 		const checkedIds = Object.entries(state.rowStates).filter(([, rs]) => rs.checked).map(([id]) => parseInt(id, 10));

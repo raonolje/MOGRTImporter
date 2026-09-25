@@ -141,12 +141,44 @@ function ticksToFrame(ticks, timebase) {
 
 /** #srtInput에 파일 하나를 넣고 change를 보낸다. content: 문자열(UTF-8) 또는 바이트 배열 */
 function pageDropSrt(name, content) {
-	const part = typeof content === "string" ? JSON.stringify(content) : "new Uint8Array(" + JSON.stringify(Array.from(content)) + ")";
+	return pageDropSrts([{ name, content }]);
+}
+
+/**
+ * #srtInput에 여러 파일을 한 번에 넣는다 (다화자 가져오기, S1-7). list: [{name, content}]
+ * 플래그가 꺼져 있으면 패널은 첫 파일만 읽는다 (window._mogrtDebug.setMiCast(true)로 켠다)
+ */
+function pageDropSrts(list) {
+	const parts = list.map((f) => {
+		const part = typeof f.content === "string" ? JSON.stringify(f.content) : "new Uint8Array(" + JSON.stringify(Array.from(f.content)) + ")";
+		return "dt.items.add(new File([" + part + "], " + JSON.stringify(f.name) + "));";
+	}).join(" ");
 	return "(() => { const input = document.getElementById('srtInput'); if (!input) return 'no-input';" +
-		" const dt = new DataTransfer(); dt.items.add(new File([" + part + "], " + JSON.stringify(name) + "));" +
+		" const dt = new DataTransfer(); " + parts +
 		" input.files = dt.files; input.dispatchEvent(new Event('change', { bubbles: true }));" +
 		" return input.disabled ? 'sent-disabled' : 'sent'; })()";
 }
+
+/** 여러 SRT 가져오기 플래그를 켜고 끈다 (DEV 디버그 훅, 코드를 고치지 않는다) → 적용된 값 */
+function pageSetMiCast(on) {
+	return "window._mogrtDebug.setMiCast(" + (on ? "true" : "false") + ")";
+}
+
+/** 'SRT 가져오기' 창의 파일 줄 [{file, key, name, preset, count, action, dup}] + {open, ok, okText, error} */
+const PAGE_IMPORT_MODAL = "(() => { const m = document.getElementById('importModal'); if (!m) return null;" +
+	" const rows = Array.from(document.querySelectorAll('#impBody tr.imp-row')).map((r) => ({" +
+	"  file: (r.querySelector('.imp-file span') || {}).textContent || ''," +
+	"  key: (r.querySelector('.imp-key') || {}).value || ''," +
+	"  name: (r.querySelector('.imp-name') || {}).value || ''," +
+	"  preset: (r.querySelector('.imp-preset') || {}).value || ''," +
+	"  count: (r.querySelector('.imp-count') || {}).textContent || ''," +
+	"  action: (r.querySelector('.imp-action') || {}).textContent || ''," +
+	"  dup: r.classList.contains('imp-dup') }));" +
+	" const ok = document.getElementById('impOk');" +
+	" return { open: m.classList.contains('open'), rows, ok: !!ok && !ok.disabled, okText: ok ? ok.textContent : ''," +
+	"  error: (document.getElementById('impError') || {}).textContent || ''," +
+	"  stats: Array.from(document.querySelectorAll('#impBody .imp-stats')).map((e) => e.textContent)," +
+	"  info: Array.from(document.querySelectorAll('#impBody .imp-info')).map((e) => e.textContent) }; })()";
 
 /** #workInput에 작업 파일(객체 → JSON)을 넣고 change를 보낸다 */
 function pageLoadWork(name, obj) {
@@ -297,7 +329,7 @@ async function devCacheRoot(panel) {
 module.exports = {
 	sleep, waitFor, ticksToFrame,
 	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed, jsxDeletePreviewSequence, jsxCloneActiveAsScratch, jsxDropScratch, withScratchSequence, SCRATCH_PREFIX,
-	pageDropSrt, pageLoadWork, pageCmd, pageSetRowPreset, pageImportPresetsText,
-	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS, PAGE_RECORD_HOST_CALLS,
+	pageDropSrt, pageDropSrts, pageSetMiCast, pageLoadWork, pageCmd, pageSetRowPreset, pageImportPresetsText,
+	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS, PAGE_RECORD_HOST_CALLS, PAGE_IMPORT_MODAL,
 	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot
 };
