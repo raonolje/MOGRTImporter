@@ -18,8 +18,9 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - **글롭 인자가 필수다.** `node --test tests/unit`처럼 폴더를 넘기면 Node 24.14는 폴더를 테스트 파일로 실행하다 실패한다.
 - `tests/lib/loadRegions.js`
   - `loadRegions(["src/srtParser.ts"])`: app.js의 `//#region <이름>` ~ `//#endregion` 블록을 잘라 `node:vm`에서 실행하고 최상위 함수·상수를 돌려준다. 빌드가 없으니 패널이 로드하는 바로 그 파일이다.
+    - 최상위 이름: `function`(`function*`, `async function` 포함), `class`, `var/let/const` 선언 목록 전체(`const A = 1, B = 2`, `const { C, D: E, ...R } = o`, `const [F, , G = 1] = xs`). 블록 안 `var`는 세지 않는다.
   - vm에는 `console`, `TextDecoder`, `TextEncoder`만 있다.
-  - 순수성 가드: 불러오는 region이 `document`, `window`, `state.`, `host.`, `localStorage`, `cep`, `CSInterface`를 쓰면 예외. 주석·문자열 속 단어는 보지 않는다. 새 순수 로직은 `//#region src/mi/core.ts`에 둔다.
+  - 순수성 가드: 불러오는 region이 `document`, `window`, `state.`, `host.`, `localStorage`, `cep`, `CSInterface`를 쓰면 예외. 주석·문자열·템플릿의 글자 부분은 보지 않지만 템플릿 `${ … }` 안의 코드는 본다. 새 순수 로직은 `//#region src/mi/core.ts`에 둔다.
   - `loadHostPure()`: hostscript.jsx의 `/* MI_PURE_BEGIN */`~`/* MI_PURE_END */`(ES3)를 그대로 node에서 실행한다. S2-1 전에는 `{}`.
   - `regionHash(name)`: region 본문의 fnv1a32(8자리 hex). 5단계 MCP 드리프트 검사에 쓴다.
   - vm 객체는 프로토타입이 달라 `assert.deepStrictEqual`이 실패한다. 비교 전에 `plain(v)`를 쓴다.
@@ -30,7 +31,8 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 ## 3. ES3 린트
 
 - `npm run lint:jsx` = `node tests/lib/es3lint.js extension/jsx/hostscript.jsx`. v27 코드는 보지 않고 `/* MI:BEGIN v28 */`~`/* MI:END */`만 본다. 구역이 없으면 통과.
-- 금지: `let`, `const`, `=>`, `class`, 템플릿 문자열, `.forEach/.map/.filter/.some/.every/.reduce(`, `Array.isArray`, 배열 `indexOf`, `.trim(`, `Object.keys/create`(와 ES5 Object.*), `.bind(`, `Date.now`, `.normalize(`, get/set 리터럴, 예약어 속성 이름(`x.default`, `{new: …}`), `JSON.*`(→ `MI__json`, `parsePayload`), ES2015+ 문자열·정적 메서드, 전개, `for…of`, 기본 매개변수.
+- 금지: `let`, `const`, `=>`, `class`, 템플릿 문자열(`${ … }` 안도 검사), `.forEach/.map/.filter/.some/.every/.reduce(`, `Array.isArray`, 배열 `indexOf`, `.trim(`, `Object.keys/create`(와 ES5+ Object.*: `getOwnPropertyDescriptor`, `is`, `fromEntries`, `isFrozen`, `setPrototypeOf` …), `.bind(`, `Date.now`, `.normalize(`, get/set 리터럴, 예약어 속성 이름(`x.default`, `{new: …}`), `JSON.*`(→ `MI__json`, `parsePayload`), ES2015+ 문자열 메서드(`.includes/.padStart/.matchAll/.replaceAll(` …), 배열 메서드(`.find/.findIndex/.fill/.flat/.flatMap/.entries/.keys/.values/.at(` …), `.toISOString/.toJSON(`, 정적 메서드·상수(`Array.from`, `Number.isSafeInteger`, `Number.MAX_SAFE_INTEGER`, `Math.trunc/imul` …), ES2015 전역(`Promise`, `Map` …), 전개, `for…of`, 기본 매개변수.
+- 목록에 없는 ES5+ 내장은 통과하므로 새 호스트 코드에서 낯선 메서드를 쓰면 ES3에 있는지 먼저 확인하고, 없으면 규칙과 실패 픽스처(`tests/unit/es3lint.test.js`)를 같이 늘린다.
 - `indexOf`는 정적으로 배열/문자열을 구분할 수 없다. 수신자가 문자열 리터럴, `String(…)`, `(x + "")`, 문자열 메서드 결과(`.toLowerCase()`, `.join(…)` 등)일 때만 통과한다. 문자열이면 `String(name).indexOf("[MI:")`처럼 감싸고, 배열 멤버십은 `MI__idx(arr, x)`를 쓴다.
 
 ## 4. DEV 사본 (운영과 부딪히지 않게)
@@ -50,6 +52,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   - `--uninstall`: `CEP_MogrtImporter_dev`만 지운다. Premiere가 꺼져 있어야 하고, 폴더의 manifest가 DEV 신원일 때만 지운다.
   - `MI_CEP_EXT_DIR`: extensions 폴더를 바꿔 모의 설치할 때만 쓴다.
 - 클립 태그 `[MI:`에는 밑줄이 없어서 이름 바꾸기에 걸리지 않는다. 태그 정규식은 DEV에서도 그대로다.
+- 식별자가 아닌 `MI_` 이름은 바꾸지 않는다: `MI_test`(`MI_test.prproj`, `MI_test/` 폴더)와 환경 변수 `MI_REAL_CACHE`, `MI_CEP_EXT_DIR`, `MI_BACKUP_ROOT` (`tools/lib/stamp.js`의 `MI_KEEP`). `run.js`가 DEV용 `.jsx`를 바꿀 때도 같은 규칙을 쓰므로, 스파이크·하드 `.jsx`가 `MI_test.prproj`인지 확인하는 코드는 DEV에서도 그대로 동작한다. 새 v28 식별자 이름을 `MI_test…`로 시작하지 않는다(`MI_tests`처럼 뒤에 글자가 더 붙으면 바뀐다).
 - 예전 스크래치 도구 `devswap.sh`(운영을 extensions 밖으로 치우고 7788로 설치)는 쓰지 않는다. 운영을 치워 둔 상태라면 먼저 `devswap.sh off`로 되돌린다.
 
 ### 규칙
@@ -75,10 +78,11 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   - `.expr.txt`: `---` 줄로 나눈 페이지 표현식. top-level `await` 가능. 예외가 나면 실패.
   - `.jsx`: 패널의 `CSInterface`로 `$.evalFile`. DEV에서는 `\bMI_`를 `MID_`로 바꾸고 한글은 `\uXXXX`로 바꾼 임시 사본을 쓴다(상대 `#include`는 안 된다). `EvalScript error.`면 실패.
   - `.case.js`: `module.exports = { run: async ({ panel, host, mi, assert, log, reload, info }) => … }`
-    - `panel(expr)` 페이지에서 평가, `host(jsx)` 호스트에서 평가(문자열), `mi(name, payload)` `MID_<name>("<JSON>")` 호출 후 JSON 파싱. 페이로드는 ASCII 리터럴로 넘겨 U+2028/2029와 한글이 안전하다.
+    - `panel(expr)` 페이지에서 평가, `host(jsx)` 호스트에서 평가(문자열), `mi(name, payload)` `MID_<name>("<JSON>")` 호출 후 JSON 파싱. 패널 `_callMi`와 같은 계약으로 JSON 텍스트의 U+2028/2029를 JSON 이스케이프로 바꾼 뒤(호스트 `JSON.parse` 폴리필은 ES3 `eval`이라 날 문자는 문법 오류) ASCII 리터럴로 넘긴다. 한글도 안전하다.
   - `--check-build`: 설치된 빌드(DEV hostscript의 `MID_BUILD` 또는 `.mi_build`)와 `MID_ping().build`, 패널 `status.build`(있으면)를 비교한다. 호스트에 `MID_ping`이 없으면(S2-1 전) 건너뛴다. 다르면 Premiere를 다시 시작한다.
   - 종료 코드: 0 통과, 1 실패, 2 연결 실패, 3 가드 거부, 64 사용법.
-- **가드**(`tests/premiere/lib/guard.js`): 열린 프로젝트가 `MI_test.prproj`이고 활성 시퀀스 이름이 `T_`로 시작할 때만 `.jsx`·`.case.js`(와 기본으로 `.expr.txt`)를 실행한다. 확인은 v27 `getActiveSequenceInfo()`로 한다.
+- **가드**(`tests/premiere/lib/guard.js`): 열린 프로젝트가 `MI_test.prproj`이고 활성 시퀀스 이름이 `T_`로 시작할 때만 `.jsx`·`.case.js`(와 기본으로 `.expr.txt`)를 실행한다. 확인은 v27 `getActiveSequenceInfo()`로 한다. `--no-guard`는 DEV의 `.expr.txt`에만 쓰고, 실행 전에 열린 프로젝트·시퀀스를 찍는다.
+- **운영(`--prod`, 7777)**: 저장소의 `tests/premiere/smoke.expr.txt`(`cdp.js`의 `PROD_SMOKE_FILES`)와 `--check-build`만 받는다. 다른 파일, `--reload`, `cdp.js --prod --expr-file <다른 파일>`은 거부한다. 운영 페이지는 `window._mogrtDebug._fsWrite`·`saveSession()`과 `evalScript`를 드러내므로 아무 표현식이나 돌리면 운영 캐시나 실제 프로젝트가 바뀔 수 있다. 운영 스모크 표현식을 늘릴 때는 읽기 전용인지 확인하고 `smoke.expr.txt`에 넣는다.
 - `npm run hard` (`tests/premiere/suite.js`): 가드 → `smoke.expr.txt` → `cases/*.case.js`(이름순). `npm run hard -- s1_9`처럼 이름 일부로 거른다.
 - 스모크(`tests/premiere/smoke.expr.txt`, 읽기 전용): `window._mogrtDebug`가 object, `getActiveSequenceInfo()`가 seqId를 돌려준다.
 
@@ -95,6 +99,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   2. `git archive HEAD`로 만든 임시 사본에 `prod-<sha>`를 찍어 CSXS·html·jsx·README.md·.debug를 **지우지 않고 덮어쓴다**. cache/는 대상이 아니다. extension/에 커밋 안 된 변경이 있으면 거부한다.
   3. 복사한 파일을 하나씩 비교하고 캐시 sha1 목록이 배포 전과 같은지 확인한다.
 - `--dry-run`: 바뀔 파일만 보여 주고, 운영 캐시의 파일 수·바이트·최신 mtime·sha1이 그대로인지 확인한다. 운영·백업 폴더에 쓰지 않는다.
+  - 파일 목록: `~` 내용이 바뀜, `=` 줄바꿈만 다름(CR만 빼면 같음), `+` 새 파일. `git archive`는 LF(`.gitattributes` `eol=lf`)로 만들고, 지금 운영 `html/index.html`은 저장소 작업 트리(`git ls-files --eol`에서 `w/mixed`)와 같은 CRLF 사본이라 코드가 같아도 첫 배포와 `--rollback v27`에서 `=`로 나온다. 동작은 같고, 한 번 배포하면 LF로 맞춰진다. 그래서 v27 롤백은 지금 설치본과 줄바꿈 바이트까지 같지는 않다.
 - `--rollback <ref>`: 같은 절차로 `<ref>`의 extension/을 배포한다. 롤백 기준 태그는 `v27`(0aa8b82, 로컬 태그).
 - `installer_v1.1.6.exe`로 업그레이드·롤백하지 않는다(캐시가 설치 폴더 안에 있다).
-- 배포 뒤 Premiere를 열고 읽기 전용 스모크: `node tests/premiere/run.js --prod --port 7777 tests/premiere/smoke.expr.txt` (`--prod`는 `.expr.txt`만 받는다).
+- 배포 뒤 Premiere를 열고 읽기 전용 스모크: `node tests/premiere/run.js --prod --port 7777 tests/premiere/smoke.expr.txt` (`--prod`는 이 파일과 `--check-build`만 받는다).

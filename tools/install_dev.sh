@@ -3,7 +3,8 @@
 # 운영 설치본(CEP_MogrtImporter)과 절대 부딪히지 않게 신원을 모두 바꾼다.
 #   - 번들 id com.raonolje.mogrtimporter.dev, 패널 id ….dev.panel
 #   - 메뉴 "MOGRT Subtitle Importer (DEV)", 디버그 포트 7778
-#   - hostscript.jsx·app.js의 \bMI_ → MID_ (ExtendScript 전역은 모든 확장이 같이 쓴다, spike #16)
+#   - hostscript.jsx·app.js의 \bMI_ → MID_ (ExtendScript 전역은 모든 확장이 같이 쓴다, spike #16).
+#     식별자가 아닌 MI_test(.prproj)·MI_REAL_CACHE 같은 이름은 그대로 (tools/lib/stamp.js MI_KEEP)
 #   - @@BUILD@@ → dev-<git short sha> (작업 트리가 더러우면 -d<시각>을 붙여 설치마다 다르게)
 # 캐시는 <확장 폴더>/cache 라 구조상 분리된다. 이 스크립트는 DEV의 cache/ 를 지우지 않고,
 # 운영 폴더에는 아무것도 쓰지 않는다(설치 전후 sha1 목록으로 확인).
@@ -41,7 +42,7 @@ for arg in "$@"; do
   case "$arg" in
     --seed-cache) SEED=1 ;;
     --uninstall) UNINSTALL=1 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) die "모르는 인자: $arg (--seed-cache | --uninstall)" ;;
   esac
 done

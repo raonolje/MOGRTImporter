@@ -58,6 +58,56 @@ test("순수성 가드: state. / document 를 쓰는 region은 거부한다", ()
 	} finally { fs.unlinkSync(f); }
 });
 
+test("순수성 가드: 템플릿 ${ … } 안의 코드도 본다 (글자 부분은 보지 않는다)", () => {
+	const f = tmpFile("app_tpl.js", [
+		"(function() {",
+		"\t//#region src/tplState.ts",
+		"\tfunction label(i) { return `${i}: ${state.subtitles[i].text}`; }",
+		"\t//#endregion",
+		"\t//#region src/tplDoc.ts",
+		"\tconst title = () => `제목 ${`안쪽 ${document.title}`}`;",
+		"\t//#endregion",
+		"\t//#region src/tplOk.ts",
+		"\tconst say = (n) => `state.x 와 document 는 글자라 괜찮다 ${n + 1} \\` ${ { a: n }.a }`;",
+		"\t//#endregion",
+		"})();"
+	].join("\n"));
+	try {
+		assert.throws(() => L.loadRegions(["src/tplState.ts"], f), /순수성 가드.*state\./);
+		assert.throws(() => L.loadRegions(["src/tplDoc.ts"], f), /순수성 가드.*document/);
+		const { say } = L.loadRegions(["src/tplOk.ts"], f);
+		assert.equal(say(1), "state.x 와 document 는 글자라 괜찮다 2 ` 1");
+	} finally { fs.unlinkSync(f); }
+});
+
+test("최상위 이름: 쉼표 목록, 구조 분해, function*, class, 줄바꿈 이어짐", () => {
+	const f = tmpFile("app_decl.js", [
+		"(function() {",
+		"\t//#region src/decl.ts",
+		"\tconst A = 1, B = f(2, 3), { C, D: E, ...R } = { C: 4, D: 5, z: 6 };",
+		"\tconst [F, , G = 7, ...H] = [8, 9, undefined, 10];",
+		"\tvar I = { x: [1, 2] }, J = (a, b) => a + b",
+		"\tlet K = 1",
+		"\t\t+ 2, L2 = `${A}-${B}`",
+		"\tfunction* gen() { const hidden = 1; yield hidden; }",
+		"\tclass Box { get v() { var alsoHidden = 2; return alsoHidden; } }",
+		"\tfunction f(a, b) { return a * b; }",
+		"\tfor (let q = 0; q < 1; q++) { /* for 머리의 let은 바깥 이름이 아니다 */ }",
+		"\t//#endregion",
+		"})();"
+	].join("\n"));
+	try {
+		const r = L.loadRegions(["src/decl.ts"], f);
+		assert.deepEqual(Object.keys(r).sort(), ["A", "B", "Box", "C", "E", "F", "G", "H", "I", "J", "K", "L2", "R", "f", "gen"].sort());
+		assert.deepEqual([r.A, r.B, r.C, r.E, r.F, r.G, r.K, r.L2, r.J(1, 2)], [1, 6, 4, 5, 8, 7, 3, "1-6", 3]);
+		assert.deepEqual(L.plain(r.R), { z: 6 });
+		assert.deepEqual(L.plain(r.H), [10]);
+		assert.deepEqual(L.plain(r.I), { x: [1, 2] });
+		assert.deepEqual(Array.from(r.gen()), [1]);
+		assert.equal(new r.Box().v, 2);
+	} finally { fs.unlinkSync(f); }
+});
+
 test("실제 app.js: srtParser region은 순수, storage region은 거부", () => {
 	assert.ok(L.listRegions().some((r) => r.name === "src/srtParser.ts"));
 	assert.doesNotThrow(() => L.loadRegions(["src/srtParser.ts"]));

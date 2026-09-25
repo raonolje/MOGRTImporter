@@ -14,7 +14,9 @@
  *              panel(expr) 페이지 평가 · host(jsx) 호스트 평가(문자열) · mi(name, payload) MID_<name> 호출(JSON)
  *
  * 가드(lib/guard.js): MI_test.prproj의 T_ 시퀀스가 아니면 아무것도 실행하지 않는다.
- * --prod: 운영 패널, .expr.txt만, 가드 없음 (읽기 전용 표현식만 넣는다).
+ *   --no-guard(DEV, .expr.txt만)는 실행 전에 열린 프로젝트·시퀀스를 찍는다.
+ * --prod: 운영 패널, 저장소의 읽기 전용 스모크(cdp.js PROD_SMOKE_FILES)와 --check-build만, 가드 없음.
+ *   다른 파일과 --reload는 거부한다 (운영 페이지는 캐시를 쓰는 _mogrtDebug._fsWrite·saveSession을 드러낸다).
  * --check-build: 설치된 빌드 스탬프와 호스트 MID_ping().build(와 패널 status.build)가 같은지 확인.
  * 종료 코드: 0 통과 · 1 실패 · 2 연결 실패 · 3 가드 거부 · 64 사용법
  */
@@ -22,8 +24,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const assert = require("node:assert/strict");
-const { Cdp, checkPort, DEV_PORT } = require("./cdp");
+const { Cdp, checkPort, checkProdFile, DEV_PORT } = require("./cdp");
 const { guard, GuardError } = require("./lib/guard");
+const { rewriteMiPrefix, findMiIdent, buildOfHost } = require("../../tools/lib/stamp");
 
 /** '---' 줄로 표현식 나누기. label = 첫 줄 */
 function splitExprs(text) {
@@ -52,10 +55,20 @@ function jsxString(s) {
 	}) + "\"";
 }
 
+/**
+ * 호스트로 보낼 payload JSON (패널 _callMi와 같은 계약).
+ * 호스트 JSON.parse 폴리필은 eval이라(hostscript 159-161) 문자열 속 날 U+2028/2029는 ES3 문법 오류다.
+ * JSON.stringify는 둘을 이스케이프하지 않으므로 JSON 텍스트 단계에서 u2028/u2029 이스케이프(역슬래시 포함 6글자)로 바꾼다.
+ */
+const RAW_SEP_RE = new RegExp("[\\u2028\\u2029]", "g");
+function payloadJson(payload) {
+	return JSON.stringify(payload).replace(RAW_SEP_RE, (ch) => "\\u" + ch.charCodeAt(0).toString(16));
+}
+
 /** fn("<payload JSON>") 호출 소스 */
 function hostCallSource(fn, payload) {
 	if (!/^[A-Za-z_$][\w$]*$/.test(fn)) throw new Error("함수 이름이 이상하다: " + fn);
-	return fn + "(" + (payload === undefined ? "" : jsxString(JSON.stringify(payload))) + ")";
+	return fn + "(" + (payload === undefined ? "" : jsxString(payloadJson(payload))) + ")";
 }
 
 /** 패널에서 호스트 JSX를 평가하는 페이지 표현식 */
@@ -63,8 +76,9 @@ function evalScriptExpr(jsx) {
 	return "new Promise((resolve) => { new CSInterface().evalScript(" + JSON.stringify(asciiJsx(jsx)) + ", (v) => resolve(String(v))); })";
 }
 
+/** DEV용 .jsx 사본: install_dev.sh와 같은 규칙(tools/lib/stamp.js). MI_test.prproj·환경 변수 이름은 그대로 */
 function rewriteMiForDev(src) {
-	return String(src).replace(/\bMI_/g, "MID_");
+	return rewriteMiPrefix(src);
 }
 
 function extDir() {
@@ -75,7 +89,6 @@ function extDir() {
 
 /** 설치본에서 기대 빌드 스탬프 읽기: hostscript의 MI(D)_BUILD, 없으면 DEV의 .mi_build 첫 줄 */
 function expectedBuild(opts = {}) {
-	const { buildOfHost } = require("../../tools/lib/stamp");
 	const dir = path.join(opts.extDir || extDir(), opts.prod ? "CEP_MogrtImporter" : "CEP_MogrtImporter_dev");
 	const hostFile = path.join(dir, "jsx", "hostscript.jsx");
 	const fromHost = fs.existsSync(hostFile) ? buildOfHost(fs.readFileSync(hostFile, "utf8")) : null;
@@ -142,6 +155,18 @@ async function checkBuildStamp(client, opts = {}) {
 	return { ok, skipped: false, lines };
 }
 
+/** --no-guard일 때 찍을 열린 프로젝트·시퀀스 (v27 getActiveSequenceInfo, 읽기 전용) */
+async function describeActive(client) {
+	let raw;
+	try {
+		raw = await client.evaluate(evalScriptExpr("getActiveSequenceInfo()"));
+		const o = JSON.parse(raw);
+		return "프로젝트 " + (o.projPath || "(없음)") + " / 시퀀스 " + (o.seqName || "(없음)");
+	} catch (e) {
+		return "(읽지 못함: " + String(raw === undefined ? e.message : raw).slice(0, 120) + ")";
+	}
+}
+
 async function runExprFile(client, file, log) {
 	const exprs = splitExprs(fs.readFileSync(file, "utf8"));
 	let failed = 0;
@@ -162,7 +187,7 @@ async function runJsxFile(client, file, opts, log) {
 	const src = fs.readFileSync(file, "utf8");
 	let target = path.resolve(file);
 	let tmp = null;
-	const needMid = !opts.prod && /\bMI_/.test(src);
+	const needMid = !opts.prod && findMiIdent(src) !== null;
 	if (needMid || /[^\x00-\x7f]/.test(src)) {
 		tmp = path.join(os.tmpdir(), "mi_run_" + process.pid + "_" + path.basename(file));
 		fs.writeFileSync(tmp, asciiJsx(needMid ? rewriteMiForDev(src) : src), "utf8");
@@ -195,9 +220,13 @@ async function runFile(client, file, opts = {}, log = console.log) {
 	const kind = /\.expr\.txt$/i.test(file) ? "expr" : /\.case\.js$/i.test(file) ? "case" : /\.jsx$/i.test(file) ? "jsx" : null;
 	if (!kind) throw new Error("모르는 파일 종류: " + file + " (.expr.txt | .jsx | .case.js)");
 	if (opts.prod && kind !== "expr") throw new Error("--prod에서는 .expr.txt(읽기 전용)만 실행한다: " + file);
+	if (opts.prod) checkProdFile(file);
 	let info = null;
 	if (!opts.prod && opts.guard !== false) info = await guard((jsx) => client.evaluate(evalScriptExpr(jsx)));
-	else if (!opts.prod && kind !== "expr") throw new Error("--no-guard는 .expr.txt에만 쓸 수 있다: " + file);
+	else if (!opts.prod) {
+		if (kind !== "expr") throw new Error("--no-guard는 .expr.txt에만 쓸 수 있다: " + file);
+		log("  !! 가드 없음 — 지금 열린 곳에서 실행한다: " + await describeActive(client));
+	}
 	if (kind === "expr") return runExprFile(client, file, log);
 	if (kind === "jsx") return runJsxFile(client, file, opts, log);
 	return runCaseFile(client, file, opts, info, log);
@@ -217,6 +246,8 @@ function parseArgs(argv) {
 		else o.files.push(a);
 	}
 	checkPort(o.port, o);
+	if (o.prod && o.reload) throw new Error("--prod --reload는 받지 않는다 — 운영 패널 부팅이 캐시를 다시 쓸 수 있다. 운영은 Premiere를 다시 시작한다");
+	if (o.prod) o.files.forEach((f) => checkProdFile(f));
 	if (!o.files.length && !o.checkBuild && !o.reload) throw new Error("실행할 파일이 없다");
 	return o;
 }

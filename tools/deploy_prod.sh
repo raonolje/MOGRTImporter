@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --rollback) [ $# -ge 2 ] || die "--rollback <gitref>"; REF="$2"; ROLLBACK=1; shift ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) die "모르는 인자: $1 (--dry-run | --rollback <gitref>)" ;;
   esac
   shift
@@ -114,14 +114,17 @@ node "$(native "$STAMP")" prod "$(native "$STAGE")" "$BUILD"
 node "$(native "$STAMP")" verify-prod "$(native "$STAGE")" || die "운영 사본 검사 실패 — 배포하지 않았다"
 
 echo "=== 3. 바뀔 파일 ==="
-changed=0; added=0; same=0
+# git archive는 LF로 만든다. 운영에 CRLF 사본(지금의 html/index.html)이 있으면 내용은 같고
+# 줄바꿈만 다르다 — 이것은 '줄바꿈만'으로 따로 세어 진짜 바뀜(~)이 묻히지 않게 한다.
+changed=0; eolonly=0; added=0; same=0
 while IFS= read -r -d '' f; do
   rel="${f#"$STAGE"/}"
   if [ ! -e "$PROD/$rel" ]; then echo "   + $rel"; added=$((added+1))
-  elif ! cmp -s "$f" "$PROD/$rel"; then echo "   ~ $rel"; changed=$((changed+1))
-  else same=$((same+1)); fi
+  elif cmp -s "$f" "$PROD/$rel"; then same=$((same+1))
+  elif cmp -s <(tr -d '\r' < "$f") <(tr -d '\r' < "$PROD/$rel"); then echo "   = $rel (줄바꿈만 다름, 내용 같음)"; eolonly=$((eolonly+1))
+  else echo "   ~ $rel"; changed=$((changed+1)); fi
 done < <(for item in $ITEMS; do find "$STAGE/$item" -type f -print0; done)
-echo "   바뀜 $changed, 새 파일 $added, 같음 $same (운영에만 있는 파일은 지우지 않는다)"
+echo "   바뀜 $changed, 줄바꿈만 $eolonly, 새 파일 $added, 같음 $same (운영에만 있는 파일은 지우지 않는다)"
 
 recheck_cache() {
   [ "$HAS_CACHE" = 1 ] || return 0

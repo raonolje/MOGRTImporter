@@ -46,7 +46,38 @@ const BANNED = [
 	["JSON", "var s = JSON.stringify(o);"],
 	["JSON", "var o = JSON.parse(s);"],
 	["es5-string", "if (String(s).includes(\"a\")) { n = 1; }"],
+	["es5-string", "var it = String(s).matchAll(re);"],
+	["es5-string", "var t = String(s).replaceAll(\"a\", \"b\");"],
+	["es6-array", "var x = arr.find(f);"],
+	["es6-array", "var i = arr.findIndex(f);"],
+	["es6-array", "var x = arr.findLast(f);"],
+	["es6-array", "var i = arr.findLastIndex(f);"],
+	["es6-array", "var z = new Array(3).fill(0);"],
+	["es6-array", "var y = arr.flat();"],
+	["es6-array", "var y = arr.flatMap(f);"],
+	["es6-array", "arr.copyWithin(0, 1);"],
+	["es6-array", "var it = arr.entries();"],
+	["es6-array", "var it = arr.keys();"],
+	["es6-array", "var it = arr.values();"],
+	["es6-array", "var last = arr.at(-1);"],
+	["es5-date", "var s = new Date().toISOString();"],
+	["es5-date", "var s = d.toJSON();"],
+	["Object.es5", "var pd = Object.getOwnPropertyDescriptor(o, \"a\");"],
+	["Object.es5", "var pds = Object.getOwnPropertyDescriptors(o);"],
+	["Object.es5", "var ss = Object.getOwnPropertySymbols(o);"],
+	["Object.es5", "if (Object.is(a, b)) { n = 1; }"],
+	["Object.es5", "var o = Object.fromEntries(pairs);"],
+	["Object.es5", "if (Object.isFrozen(o)) { n = 1; }"],
+	["Object.es5", "if (Object.isSealed(o)) { n = 1; }"],
+	["Object.es5", "if (Object.isExtensible(o)) { n = 1; }"],
+	["Object.es5", "Object.preventExtensions(o);"],
+	["Object.es5", "Object.setPrototypeOf(o, p);"],
 	["es6-static", "var a = Array.from(x);"],
+	["es6-static", "if (Number.isSafeInteger(1)) { n = 1; }"],
+	["es6-static", "var m = Number.MAX_SAFE_INTEGER;"],
+	["es6-static", "var m = Number.MIN_SAFE_INTEGER;"],
+	["es6-static", "var t = Math.trunc(x);"],
+	["es6-static", "var p = Math.imul(a, b);"],
 	["es6-global", "var m = new Map();"],
 	["spread", "f(...xs);"],
 	["for-of", "for (var x of xs) { n += x; }"],
@@ -92,6 +123,11 @@ function MI__clean(s, name, list) {
 
 test("깨끗한 ES3 픽스처는 통과한다", () => {
 	assert.deepEqual(rulesOf(CLEAN), []);
+});
+
+test("템플릿 ${ … } 안의 코드도 검사한다", () => {
+	const got = rulesOf("var s = `a${JSON.stringify(o)}b${xs.map(f)}`;");
+	assert.ok(got.includes("template") && got.includes("JSON") && got.includes("array-hof"), JSON.stringify(got));
 });
 
 test("문자열 indexOf는 통과한다", () => {

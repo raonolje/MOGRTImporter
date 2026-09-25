@@ -11,9 +11,11 @@
  * 금지: let, const, =>, class, 템플릿 문자열, 배열 고차 함수(forEach·map·filter·some·every·reduce),
  * Array.isArray, 배열 indexOf(문자열 indexOf는 허용 — 수신자가 문자열 리터럴이거나 String(...),
  * .toLowerCase() 같은 문자열 메서드 결과여야 한다. 배열 멤버십은 MI__idx),
- * trim, Object.keys/create(및 ES5 Object.*), bind, Date.now, normalize, get/set 리터럴,
- * 예약어 속성 이름(x.default, {new: …}), JSON.*(MI__json·parsePayload를 쓴다),
- * 그 밖의 ES5+ 문자열/정적 메서드, 전개 연산자, for…of, 기본 매개변수.
+ * trim, Object.keys/create(및 ES5+ Object.*: getOwnPropertyDescriptor, is, fromEntries …), bind, Date.now,
+ * normalize, get/set 리터럴, 예약어 속성 이름(x.default, {new: …}), JSON.*(MI__json·parsePayload를 쓴다),
+ * ES2015+ 문자열 메서드(includes, padStart, matchAll …), 배열 메서드(find, findIndex, fill, flat, flatMap,
+ * entries/keys/values, at …), Date toISOString/toJSON, 정적 메서드·상수(Array.from, Number.isSafeInteger,
+ * Number.MAX_SAFE_INTEGER, Math.trunc …), ES2015 전역(Promise, Map …), 전개 연산자, for…of, 기본 매개변수.
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -50,7 +52,7 @@ const RULES = [
 		ok: _isStringReceiver
 	},
 	{ id: "trim", re: /\.\s*trim(Left|Right|Start|End)?\s*\(/g, msg: "trim은 ES3에 없다 — replace(/^\\s+|\\s+$/g, \"\")" },
-	{ id: "Object.es5", re: /\bObject\s*\.\s*(keys|create|assign|freeze|seal|defineProperty|defineProperties|getPrototypeOf|getOwnPropertyNames|entries|values)\b/g, msg: "Object.keys/create 등 ES5+ Object 메서드는 ES3에 없다 — for…in" },
+	{ id: "Object.es5", re: /\bObject\s*\.\s*(keys|create|assign|freeze|seal|defineProperty|defineProperties|getPrototypeOf|getOwnPropertyNames|getOwnPropertyDescriptors?|getOwnPropertySymbols|entries|values|fromEntries|is|isFrozen|isSealed|isExtensible|preventExtensions|setPrototypeOf)\b/g, msg: "Object.keys/create 등 ES5+ Object 메서드는 ES3에 없다 — for…in" },
 	{ id: "bind", re: /\.\s*bind\s*\(/g, msg: "Function.prototype.bind는 ES3에 없다 — 클로저" },
 	{ id: "Date.now", re: /\bDate\s*\.\s*now\b/g, msg: "Date.now는 ES3에 없다 — new Date().getTime()" },
 	{ id: "normalize", re: /\.\s*normalize\s*\(/g, msg: "String.prototype.normalize는 ES3에 없다" },
@@ -58,8 +60,10 @@ const RULES = [
 	{ id: "reserved-member", re: new RegExp("\\.\\s*(" + RESERVED_ALT + ")\\b", "g"), msg: "예약어를 점 표기 속성으로 쓸 수 없다 — x[\"default\"]", ok: _notSpread },
 	{ id: "reserved-key", re: new RegExp("([{,])\\s*(" + RESERVED_ALT + ")\\s*:(?!:)", "g"), msg: "예약어를 따옴표 없는 객체 키로 쓸 수 없다 — {\"new\": …}", ok: _isBlockBrace },
 	{ id: "JSON", re: /\bJSON\s*\./g, msg: "JSON.*은 쓰지 않는다 — MI__json / parsePayload" },
-	{ id: "es5-string", re: /\.\s*(includes|startsWith|endsWith|padStart|padEnd|repeat|codePointAt|trimStart|trimEnd)\s*\(/g, msg: "ES2015+ 문자열·배열 메서드는 ES3에 없다" },
-	{ id: "es6-static", re: /\b(Array\s*\.\s*(from|of)|Number\s*\.\s*(isNaN|isFinite|isInteger|parseFloat|parseInt|EPSILON)|String\s*\.\s*(fromCodePoint|raw)|Math\s*\.\s*(sign|trunc|log10|log2|hypot|cbrt))\b/g, msg: "ES2015+ 정적 메서드는 ES3에 없다" },
+	{ id: "es5-string", re: /\.\s*(includes|startsWith|endsWith|padStart|padEnd|repeat|codePointAt|trimStart|trimEnd|matchAll|replaceAll)\s*\(/g, msg: "ES2015+ 문자열·배열 메서드는 ES3에 없다" },
+	{ id: "es6-array", re: /\.\s*(find|findIndex|findLast|findLastIndex|fill|flat|flatMap|copyWithin|entries|keys|values|at)\s*\(/g, msg: "ES2015+ 배열 메서드는 ES3에 없다 — for 루프 (객체 키는 for…in)" },
+	{ id: "es5-date", re: /\.\s*(toISOString|toJSON)\s*\(/g, msg: "Date toISOString/toJSON은 ES3에 없다 — getUTCFullYear() 등으로 직접 만든다" },
+	{ id: "es6-static", re: /\b(Array\s*\.\s*(from|of)|Number\s*\.\s*(isNaN|isFinite|isInteger|isSafeInteger|parseFloat|parseInt|EPSILON|MAX_SAFE_INTEGER|MIN_SAFE_INTEGER)|String\s*\.\s*(fromCodePoint|raw)|Math\s*\.\s*(sign|trunc|log10|log2|hypot|cbrt|imul|clz32|fround|expm1|log1p|sinh|cosh|tanh|asinh|acosh|atanh))\b/g, msg: "ES2015+ 정적 메서드·상수는 ES3에 없다" },
 	{ id: "es6-global", re: /\b(Promise|Symbol|Map|Set|WeakMap|WeakSet|Proxy|Reflect)\s*[.(]|\bnew\s+(Promise|Map|Set|WeakMap|WeakSet|Proxy)\b/g, msg: "ES2015+ 전역 객체는 ES3에 없다" },
 	{ id: "spread", re: /\.\.\./g, msg: "전개/나머지 연산자는 ES3에 없다" },
 	{ id: "for-of", re: /\bfor\s*\(\s*(var\s+)?[A-Za-z_$][\w$]*\s+of\b/g, msg: "for…of는 ES3에 없다" },

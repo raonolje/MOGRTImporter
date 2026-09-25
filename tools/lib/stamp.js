@@ -57,12 +57,25 @@ function devDebug(xml) {
 	return s;
 }
 
+// \bMI_로 시작하지만 v28 식별자가 아닌 이름: 테스트 프로젝트(MI_test.prproj, MI_test/ 폴더)와
+// 도구 환경 변수. DEV 사본·DEV용 .jsx에서도 그대로 둔다 (MI_test.prproj를 확인하는 코드가 DEV에서 늘 실패하지 않게)
+const MI_KEEP = ["test", "REAL_CACHE", "CEP_EXT_DIR", "BACKUP_ROOT"];
+const MI_IDENT_SRC = "\\bMI_(?!(?:" + MI_KEEP.join("|") + ")\\b)";
+
 /**
  * \bMI_ → MID_ (MI__helper → MID__helper, "MI_" → "MID_").
  * 클립 태그 [MI: 는 밑줄이 없어서 그대로다. _MI_x, xMI_ 처럼 단어 중간은 건드리지 않는다.
+ * MI_KEEP(MI_test, MI_REAL_CACHE …)은 식별자가 아니라서 그대로 둔다.
+ * tests/premiere/run.js도 DEV용 .jsx를 이 함수로 바꾼다.
  */
 function rewriteMiPrefix(src) {
-	return src.replace(/\bMI_/g, "MID_");
+	return String(src).replace(new RegExp(MI_IDENT_SRC, "g"), "MID_");
+}
+
+/** 바꿀 MI_ 식별자가 남아 있으면 그 첫 이름, 없으면 null */
+function findMiIdent(src) {
+	const m = String(src).match(new RegExp(MI_IDENT_SRC + "\\w*"));
+	return m ? m[0] : null;
 }
 
 function checkBuild(build) {
@@ -127,7 +140,7 @@ function _read(dir, rel) {
 
 /**
  * DEV 사본 검사. 문제 목록을 돌려준다(빈 배열이면 통과).
- * - \bMI_ 식별자가 하나도 없다 (html, jsx 전체)
+ * - \bMI_ 식별자가 하나도 없다 (html, jsx 전체. MI_test 같은 MI_KEEP 이름은 제외)
  * - [MI: 개수가 원본과 같다 (태그 정규식은 그대로)
  * - manifest/.debug가 DEV 신원·포트 7778이다
  * - @@BUILD@@가 남지 않았다
@@ -136,8 +149,8 @@ function verifyDev(dir, srcDir) {
 	const problems = [];
 	for (const f of _codeFiles(dir)) {
 		const s = fs.readFileSync(f, "utf8");
-		const m = s.match(/\bMI_\w*/);
-		if (m) problems.push("MI_ 식별자가 남았다: " + path.relative(dir, f) + " (" + m[0] + ")");
+		const left = findMiIdent(s);
+		if (left) problems.push("MI_ 식별자가 남았다: " + path.relative(dir, f) + " (" + left + ")");
 		if (s.indexOf(BUILD_TOKEN) !== -1) problems.push("@@BUILD@@가 남았다: " + path.relative(dir, f));
 	}
 	if (srcDir) {
@@ -214,6 +227,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-	devManifest, devDebug, rewriteMiPrefix, stampBuild, checkBuild, stageDev, stageProd, verifyDev, verifyProd, buildOfHost,
-	PROD_BUNDLE, PROD_PANEL, DEV_BUNDLE, DEV_PANEL, DEV_MENU, PROD_PORT, DEV_PORT, CODE_FILES, BUILD_TOKEN
+	devManifest, devDebug, rewriteMiPrefix, findMiIdent, stampBuild, checkBuild, stageDev, stageProd, verifyDev, verifyProd, buildOfHost,
+	MI_KEEP, PROD_BUNDLE, PROD_PANEL, DEV_BUNDLE, DEV_PANEL, DEV_MENU, PROD_PORT, DEV_PORT, CODE_FILES, BUILD_TOKEN
 };

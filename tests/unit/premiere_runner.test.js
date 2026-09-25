@@ -6,10 +6,11 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { checkGuard, guard, GuardError } = require("../premiere/lib/guard");
-const { Cdp, checkPort, pickTarget } = require("../premiere/cdp");
+const { Cdp, checkPort, checkProdFile, pickTarget, parseCliArgs } = require("../premiere/cdp");
 const R = require("../premiere/run");
 const { caseFiles } = require("../premiere/suite");
 
+const SMOKE = path.join(__dirname, "..", "premiere", "smoke.expr.txt");
 const TEST_PROJ = "C:\\Users\\RAONOLJE\\Documents\\MI_test\\MI_test.prproj";
 
 test("guard: MI_test.prproj의 T_ 시퀀스만 통과", () => {
@@ -95,6 +96,17 @@ test("hostCallSource: payload JSON을 ASCII 리터럴로 넘긴다 (U+2028 안�
 	assert.match(src, /^MID_ping\("[\x20-\x7e]*"\)$/);
 	const got = new Function("MID_ping", "return " + src)((s) => s);
 	assert.deepEqual(JSON.parse(got), payload);
+	// 호스트가 받는 문자열(= parsePayload 입력)에 날 U+2028/2029가 없어야 한다.
+	// 호스트 JSON.parse 폴리필은 ES3 eval이라 문자열 속 날 구분자를 줄 끝으로 보고 문법 오류를 낸다.
+	// V8 JSON.parse·eval은 날 구분자를 받아 주므로, ES3 흉내로 LF로 바꿔 eval한다.
+	const RAW_SEP_G = new RegExp("[\\u2028\\u2029]", "g");
+	const es3Parse = (s) => eval("(" + s.replace(RAW_SEP_G, "\n") + ")");
+	assert.ok(!new RegExp("[\\u2028\\u2029]").test(got), "날 U+2028/2029가 호스트까지 갔다");
+	assert.deepEqual(es3Parse(got), payload);
+	const p2 = { t: "a" + String.fromCharCode(0x2029) + "b" + String.fromCharCode(0x2028) };
+	const got2 = new Function("MID_x", "return " + R.hostCallSource("MID_x", p2))((s) => s);
+	assert.ok(!new RegExp("[\\u2028\\u2029]").test(got2));
+	assert.deepEqual(es3Parse(got2), p2);
 	assert.equal(R.hostCallSource("MID_ping"), "MID_ping()");
 	assert.throws(() => R.hostCallSource("x); evil(", {}), /함수 이름/);
 });
@@ -110,6 +122,9 @@ test("asciiJsx / evalScriptExpr: 비ASCII는 \\u 이스케이프, 뜻은 그대�
 
 test("rewriteMiForDev: spike .jsx의 MI_ 호출을 MID_로", () => {
 	assert.equal(R.rewriteMiForDev("MI_ping(); MI__json(1); '[MI:a-1.1]'"), "MID_ping(); MID__json(1); '[MI:a-1.1]'");
+	// 테스트 프로젝트 확인(MI_test.prproj)은 DEV에서도 그대로여야 스스로 실패하지 않는다
+	assert.equal(R.rewriteMiForDev("if (String(app.project.path).indexOf(\"MI_test.prproj\") < 0) throw \"not test\"; MI_getTracks(p);"),
+		"if (String(app.project.path).indexOf(\"MI_test.prproj\") < 0) throw \"not test\"; MID_getTracks(p);");
 });
 
 test("runFile: --prod는 .expr.txt만, --no-guard는 .expr.txt에만", async () => {
@@ -123,9 +138,45 @@ test("runFile: --prod는 .expr.txt만, --no-guard는 .expr.txt에만", async () 
 test("parseArgs: 기본 7778, 7777은 --prod 필요", () => {
 	assert.equal(R.parseArgs(["a.expr.txt"]).port, 7778);
 	assert.throws(() => R.parseArgs(["--port", "7777", "a.expr.txt"]), /운영 패널/);
-	assert.equal(R.parseArgs(["--prod", "--port", "7777", "a.expr.txt"]).prod, true);
+	assert.equal(R.parseArgs(["--prod", "--port", "7777", SMOKE]).prod, true);
 	assert.equal(R.parseArgs(["--check-build"]).checkBuild, true);
 	assert.throws(() => R.parseArgs([]), /파일이 없다/);
+});
+
+test("--prod 정책: 저장소 smoke.expr.txt와 --check-build만, --reload는 거부 (run.js·cdp.js)", async () => {
+	// run.js
+	assert.equal(R.parseArgs(["--prod", "--port", "7777", "--check-build"]).checkBuild, true);
+	assert.deepEqual(R.parseArgs(["--prod", "--port", "7777", path.relative(process.cwd(), SMOKE)]).files.length, 1);
+	assert.throws(() => R.parseArgs(["--prod", "--port", "7777", "a.expr.txt"]), /읽기 전용 스모크만/);
+	assert.throws(() => R.parseArgs(["--prod", "--port", "7777", path.join(os.tmpdir(), "smoke.expr.txt")]), /읽기 전용 스모크만/);
+	assert.throws(() => R.parseArgs(["--prod", "--port", "7777", "--reload"]), /--reload/);
+	assert.equal(R.parseArgs(["--reload"]).reload, true); // DEV 새로 고침은 된다
+	await assert.rejects(R.runFile({}, "write_cache.expr.txt", { prod: true }), /읽기 전용 스모크만/);
+	// cdp.js
+	assert.throws(() => parseCliArgs(["--prod", "--port", "7777", "--reload"]), /--reload/);
+	assert.throws(() => parseCliArgs(["--prod", "--port", "7777", "--expr-file", "x.expr.txt"]), /읽기 전용 스모크만/);
+	assert.equal(parseCliArgs(["--prod", "--port", "7777", "--expr-file", SMOKE]).exprFile, SMOKE);
+	assert.equal(parseCliArgs(["--port", "7778", "--reload", "--expr-file", "x.expr.txt"]).reload, true);
+	assert.equal(checkProdFile(SMOKE), path.resolve(SMOKE));
+});
+
+test("runFile --no-guard: 실행 전에 열린 프로젝트·시퀀스를 찍는다", async () => {
+	const file = path.join(os.tmpdir(), "mi_noguard_" + process.pid + ".expr.txt");
+	fs.writeFileSync(file, "1 + 1\n");
+	const seen = [];
+	const client = {
+		async evaluate(expr) {
+			seen.push(expr);
+			if (expr.indexOf("getActiveSequenceInfo") !== -1) return JSON.stringify({ projPath: "D:/work/EP12.prproj", seqName: "EP12 편집" });
+			return 2;
+		}
+	};
+	const logs = [];
+	try {
+		await R.runFile(client, file, { guard: false }, (s) => logs.push(s));
+	} finally { fs.unlinkSync(file); }
+	assert.match(logs[0], /가드 없음.*EP12\.prproj.*EP12 편집/);
+	assert.equal(seen[seen.length - 1], "1 + 1");
 });
 
 test("expectedBuild: 설치본 hostscript의 MID_BUILD, 없으면 .mi_build", () => {

@@ -2,9 +2,10 @@
 /**
  * JS 소스를 "가린" 사본으로 바꾼다 (길이·줄 번호는 그대로).
  *  - 주석 → 공백
- *  - 문자열·템플릿·정규식 리터럴 → 구분자만 남기고 내용은 공백
+ *  - 문자열·정규식 리터럴 → 구분자만 남기고 내용은 공백
+ *  - 템플릿 리터럴 → 글자 부분만 공백. ${ … } 안은 코드라 그대로 두고 그 안도 같은 규칙으로 가린다(중첩 템플릿 포함)
  * es3lint(금지 구문 검사)와 loadRegions(순수성 가드, 최상위 이름 찾기)가 쓴다.
- * 주석이나 문자열 안의 단어("state." 같은)로 오탐하지 않게 하는 것이 목적이다.
+ * 주석이나 문자열 안의 단어("state." 같은)로 오탐하지 않게 하되, `${state.x}` 같은 코드는 놓치지 않는 것이 목적이다.
  *
  * 정규식과 나눗셈은 직전 토큰으로 가른다(흔한 휴리스틱). 완전한 파서는 아니다.
  */
@@ -34,6 +35,31 @@ function maskJs(src) {
 		lastSig === "" ||
 		(lastSig.length === 1 && REGEX_AFTER_PUNCT.indexOf(lastSig) !== -1) ||
 		(lastSig === "word" && REGEX_AFTER_WORD.test(lastWord));
+	// 열린 템플릿 치환(${ … })마다 그 안의 '{' 깊이. 비어 있으면 치환 밖이다
+	const tplStack = [];
+	/**
+	 * 템플릿의 글자 부분을 from부터 가린다 (from = 여는 백틱 다음, 또는 치환을 닫는 '}' 다음).
+	 * 닫는 백틱을 만나면 그 다음 위치를, '${'를 만나면 치환 코드의 첫 위치를 돌려준다.
+	 * 구분자(백틱, '${', '}')는 남겨 중괄호 짝이 맞게 한다.
+	 */
+	const templateText = (from) => {
+		let j = from;
+		while (j < n && src[j] !== "`") {
+			if (src[j] === "\\") { j += 2; continue; }
+			if (src[j] === "$" && src[j + 1] === "{") {
+				blank(from, j);
+				tplStack.push(0);
+				lastSig = "{";
+				lastWord = "";
+				return j + 2;
+			}
+			j++;
+		}
+		blank(from, j);
+		lastSig = "lit";
+		lastWord = "";
+		return j + 1;
+	};
 
 	let i = 0;
 	while (i < n) {
@@ -55,18 +81,23 @@ function maskJs(src) {
 			i = j;
 			continue;
 		}
-		// 문자열·템플릿 리터럴
-		if (c === '"' || c === "'" || c === "`") {
-			if (c === "`") templates.push(i);
+		// 문자열 리터럴
+		if (c === '"' || c === "'") {
 			let j = i + 1;
 			while (j < n && src[j] !== c) {
 				if (src[j] === "\\") { j += 2; continue; }
-				if (c !== "`" && (src[j] === "\n" || src[j] === "\r")) break; // 닫히지 않은 문자열
+				if (src[j] === "\n" || src[j] === "\r") break; // 닫히지 않은 문자열
 				j++;
 			}
 			blank(i + 1, j);
 			i = j + 1;
 			lastSig = "lit";
+			continue;
+		}
+		// 템플릿 리터럴: 글자 부분만 가리고 ${ … } 안의 코드는 남긴다
+		if (c === "`") {
+			templates.push(i);
+			i = templateText(i + 1);
 			continue;
 		}
 		// 정규식 리터럴
@@ -100,6 +131,17 @@ function maskJs(src) {
 			continue;
 		}
 		if (!/\s/.test(c)) {
+			if (tplStack.length && c === "{") {
+				tplStack[tplStack.length - 1]++;
+			} else if (tplStack.length && c === "}") {
+				if (tplStack[tplStack.length - 1] === 0) {
+					// 치환이 닫힌다 → 템플릿 글자 부분으로 돌아간다
+					tplStack.pop();
+					i = templateText(i + 1);
+					continue;
+				}
+				tplStack[tplStack.length - 1]--;
+			}
 			lastSig = c;
 			lastWord = "";
 		}

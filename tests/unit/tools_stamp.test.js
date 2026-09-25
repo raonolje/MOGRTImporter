@@ -64,6 +64,15 @@ test("devDebug: 포트 7778, 패널 id .dev.panel", () => {
 	assert.throws(() => S.devDebug(out), /\.debug/);
 });
 
+test("rewriteMiPrefix: MI_test.prproj·도구 환경 변수는 식별자가 아니라 그대로", () => {
+	const src = "if (String(app.project.path).indexOf(\"MI_test.prproj\") < 0) throw \"not test\"; var d = \"C:/x/MI_test/\"; " +
+		"$.getenv(\"MI_REAL_CACHE\"); MI_CEP_EXT_DIR; MI_BACKUP_ROOT; MI_getTracks(p); MI_tests(); MI_test_x();";
+	assert.equal(S.rewriteMiPrefix(src), "if (String(app.project.path).indexOf(\"MI_test.prproj\") < 0) throw \"not test\"; var d = \"C:/x/MI_test/\"; " +
+		"$.getenv(\"MI_REAL_CACHE\"); MI_CEP_EXT_DIR; MI_BACKUP_ROOT; MID_getTracks(p); MID_tests(); MID_test_x();");
+	assert.equal(S.findMiIdent("\"MI_test.prproj\" MI_REAL_CACHE"), null);
+	assert.equal(S.findMiIdent("\"MI_test.prproj\" MI__json(1)"), "MI__json");
+});
+
 test("rewriteMiPrefix: MI_ 식별자 → MID_, [MI: 태그와 단어 중간은 그대로", () => {
 	const src = "MI_ping(); MI__json(x); var p = \"MI_\"; var t = \"철수 [MI:ab12-1.1]\"; _MI_x; xMI_y; /* MI_PURE_BEGIN */";
 	const out = S.rewriteMiPrefix(src);

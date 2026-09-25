@@ -3,7 +3,9 @@
 /**
  * CEP 패널의 CEF 원격 디버깅 포트(CDP)에 붙는 작은 클라이언트.
  * 하드 테스트는 DEV 패널(7778, CEP_MogrtImporter_dev)만 몬다. 운영 7777은 --prod일 때만,
- * 그것도 읽기 전용 스모크(.expr.txt)에만 쓴다(run.js가 막는다).
+ * 그것도 저장소의 읽기 전용 스모크(PROD_SMOKE_FILES)에만 쓴다. 운영 페이지에는 _mogrtDebug._fsWrite·
+ * saveSession과 evalScript가 있어 아무 표현식이나 돌리면 운영 캐시·실제 프로젝트를 바꿀 수 있다.
+ * 그래서 --prod에서는 다른 --expr-file과 --reload(부팅이 캐시를 다시 쓸 수 있다)를 거부한다(run.js도 같다).
  *
  * 모듈:  const { Cdp } = require("./cdp");  const c = await Cdp.connect(7778);  await c.evaluate("1+1");
  * CLI:   node tests/premiere/cdp.js [--port 7778] [--prod] [--reload] [--settle ms] [--expr-file f]
@@ -12,10 +14,25 @@
  *   --expr-file  '---' 줄로 나눈 표현식들을 차례로 평가해 결과를 찍는다
  * 종료 코드: 0 정상 · 1 오류 · 2 포트 연결 실패 · 3 대상 페이지 없음 · 4 표현식 예외
  */
+const path = require("node:path");
+
 const PROD_PORT = 7777;
 const DEV_PORT = 7778;
 const DEV_DIR_RE = /CEP_MogrtImporter_dev\//i;
 const PROD_DIR_RE = /CEP_MogrtImporter\//i;
+// --prod(운영 패널)에서 평가해도 되는 파일: 저장소에 커밋된 읽기 전용 스모크만
+const PROD_SMOKE_FILES = [path.join(__dirname, "smoke.expr.txt")];
+
+/** --prod 파일 정책: PROD_SMOKE_FILES가 아니면 throw. 절대 경로를 돌려준다 */
+function checkProdFile(file) {
+	const abs = path.resolve(String(file));
+	const norm = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
+	if (!PROD_SMOKE_FILES.some((p) => norm(p) === norm(abs))) {
+		throw new Error("--prod(운영 패널)에서는 읽기 전용 스모크만 실행한다: " +
+			PROD_SMOKE_FILES.map((p) => path.relative(process.cwd(), p) || p).join(", ") + " (받은 것: " + file + ")");
+	}
+	return abs;
+}
 
 /** 포트 정책: 운영 포트는 --prod일 때만, --prod는 운영 포트에서만 */
 function checkPort(port, opts = {}) {
@@ -214,6 +231,8 @@ function parseCliArgs(argv) {
 		else if (/^\d+$/.test(a)) o.port = Number(a); // 예전 형식: 첫 인자가 포트
 		else throw new Error("모르는 인자: " + a);
 	}
+	if (o.prod && o.reload) throw new Error("--prod --reload는 받지 않는다 — 운영 패널 부팅이 캐시를 다시 쓸 수 있다. 운영은 Premiere를 다시 시작한다");
+	if (o.prod && o.exprFile) checkProdFile(o.exprFile);
 	return o;
 }
 
@@ -267,4 +286,4 @@ if (require.main === module) {
 	cli(process.argv.slice(2)).then((code) => { process.exitCode = code; }, (e) => { console.log("FATAL " + e.message); process.exitCode = 1; });
 }
 
-module.exports = { Cdp, checkPort, pickTarget, listTargets, describeException, parseCliArgs, PROD_PORT, DEV_PORT };
+module.exports = { Cdp, checkPort, checkProdFile, pickTarget, listTargets, describeException, parseCliArgs, PROD_PORT, DEV_PORT, PROD_SMOKE_FILES };
