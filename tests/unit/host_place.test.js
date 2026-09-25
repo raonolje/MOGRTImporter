@@ -435,3 +435,28 @@ test("name:null이면 이름을 건드리지 않는다 (레거시 안전 경로)
 	assert.equal(sim.call("MI_placeChunk", { seqId: "seq-A", build: BUILD, items: "x" }).error, "bad-payload");
 	assert.equal(sim.call("MI_placeChunk", { seqId: "seq-A", build: BUILD, items: Array.from({ length: 61 }, () => ({})) }).error, "bad-payload");
 });
+
+test("T12 보완: 공유 projectItem이 다른 구조(재저장된 MOGRT)를 놓으면 지우고 own.m(importMGT)으로 되놓는다, m이 없으면 detail에 적는다", () => {
+	for (const withM of [true, false]) {
+		const { sim, seq, base, chunk } = setup({ drift: true });
+		const P = presetParams(sim, seq, base, AE);
+		const r0 = chunk([place("ab12-1", 2, 100, 150, { params: withCaption(P, "새 구조 문장") })]);
+		assert.equal(r0.results[0].lay.length, NEW_PARAMS.length, "importMGT는 새 구조");
+		const own = Object.assign({ track: 2, sf: 100, nodeId: r0.results[0].nodeId }, withM ? { m: AE } : {});
+		const r = chunk([{ key: "ab12-1", op: "replace", g: 2, track: 2, sf: 100, ef: 150, own, mogrtPath: "C:/m/없는.mogrt", durSec: 5.005, params: [], name: "철수 [MI:ab12-1.2]" }]);
+		const x = r.results[0];
+		assert.deepEqual([x.status, x.reason], ["failed", "restored-old"]);
+		const live = sim.clips(seq, 2);
+		assert.equal(live.length, 1);
+		if (withM) {
+			assert.equal(x.lay.length, NEW_PARAMS.length, "옛 클립과 같은 구조로 되놓았다");
+			assert.equal(sim.textOf(live[0], "전체 텍스트"), "새 구조 문장");
+			assert.doesNotMatch(x.detail, /구조가 옛 클립과 다르다/);
+		} else {
+			assert.equal(x.lay.length, OLD_PARAMS.length, "m이 없어 공유 projectItem의 구조 그대로");
+			assert.match(x.detail, /구조가 옛 클립과 다르다/);
+			assert.equal(sim.textOf(live[0], "전체 텍스트"), "새 구조 문장", "이름으로 쓴 캡션은 들어갔다");
+		}
+		assert.equal(live[0].name, "철수 [MI:ab12-1.1]");
+	}
+});

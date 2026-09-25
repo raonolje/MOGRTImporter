@@ -3885,6 +3885,8 @@ function MI__locate(ctx, it) {
     } else {
         pr.before = MI__snapOf(c, o.track, ft, it.own ? it.own.m : null);
         try { pr.pi = c.projectItem || null; } catch (e4) { pr.pi = null; }
+        /* replace가 실패해 되놓을 때 같은 구조인지 보려고 옛 클립의 lay를 둔다 */
+        if (it.op === "replace") pr.lay = MI__json(MI__lay(c, pr.kind));
     }
     return pr;
 }
@@ -4103,24 +4105,41 @@ function MI__opReplace(ctx, it, pr, r) {
     var back = MI__restoreOld(ctx, pr);
     if (back) {
         r.reason = "restored-old";
-        MI__readback(r, back, pr.ti, ctx.ft, false);
+        if (!back.sameLay) r.detail += " (되놓은 클립의 속성 구조가 옛 클립과 다르다)";
+        MI__readback(r, back.clip, pr.ti, ctx.ft, false);
     } else {
         r.reason = "lost-old";
     }
 }
-/* replace가 실패했을 때 옛 템플릿을 옛 자리에 되놓는다 (속성·이름은 before로) → 새 클립 | null */
+/* replace가 실패했을 때 옛 템플릿을 옛 자리에 되놓는다 (속성·이름은 before로) → {clip, sameLay} | null.
+   공유 projectItem으로 놓은 클립의 구조가 옛 클립과 다르면(같은 capsule로 재저장된 MOGRT는 overwriteClip이 다른 버전을
+   놓을 수 있다, S0-3 x ③) 지우고 옛 경로 m(importMGT)으로 다시 놓는다 */
 function MI__restoreOld(ctx, pr) {
     var b = pr.before;
     if (!b) return null;
     var usePi = pr.kind === "ae" ? pr.pi : null;
-    var plan = MI__planPut(ctx, { ti: pr.ti, sf: b.sf, ef: Math.max(b.ef, b.sf + 1), endT: pr.eT, path: b.m || "", pi: usePi, durSec: 0, guard: {}, skip: {}, guardAll: true });
+    var spec = { ti: pr.ti, sf: b.sf, ef: Math.max(b.ef, b.sf + 1), endT: pr.eT, path: b.m || "", pi: usePi, durSec: 0, guard: {}, skip: {}, guardAll: true };
+    var plan = MI__planPut(ctx, spec);
     if (plan.fail || plan.conflict) return null;
     var put = MI__doPut(ctx, plan);
     if (!put.clip) return null;
     var c = put.clip;
+    var same = !pr.lay || MI__json(MI__lay(c, MI__kind(c))) === pr.lay;
+    if (!same && usePi && b.m) {
+        var id0 = "";
+        try { id0 = String(c.nodeId); } catch (e) { id0 = ""; }
+        MI__removeNode(ctx, pr.ti, id0);
+        spec.pi = null;
+        plan = MI__planPut(ctx, spec);
+        if (plan.fail || plan.conflict) return null;
+        put = MI__doPut(ctx, plan);
+        if (!put.clip) return null;
+        c = put.clip;
+        same = MI__json(MI__lay(c, MI__kind(c))) === pr.lay;
+    }
     MI__applyParamsSafe(c, MI__kind(c), b.params);
     MI__setName(c, b.name);
-    return c;
+    return { clip: c, sameLay: same };
 }
 
 /* ══ 진입점: 쓰기 (S2-2) ══ */

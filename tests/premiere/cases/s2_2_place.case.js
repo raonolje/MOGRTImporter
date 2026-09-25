@@ -140,6 +140,13 @@ async function steps(env) {
 	const item = (n, op, track, sf, ef, extra) => Object.assign({ key: SALT + "-" + n, op, g: 1, track, sf, ef, mogrtPath: P.mogrtPath, durSec: DUR, params: [], name: tag(n, 1), guard: [], motion: null, removeAfter: null, own: null }, extra || {});
 	const ownOf = (x, track) => ({ track, sf: x.sf, nodeId: x.nodeId });
 	for (const ti of [V3, V4, V5]) assert.equal(await host(H.jsxClearVideoTrack(ti)), "0", "V" + (ti + 1) + " 비우기");
+	// 예열: Premiere를 다시 시작한 뒤 첫 AE importMGT는 약 9초 걸린다 (S0-3 결정 5). T1 청크가 예산(7초)을 첫 클립에 다 쓰지 않게
+	// 먼저 한 번 놓고 지운다 (패널 S2-4는 템플릿의 첫 importMGT를 단독 청크로 보낸다)
+	const t0 = Date.now();
+	const warm = await hostJson(host, jsxPlaceNamed(P.mogrtPath, V5, 30000, 30024, "warmup"), "예열");
+	assert.ok(!warm.error, JSON.stringify(warm));
+	assert.equal(await host(H.jsxClearVideoTrack(V5)), "0", "예열 클립 지우기");
+	log("예열 importMGT " + (Date.now() - t0) + "ms");
 	const facts = await hostJson(host, JSX_FACTS, "facts");
 	const N = facts.numTracks;
 	log("스크래치 " + facts.name + ": 비디오 트랙 " + N + "개, frameTicks " + FT);
@@ -293,9 +300,10 @@ async function steps(env) {
 	// ── T12: replace 실패 → 옛 템플릿 되놓기 ──
 	live = await clips(NT);
 	const a12 = live.find((c) => c.nodeId === t1[1].nodeId);
-	r = await chunk([item(2, "replace", NT, 719, 767, { g: 2, own: ownOf(t1[1], NT), mogrtPath: BAD_PATH, name: tag(2, 2) })]);
+	r = await chunk([item(2, "replace", NT, 719, 767, { g: 2, own: Object.assign(ownOf(t1[1], NT), { m: P.mogrtPath }), mogrtPath: BAD_PATH, name: tag(2, 2) })]);
 	let x12 = r.results[0];
 	assert.deepEqual([x12.status, x12.reason], ["failed", "restored-old"], JSON.stringify(x12));
+	assert.doesNotMatch(String(x12.detail), /구조가 옛 클립과 다르다/, "옛 클립과 같은 구조로 되놓았다");
 	const b12 = (await clips(NT)).find((c) => c.nodeId === x12.nodeId);
 	assert.ok(b12, "되놓은 클립");
 	assert.deepEqual([b12.s, b12.e, b12.name], [a12.s, a12.e, a12.name], "자리·이름 그대로");
