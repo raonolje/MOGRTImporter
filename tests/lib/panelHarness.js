@@ -328,7 +328,7 @@ function makeFs(initial) {
 	const norm = (p) => String(p).replace(/\\/g, "/");
 	const api = {
 		NO_ERROR: 0, ERR_UNKNOWN: 1, ERR_INVALID_PARAMS: 2, ERR_NOT_FOUND: 3, ERR_CANT_READ: 4,
-		files, dirs, writes, unreadable: new Set(),
+		files, dirs, writes, unreadable: new Set(), renameFails: false,
 		stat(p) {
 			p = norm(p);
 			if (files.has(p)) return { err: 0, data: { isFile: () => true, isDirectory: () => false } };
@@ -343,6 +343,27 @@ function makeFs(initial) {
 		writeFile(p, data) { p = norm(p); files.set(p, String(data)); writes.push(p); return { err: 0 }; },
 		makedir(p) { dirs.add(norm(p)); return { err: 0 }; },
 		deleteFile(p) { files.delete(norm(p)); return { err: 0 }; },
+		/** 바로 아래 이름들 (파일·폴더) */
+		readdir(p) {
+			p = norm(p).replace(/\/$/, "");
+			const pre = p + "/";
+			const names = new Set();
+			for (const k of [...files.keys(), ...dirs]) if (k.indexOf(pre) === 0) names.add(k.slice(pre.length).split("/")[0]);
+			names.delete("");
+			if (!names.size && !dirs.has(p)) return { err: 3, data: [] };
+			return { err: 0, data: [...names] };
+		},
+		/** 파일만 옮긴다. api.renameFails가 참이면 실패(err 1) */
+		rename(a, b) {
+			a = norm(a); b = norm(b);
+			if (api.renameFails) return { err: 1 };
+			if (!files.has(a)) return { err: 3 };
+			if (files.has(b)) return { err: 1 };
+			files.set(b, files.get(a));
+			files.delete(a);
+			api.unreadable.delete(a);
+			return { err: 0 };
+		},
 		readJson(p) { const d = files.get(norm(p)); return d === undefined ? undefined : JSON.parse(d); }
 	};
 	return api;

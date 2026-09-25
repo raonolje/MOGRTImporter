@@ -2,7 +2,7 @@
 // S1-3: 세션 생명주기·부팅 게이트·렌더링 — app.js 전체를 panelHarness(가짜 DOM·호스트·cep.fs)로 돌린다
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { bootPanel, cachePaths: P } = require("../lib/panelHarness");
+const { bootPanel, cachePaths: P, seqKeyOf } = require("../lib/panelHarness");
 const { build } = require("../fixtures/presets_synth");
 
 const PROJ1 = "C:/work/one.prproj";
@@ -175,7 +175,7 @@ test("다른 프로젝트: 목록은 비고, 프리셋은 파일이 있으면 �
 	noErrors(h);
 });
 
-test("읽지 못하는 session.json: 메모리를 유지하고 그 키로는 쓰지 않으며 오류를 보여 준다", async () => {
+test("읽지 못하는 session.json: 그 파일은 덮지 않고, 이전 시퀀스의 목록을 끌고 오지 않으며, 경고가 남는다", async () => {
 	const badPath = P.session(PROJ1, B.seqId);
 	const h = await bootPanel({
 		seq: A,
@@ -189,28 +189,103 @@ test("읽지 못하는 session.json: 메모리를 유지하고 그 키로는 쓰
 	await h.advance(300);
 	let s = h.snapshot();
 	assert.equal(s.flags.sessionReadFailed, true);
-	assert.deepEqual(s.subtitles.map((x) => x.text), ["A 목록"], "메모리는 그대로");
+	// A의 목록이 B에 남으면 ▶가 A의 자막을 B 타임라인에 놓는다
+	assert.deepEqual([s.subtitles.length, s.trashBin.length, Object.keys(s.rowStates).length], [0, 0, 0], "목록을 비운다 (A의 목록이 아니다)");
+	assert.equal(h.rows().length, 0);
 	assert.equal(h.status().cls, "err");
 	assert.match(h.status().text, /세션 파일을 읽지 못했습니다/);
-	// 저장 시도 (속성창 모두 닫기) → B 파일은 그대로
+	assert.match(h.$("activeSeqLabel").textContent, /^⚠ 세션 파일 읽기 실패 · 활성 시퀀스 : T_B$/, "상태 줄이 덮여도 남는 경고");
+	// 저장 시도 (속성창 모두 닫기·직접 저장) → 비어 있으니 아무것도 쓰지 않는다
 	h.$("btnCloseAllParams").disabled = false;
 	h.$("btnCloseAllParams").click();
 	h.win._mogrtDebug.saveSession();
 	assert.equal(h.fs.files.get(badPath), "{ 이건 JSON이 아니다");
-	assert.match(h.status().text, /저장하지 않습니다/);
+	assert.deepEqual([...h.fs.files.keys()].filter((k) => k.indexOf(badPath) === 0), [badPath], "옮기지도 않는다");
 	// 읽을 수 없는 파일(err 4)도 같은 처리
 	h.fs.unreadable.add(P.session(PROJ1, C.seqId));
 	h.fs.files.set(P.session(PROJ1, C.seqId), "{}");
 	h.host.seq = C;
 	await h.advance(300);
 	assert.equal(h.snapshot().flags.sessionReadFailed, true);
-	// A로 돌아오면 풀린다
+	// A로 돌아오면 풀리고 A의 목록을 다시 읽는다
 	h.host.seq = A;
 	await h.advance(300);
 	s = h.snapshot();
 	assert.equal(s.flags.sessionReadFailed, false);
 	assert.deepEqual(s.subtitles.map((x) => x.text), ["A 목록"]);
+	assert.equal(h.$("activeSeqLabel").textContent, "활성 시퀀스 : T_A");
+	assert.equal(h.fs.files.get(badPath), "{ 이건 JSON이 아니다", "B 파일은 끝까지 그대로");
 	noErrors(h);
+});
+
+test("읽지 못하는 session.json인 시퀀스에서 새로 작업하면 그 파일을 옆 이름으로 옮겨 보관하고 저장한다", async () => {
+	const badPath = P.session(PROJ1, B.seqId);
+	const h = await bootPanel({ seq: B, files: { [badPath]: "{\"subtitles\":[{\"id\":1,\"text\":\"잘린 파" } });
+	await h.advance(1000);
+	assert.equal(h.snapshot().flags.sessionReadFailed, true);
+	await h.dropSrt("new.srt", "1\n00:00:01,000 --> 00:00:02,000\n새 작업\n");
+	const s = h.snapshot();
+	assert.equal(s.flags.sessionReadFailed, false);
+	const kept = [...h.fs.files.keys()].filter((k) => k.indexOf(badPath + ".unreadable-") === 0);
+	assert.equal(kept.length, 1, "읽지 못한 파일을 옮겨 보관");
+	assert.equal(h.fs.files.get(kept[0]), "{\"subtitles\":[{\"id\":1,\"text\":\"잘린 파", "내용 그대로");
+	assert.deepEqual(h.fs.readJson(badPath).subtitles.map((x) => x.text), ["새 작업"], "새 작업이 저장된다");
+	assert.equal(h.$("alertModal").classList.contains("open"), true);
+	assert.match(h.$("alertMessage").textContent, /옮겨 보관/);
+	assert.ok(h.$("alertMessage").textContent.indexOf(kept[0]) !== -1, "옮긴 경로를 알려 준다");
+	assert.equal(h.$("activeSeqLabel").textContent, "활성 시퀀스 : T_B", "경고가 풀린다");
+	assert.ok(h.fs.readJson(P.historyAuto(PROJ1, B.seqId)), "히스토리도 이어서 쓴다");
+	noErrors(h);
+});
+
+test("읽지 못한 파일을 옮기지 못하면 쓰지 않고, 수동저장도 성공이라고 하지 않는다", async () => {
+	const badPath = P.session(PROJ1, B.seqId);
+	const h = await bootPanel({ seq: B, files: { [badPath]: "{ broken" } });
+	await h.advance(1000);
+	h.fs.renameFails = true;
+	await h.dropSrt("new.srt", "1\n00:00:01,000 --> 00:00:02,000\n새 작업\n");
+	assert.equal(h.snapshot().flags.sessionReadFailed, true);
+	assert.equal(h.fs.files.get(badPath), "{ broken", "덮지 않는다");
+	assert.match(h.$("activeSeqLabel").textContent, /^⚠ 세션 파일 읽기 실패/, "경고가 남는다");
+	// 히스토리 → 저장
+	h.$("btnHistory").click();
+	const saveBtn = h.$("historyDropdown").querySelectorAll("button").find((b) => b.textContent === "저장");
+	saveBtn.click();
+	assert.deepEqual(h.status(), { text: "수동저장하지 못했습니다: 이 시퀀스의 세션 파일을 읽지 못했습니다", cls: "err" });
+	assert.equal(h.fs.files.has(P.historyAuto(PROJ1, B.seqId).replace("history_auto", "history_manual")), false, "수동저장 파일을 만들지 않는다");
+	noErrors(h);
+});
+
+test("localStorage 마이그레이션은 있는데 읽지 못한 session.json을 옛 값으로 덮지 않는다", async () => {
+	const badPath = P.session(PROJ1, A.seqId);
+	const seqKey = seqKeyOf(PROJ1, A.seqId);
+	const legacy = JSON.stringify(session([sub(1, 1, "옛 localStorage 목록")]));
+	const h = await bootPanel({ seq: A, files: { [badPath]: "{\"subtitles\":[{\"id\":1,\"text\":\"잘린 파일" }, localStorage: { ["mogrt_session_" + seqKey]: legacy } });
+	await h.advance(1000);
+	const s = h.snapshot();
+	assert.equal(s.keys.seq, seqKey);
+	assert.equal(s.flags.sessionReadFailed, true, "읽기 실패로 잡힌다");
+	assert.equal(s.subtitles.length, 0);
+	assert.equal(h.fs.files.get(badPath), "{\"subtitles\":[{\"id\":1,\"text\":\"잘린 파일", "마이그레이션이 덮지 않는다");
+	noErrors(h);
+});
+
+test("키를 정한 뒤 그리기 하나가 예외를 던져도 부팅 게이트는 열린다", async () => {
+	const { presets } = build();
+	const broken = clone(presets.preset_3);
+	delete broken.mogrtPath; // makePresetRow가 던진다
+	const trashNoPath = clone(presets.preset_6);
+	delete trashNoPath.mogrtPath;
+	const h = await bootPanel({ seq: A, files: { [P.presets(PROJ1)]: presetsFile({ preset_3: broken }, { presetTrash: [{ preset: trashNoPath, deletedAt: "x" }] }) } });
+	await h.advance(500);
+	assert.equal(h.snapshot().flags.keysResolved, true);
+	assert.equal(h.$("srtInput").disabled, false);
+	assert.equal(h.$("workInput").disabled, false);
+	assert.equal(h.$("btnApply").disabled, false);
+	assert.notEqual(h.status().text, "시퀀스 확인 중…");
+	assert.equal(h.$("presetTrashWrap").querySelectorAll(".trash-row").length, 1, "mogrtPath 없는 휴지통 항목도 그린다");
+	await h.dropSrt("x.srt", "1\n00:00:01,000 --> 00:00:02,000\n가\n");
+	assert.equal(h.rows().length, 1, "SRT를 열 수 있다");
 });
 
 test("SRT 열기는 nextId를 되돌리지 않는다", async () => {
@@ -264,6 +339,29 @@ test("노출 속성이 없는 프리셋의 줄: renderAll을 여러 번 해도 _
 		check();
 	}
 	assert.deepEqual(h.fs.readJson(P.session(PROJ1, A.seqId)).rowStates[1]._allParams, edited, "저장된 파일도 그대로");
+	noErrors(h);
+});
+
+test("노출 속성이 없는 줄의 _allParams가 프리셋과 다른 구조면 v27처럼 프리셋에서 다시 채운다 (▶가 캡션을 엉뚱한 필드에 쓰지 않게)", async () => {
+	const { helpers } = build();
+	const { T, N } = helpers;
+	// 지금 프리셋 구조: 캡션 idx4. 줄에는 옛 구조(캡션 idx0, '서브 포인트 텍스트' idx4)가 남아 있다
+	const cur = [N(0, "크기", 1), N(1, "x", 1), N(2, "y", 1), N(3, "z", 1), T(4, "전체 텍스트", "기본"), N(5, "w", 1), T(6, "포인트 텍스트", "")];
+	const old = [T(0, "전체 텍스트", "옛 캡션"), N(1, "크기", 1), T(2, "포인트 텍스트", ""), N(3, "x", 1), T(4, "서브 포인트 텍스트", "")];
+	const p1 = { id: "preset_1", name: "P1", mogrtPath: "D:/MOGRT/P1.mogrt", params: cur, exposedIndices: [], textParamIndex: 4, exposedFontFields: {}, thumbnailData: null };
+	const sess = session([sub(1, 1, "캡션 문장")]);
+	sess.rowStates[1] = { presetId: "preset_1", params: [], _allParams: clone(old), open: false, checked: false };
+	const h = await bootPanel({ seq: A, mogrts: [{ name: "P1", path: p1.mogrtPath }], files: { [P.presets(PROJ1)]: presetsFile({ preset_1: p1 }), [P.session(PROJ1, A.seqId)]: sess } });
+	await h.advance(500);
+	const all = h.snapshot().rowStates[1]._allParams;
+	assert.deepEqual(all.map((p) => [p.index, p.displayName]), cur.map((p) => [p.index, p.displayName]), "지금 프리셋 구조");
+	assert.equal(all[4].value, "캡션 문장");
+	h.$("btnApply").click();
+	await h.flush();
+	const call = h.host.calls.find((c) => c.fn === "applyToTimeline");
+	assert.ok(call, "applyToTimeline");
+	const sent = JSON.parse(call.args[0]).subtitles[0].params;
+	assert.deepEqual(sent.filter((p) => p.type === "text").map((p) => [p.index, p.displayName, p.value]), [[4, "전체 텍스트", "캡션 문장"], [6, "포인트 텍스트", ""]]);
 	noErrors(h);
 });
 
@@ -406,6 +504,33 @@ test("모달: definition 패치를 받은 뒤에 캐시한다 (두 번째로 열
 	assert.ok(cached, "캐시됨");
 	assert.equal(cached[1].type, "dropdown");
 	assert.deepEqual(cached[1].dropdownOptions, ["왼쪽", "가운데", "오른쪽"]);
-	assert.equal(cached[0].value, "기본", "캐시는 원래 값 (프리셋 값을 덮기 전)");
+	assert.equal(cached[0].value, "기본");
+	noErrors(h);
+});
+
+test("모달: 기존 프리셋을 편집으로 열어도 캐시는 MOGRT 원래 값이다 (프리셋 값이 다른 새 프리셋으로 새지 않는다)", async () => {
+	const { helpers } = build();
+	const path = "D:/MOGRT/합성 A.mogrt";
+	const list = [helpers.T(0, "텍스트", "기본"), helpers.N(1, "정렬", 1, "number")];
+	const def = { sourceInfoLocalized: { en_US: { capsuleparams: { capParams: [{ capPropUIName: "정렬", menuContent: ["왼쪽", "가운데", "오른쪽"] }] } } } };
+	const pv = clone(list);
+	pv[0].value = "프리셋 값";
+	pv[0].rawValue = JSON.stringify(Object.assign(JSON.parse(pv[0].rawValue), { textEditValue: "프리셋 값", fontTextRunLength: [5] }));
+	pv[1].value = "3";
+	const p5 = { id: "preset_5", name: "값 있는 프리셋", mogrtPath: path, params: pv, exposedIndices: [0], textParamIndex: 0, exposedFontFields: {}, thumbnailData: null };
+	const h = await bootPanel({ seq: A, params: { [path]: list }, files: { [path]: "ZmFrZQ==", [P.presets(PROJ1)]: presetsFile({ preset_5: p5 }) } });
+	h.win.JSZip = { loadAsync: async () => ({ file: (n) => (n === "definition.json" ? { async: async () => JSON.stringify(def) } : null) }) };
+	await h.advance(1000);
+	const edit = h.$("presetList").querySelectorAll("button").find((b) => b.textContent === "편집");
+	edit.click();
+	await h.flush();
+	await h.advance(10);
+	assert.ok(h.host.calls.some((c) => c.fn === "getMogrtParams"), "캐시가 없어 호스트에서 읽었다");
+	const cached = h.snapshot().mogrtOriginals[path];
+	assert.ok(cached, "캐시됨");
+	assert.deepEqual([cached[0].value, cached[1].value], ["기본", "1"], "캐시는 원래 값 (프리셋 값을 덮기 전)");
+	assert.equal(cached[1].type, "dropdown", "패치는 캐시에도");
+	// 모달에는 프리셋 값이 보인다
+	assert.ok(h.$("defaultModalBody")._descendants().some((el) => el.value === "프리셋 값"), "모달의 텍스트 입력 = 프리셋 값");
 	noErrors(h);
 });

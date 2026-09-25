@@ -5,10 +5,14 @@
  *   nextPresetId 2)으로 바꿔 놓고 (끝나면 원래 파일로 되돌린다):
  *   (1) 새 프리셋 → preset_9, preset_2는 그대로
  *   (2) 휴지통의 preset_2 복구 → preset_10 ('새 ID로 복구')
+ *   (DEV 캐시의 이 프로젝트 session·히스토리가 preset_9 이상을 이미 가리키면 패널은 그 번호도 피한다 →
+ *    기대 id를 그만큼 올린다. 깨끗한 캐시에서는 preset_9·10·11)
  *   (3) 같은 프리셋 파일을 가져오면 모든 id·행이 그대로
  *   (4) preset_3이 다른 MOGRT인 파일 → 옛 preset_3은 휴지통(why import), 가져온 것은 새 id, preset_3을 쓰던 행은 프리셋 없음
  * 필요: 스캔된 MOGRT 2개 이상. 실행: npm run hard -- s1_2
  */
+const fs = require("node:fs");
+const path = require("node:path");
 const H = require("../lib/hard");
 
 const SRT = [
@@ -19,6 +23,25 @@ const SRT = [
 
 function synthPreset(id, name, mogrtPath) {
 	return { id, name, mogrtPath, params: [], exposedIndices: [], textParamIndex: -1, exposedFontFields: {}, thumbnailData: null };
+}
+
+// DEV 캐시의 이 프로젝트 폴더에서 session·히스토리가 가리키는 가장 큰 프리셋 번호 (패널 _scanDiskPresetRefs와 같은 규칙)
+function diskPresetRefMax(root, projKey) {
+	const dir = path.join(root, projKey);
+	let max = 0;
+	if (!fs.existsSync(dir)) return 0;
+	for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+		if (!e.isDirectory()) continue;
+		for (const f of ["session.json", "history_auto.json", "history_manual.json"]) {
+			const fp = path.join(dir, e.name, f);
+			if (!fs.existsSync(fp)) continue;
+			const text = fs.readFileSync(fp, "utf8");
+			const re = /"presetId"\s*:\s*"preset_(\d+)"/g;
+			let m;
+			while ((m = re.exec(text))) max = Math.max(max, parseInt(m[1], 10));
+		}
+	}
+	return max;
 }
 
 async function importText(api, text, log) {
@@ -55,6 +78,11 @@ module.exports = {
 		const backup = await panel("window._mogrtDebug._fsRead(" + JSON.stringify(presetsPath) + ")");
 		const mogrts = await H.waitMogrts(panel, 2);
 		const M = (i) => mogrts[i % mogrts.length][0];
+		// 씨앗을 넣기 전(홈 session.json이 아직 이전 줄을 가질 때) 디스크 참조를 본다 → 첫 새 id
+		const refMax = diskPresetRefMax(root, snap0.keys.proj);
+		const F = Math.max(9, refMax + 1);
+		const id = (k) => "preset_" + (F + k);
+		log("디스크의 가장 큰 프리셋 참조: " + (refMax || "없음") + " → 첫 새 id " + id(0));
 
 		const seed = {
 			presets: {
@@ -81,10 +109,10 @@ module.exports = {
 			// (1) 새 프리셋 → preset_9
 			await H.createPresetViaModal(api, M(1), { name: "S12 새 프리셋" });
 			let s = await panel("window._mogrtDebug.snapshot()");
-			assert.ok(s.presets.preset_9, "preset_9가 생겼다: " + Object.keys(s.presets).join(","));
-			assert.equal(s.presets.preset_9.name, "S12 새 프리셋");
+			assert.ok(s.presets[id(0)], id(0) + "가 생겼다: " + Object.keys(s.presets).join(","));
+			assert.equal(s.presets[id(0)].name, "S12 새 프리셋");
 			assert.deepEqual([s.presets.preset_2.name, s.presets.preset_2.mogrtPath], ["S12 합성 2", M(1)], "preset_2는 그대로");
-			assert.equal(s.nextPresetId, 10);
+			assert.equal(s.nextPresetId, F + 1);
 
 			// (2) 휴지통의 preset_2 복구 → preset_10
 			const clicked = await panel("(() => { const r = Array.from(document.querySelectorAll('#presetTrashWrap .trash-row')).find((x) => (x.querySelector('.trash-text') || {}).textContent.indexOf('S12 휴지통 2') === 0);" +
@@ -93,10 +121,10 @@ module.exports = {
 			const st2 = await H.waitStatus(panel, /새 ID로 복구/);
 			log(st2.text);
 			s = await panel("window._mogrtDebug.snapshot()");
-			assert.equal(s.presets.preset_10 && s.presets.preset_10.name, "S12 휴지통 2");
-			assert.equal(s.presets.preset_10.id, "preset_10");
+			assert.equal(s.presets[id(1)] && s.presets[id(1)].name, "S12 휴지통 2");
+			assert.equal(s.presets[id(1)].id, id(1));
 			assert.equal(s.presets.preset_2.name, "S12 합성 2", "살아 있던 preset_2를 덮어쓰지 않았다");
-			assert.equal(s.nextPresetId, 11);
+			assert.equal(s.nextPresetId, F + 2);
 
 			// (3) 행 준비: 1번 → preset_1, 2·3번 → preset_3
 			await panel(H.pageSetRowPreset(rows[0].id, "preset_1"));
@@ -130,12 +158,12 @@ module.exports = {
 			assert.deepEqual(trashed.map((t) => t.preset.id), ["preset_3"]);
 			const fresh = Object.values(s.presets).find((p) => p.name === "S12 합성 3");
 			assert.ok(fresh && fresh.id !== "preset_3", "가져온 preset_3은 새 id: " + (fresh && fresh.id));
-			assert.equal(fresh.id, "preset_11");
+			assert.equal(fresh.id, id(2));
 			assert.equal(fresh.mogrtPath, other.preset_3.mogrtPath);
 			assert.deepEqual(rows.map((r) => s.rowStates[r.id].presetId), ["preset_1", "", ""], "preset_3 행은 프리셋 없음 (다른 MOGRT가 아님)");
 			const sel = await panel(H.PAGE_ROWS);
 			assert.deepEqual(sel.map((r) => r.preset), ["preset_1", "", ""]);
-			return "preset_9 · preset_10 · 재가져오기 id 유지 · " + fresh.id;
+			return id(0) + " · " + id(1) + " · 재가져오기 id 유지 · " + fresh.id;
 		} finally {
 			// DEV presets.json을 원래대로 (없었으면 빈 프리셋 파일)
 			const restore = backup || { presets: {}, presetTrash: [], nextPresetId: 1 };

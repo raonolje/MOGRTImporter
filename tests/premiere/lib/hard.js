@@ -121,6 +121,17 @@ function jsxHasSequenceNamed(name) {
 	return "(function(){var n=" + JSON.stringify(String(name)) + ";var p=app.project;for(var k=0;k<p.sequences.numSequences;k++){if(String(p.sequences[k].name)===n)return 'true';}return 'false';})()";
 }
 
+/**
+ * 프로젝트의 __MOGRT_PREVIEW__ 시퀀스를 지운다 (이 이름과 정확히 같은 시퀀스만) → "deleted:n left:m".
+ * 패널이 필요할 때 setupPreviewSequence로 다시 만든다. '프리뷰 시퀀스가 없는 프로젝트' 경로를 시험할 때만 쓴다.
+ */
+function jsxDeletePreviewSequence() {
+	return "(function(){var p=app.project,n=0,m=0;for(var k=p.sequences.numSequences-1;k>=0;k--){var s=p.sequences[k];" +
+		"if(String(s.name)==='__MOGRT_PREVIEW__'){try{p.deleteSequence(s);n++;}catch(e){}}}" +
+		"for(var j=0;j<p.sequences.numSequences;j++){if(String(p.sequences[j].name)==='__MOGRT_PREVIEW__')m++;}" +
+		"return 'deleted:'+n+' left:'+m;})()";
+}
+
 /** ticks 문자열 → 프레임 (timebase = 프레임당 ticks) */
 function ticksToFrame(ticks, timebase) {
 	return Math.round(Number(ticks) / Number(timebase));
@@ -147,6 +158,15 @@ const PAGE_ROWS = "Array.from(document.querySelectorAll('#listWrap .sub-row')).m
 	" cls: r.className }))";
 
 const PAGE_STATUS = "(() => { const s = document.getElementById('statusBar'); return s ? { text: s.textContent, cls: s.className } : null; })()";
+
+/**
+ * 패널이 부르는 호스트 함수 이름을 순서대로 window.__hostCalls에 남기기 시작한다 (기록을 비운다).
+ * CSInterface.prototype.evalScript를 감싼다. 케이스의 host()가 보내는 (function(){…})() 식은 이름이 없어 빠진다.
+ */
+const PAGE_RECORD_HOST_CALLS = "(() => { window.__hostCalls = []; if (!window.__hostCallsHooked) { window.__hostCallsHooked = true;" +
+	" const orig = CSInterface.prototype.evalScript; CSInterface.prototype.evalScript = function (script, cb) {" +
+	"  const m = /^\\s*([A-Za-z_$][\\w$]*)\\s*\\(/.exec(String(script)); if (m) window.__hostCalls.push(m[1]); return orig.call(this, script, cb); }; }" +
+	" return true; })()";
 
 /** 행 select로 프리셋 하나를 행 하나에 건다 (체크된 행이 없을 때 = 한 줄 경로) */
 function pageSetRowPreset(rowId, presetId) {
@@ -262,8 +282,8 @@ async function devCacheRoot(panel) {
 
 module.exports = {
 	sleep, waitFor, ticksToFrame,
-	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed, jsxCloneActiveAsScratch, jsxDropScratch, withScratchSequence, SCRATCH_PREFIX,
+	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed, jsxDeletePreviewSequence, jsxCloneActiveAsScratch, jsxDropScratch, withScratchSequence, SCRATCH_PREFIX,
 	pageDropSrt, pageSetRowPreset, pageImportPresetsText,
-	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS,
+	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS, PAGE_RECORD_HOST_CALLS,
 	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot
 };

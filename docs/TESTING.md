@@ -28,12 +28,12 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - `tests/lib/panelHarness.js` (S1-3): **app.js 전체**(IIFE)를 node:vm에서 부팅한다. 브라우저가 아니라 app.js가 지나가는 만큼만 흉내 낸다.
   - DOM: `index.html`을 작은 파서로 읽은 트리(id·class·label 부모·select 옵션, innerHTML 마크업도 파싱). 선택자는 `tag#id.class[attr=v]:checked`, 자손, 쉼표만.
   - 호스트: `CSInterface.evalScript`의 함수 이름으로 `h.host.handlers[이름](...인자)`를 부르고 `h.host.calls`에 남긴다. 처리기가 없으면 빈 응답(전송 실패).
-  - `cep.fs`: 메모리(`h.fs.files`, 쓰기 기록 `h.fs.writes`, 읽기 실패 흉내 `h.fs.unreadable`). 캐시 경로는 `cachePaths`로 만든다.
+  - `cep.fs`: 메모리(`h.fs.files`, 쓰기 기록 `h.fs.writes`, 읽기 실패 흉내 `h.fs.unreadable`, 옮기기 실패 흉내 `h.fs.renameFails`). `readdir`·`rename`도 있다. 캐시 경로는 `cachePaths`로 만든다.
   - 시계: 타이머는 `await h.advance(ms)`로만 돈다(부팅 2초 재확인, 100 ms 폴러, 30초 재스캔). `Date`는 진짜라 5분 무작업 자동저장은 돌지 않는다.
   - 상태는 `h.snapshot()`(= `window._mogrtDebug.snapshot()`, 읽기 전용 사본)으로 본다. `h.errors()`는 부팅·타이머·콘솔의 TypeError/ReferenceError.
   - `panel_golden.test.js`(단일 화자 SRT → 프리셋 → ▶ 페이로드·session.json)는 v27 app.js에서도 통과한다. 단일 화자 경로가 바뀌면 여기서 깨진다.
 - **픽스처는 합성 텍스트만** 넣는다(`tests/fixtures/`). 저장소에 GitHub 원격이 있다. `tests/fixtures/**`는 `-text`라 CRLF·CR·BOM 바이트가 그대로 커밋된다.
-- `tests/compat/` (S1-5부터): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지).
+- `tests/compat/` (S1-5부터, `preset_refs.test.js`는 S1-2 리뷰 반영): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지). 출력은 숫자·id만.
 
 ## 3. ES3 린트
 

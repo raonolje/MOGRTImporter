@@ -20,8 +20,11 @@
 	//   _keysResolved      실제(프리뷰가 아닌) 시퀀스로 프로젝트·시퀀스 키가 정해졌다. 그 전에는
 	//                      SRT 열기·적용·작업 불러오기를 막고 세션 파일에 쓰지 않는다 (부팅 게이트)
 	//   _filtersReady      main.ts의 검색·프리셋 필터 선언이 끝났다 (renderAll에서 필터를 부르기 전 확인)
-	//   _sessionReadFailed 지금 키의 session.json이 있는데 읽지 못했다. 그 키로는 저장하지 않는다
+	//   _sessionReadFailed 지금 키의 session.json이 있는데 읽지 못했다. 그 파일을 덮지 않는다
+	//                      (새 작업을 저장할 때 그 파일을 옆 이름으로 옮겨 보관한 뒤 풀린다)
 	var _keysResolved = false, _filtersReady = false, _sessionReadFailed = false;
+	// 활성 시퀀스 표시(#activeSeqLabel)의 마지막 정보. 세션 읽기 실패 경고를 다시 그릴 때 쓴다
+	var _seqLabelInfo = null;
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -137,13 +140,14 @@
 		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/settings.json";
 	}
 	// ── localStorage → 파일 마이그레이션 (최초 1회) ──
+	// 파일이 '있는가'는 _fsExists로 본다. _fsRead는 있는데 읽지 못한 파일에도 null을 돌려주므로
+	// 그것으로 판단하면 깨진 session.json 등을 localStorage의 옛 값으로 덮어 버린다.
 	function _migrateFromLocalStorage() {
 		try {
 			// 프리셋 마이그레이션
 			const presetsPath = _getPresetsPath();
 			if (presetsPath) {
-				const existingFile = _fsRead(presetsPath);
-				if (!existingFile) {
+				if (!_fsExists(presetsPath)) {
 					let raw = localStorage.getItem("mogrt_presets_" + state.currentProjectKey);
 					if (!raw) raw = localStorage.getItem("mogrtImporter_" + state.currentProjectKey);
 					if (!raw) raw = localStorage.getItem("mogrtImporter_default");
@@ -159,8 +163,7 @@
 			// 세션 마이그레이션
 			const sessionPath = _getSessionPath();
 			if (sessionPath) {
-				const existingSession = _fsRead(sessionPath);
-				if (!existingSession) {
+				if (!_fsExists(sessionPath)) {
 					const sraw = localStorage.getItem("mogrt_session_" + state.currentSequenceKey);
 					if (sraw) {
 						try {
@@ -174,8 +177,7 @@
 			// 히스토리 마이그레이션
 			const histPath = _getHistoryPath();
 			if (histPath) {
-				const existingHist = _fsRead(histPath);
-				if (!existingHist) {
+				if (!_fsExists(histPath)) {
 					const hraw = localStorage.getItem("mogrt_history");
 					if (hraw) {
 						try {
@@ -189,8 +191,7 @@
 			// 트랙 마이그레이션
 			const trackPath = _getTrackPath();
 			if (trackPath) {
-				const existingTrack = _fsRead(trackPath);
-				if (!existingTrack) {
+				if (!_fsExists(trackPath)) {
 					const traw = localStorage.getItem("mogrt_track_" + state.currentSequenceKey);
 					if (traw !== null) {
 						_fsWrite(trackPath, { trackValue: traw });
@@ -213,7 +214,10 @@
 	}
 	// 세션 저장. 다음 경우에는 쓰지 않는다.
 	//   - 키가 정해지기 전 (부팅 게이트): 기본 키(default_seq)의 기존 목록을 빈 목록으로 덮지 않게
-	//   - 지금 키의 session.json을 읽지 못했을 때: 읽지 못한 파일을 메모리 값으로 덮지 않게 (오류 표시)
+	//   - 지금 키의 session.json을 읽지 못했을 때: 읽지 못한 파일을 메모리 값으로 덮지 않는다.
+	//     읽기 실패 때 목록을 비웠으므로, 목록이나 휴지통이 다시 찼다면 이 시퀀스에서 새로 한 작업이다.
+	//     그때 읽지 못한 파일을 session.json.unreadable-<시각>으로 옮겨 보관하고 저장을 이어 간다
+	//     (옮기지 못하면 쓰지 않고 오류를 보인다). 비어 있으면 아무것도 하지 않는다 (전환 직전 저장 등).
 	//   - 자막과 휴지통이 모두 비었고 파일도 없을 때: 들르기만 한 시퀀스마다 빈 파일이 생기지 않게
 	function saveSessionToStorage() {
 		try {
@@ -221,8 +225,15 @@
 			const path = _getSessionPath();
 			if (!path) return;
 			if (_sessionReadFailed) {
-				setStatus("세션 파일을 읽지 못해 이 시퀀스에는 저장하지 않습니다 (파일을 확인하세요)", "err");
-				return;
+				if (state.subtitles.length === 0 && state.trashBin.length === 0) return;
+				const kept = _setAsideUnreadable(path);
+				if (kept === null) {
+					setStatus("세션 파일을 읽지 못했고 옮기지도 못해 이 시퀀스에는 저장하지 않습니다 (파일을 확인하세요)", "err");
+					return;
+				}
+				_sessionReadFailed = false;
+				_renderSeqLabel();
+				if (kept) showAlert("이 시퀀스의 세션 파일을 읽지 못해 목록을 비웠었습니다.\n읽지 못한 파일은 다음 이름으로 옮겨 보관하고, 지금 작업을 새로 저장합니다.\n\n" + kept);
 			}
 			if (state.subtitles.length === 0 && state.trashBin.length === 0 && !_fsExists(path)) return;
 			const data = {
@@ -233,6 +244,29 @@
 			};
 			_fsWrite(path, data);
 		} catch (_) {}
+	}
+	// 읽지 못한 세션 파일을 같은 폴더의 path.unreadable-<YYYYMMDD-HHMMSS>로 옮긴다 (지우지 않는다).
+	//   → 옮긴 경로 / "" (그 사이 파일이 없어져 옮길 것이 없다) / null (옮기지 못했다: 쓰면 안 된다)
+	function _setAsideUnreadable(path) {
+		try {
+			if (!_fsExists(path)) return "";
+			if (!window.cep || !window.cep.fs || typeof window.cep.fs.rename !== "function") return null;
+			const d = new Date();
+			const p2 = (n) => String(n).padStart(2, "0");
+			const ts = d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + "-" + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds());
+			let dest = path + ".unreadable-" + ts;
+			for (let i = 2; _fsExists(dest); i++) dest = path + ".unreadable-" + ts + "-" + i;
+			const r = window.cep.fs.rename(path, dest);
+			if (!r || r.err !== 0 || _fsExists(path)) {
+				console.error("[MOGRT] 읽지 못한 세션 파일을 옮기지 못함:", path, r && r.err);
+				return null;
+			}
+			console.warn("[MOGRT] 읽지 못한 세션 파일을 옮겨 보관:", dest);
+			return dest;
+		} catch (e) {
+			console.error("[MOGRT] 읽지 못한 세션 파일 옮기기 예외:", e);
+			return null;
+		}
 	}
 	// ── state.subtitles / state.presets 대입 창구 ──
 	//
@@ -268,19 +302,22 @@
 	// 지금 키의 session.json을 메모리에 넣는다 (키가 바뀔 때마다: 같은 프로젝트든 다른 프로젝트든).
 	//   파일 있음        그 내용으로 바꾼다 (빠진 키는 빈 값)
 	//   파일 없음        세션 상태를 비운다 (이전 시퀀스·프로젝트의 목록이 새 키로 새지 않게)
-	//   있는데 못 읽음   메모리를 그대로 두고 _sessionReadFailed → 이 키로는 저장하지 않는다
+	//   있는데 못 읽음   세션 상태를 비우고 _sessionReadFailed → 그 파일은 덮지 않는다.
+	//                    메모리의 목록은 이전 키(다른 시퀀스)의 것이라 남겨 두면 ▶로 이 시퀀스에 적용되거나
+	//                    이 키에 저장될 수 있다. 목록을 다시 채우는 새 작업이 저장될 때 saveSessionToStorage가
+	//                    읽지 못한 파일을 옆 이름으로 옮겨 보관한다.
 	function _loadSessionForKey(reason) {
 		const path = _getSessionPath();
 		const r = path ? _fsReadEx(path) : { exists: false, data: null, error: null };
-		if (r.exists && !r.data) {
-			_sessionReadFailed = true;
+		const failed = r.exists && !r.data;
+		_sessionReadFailed = failed;
+		if (failed) {
 			console.error("[MOGRT] 세션 파일 읽기 실패:", path, r.error);
-			setStatus("세션 파일을 읽지 못했습니다 (" + r.error + ") — 이 시퀀스에는 저장하지 않습니다", "err");
-			return;
+			setStatus("세션 파일을 읽지 못했습니다 (" + r.error + ") — 파일은 그대로 두고 목록을 비웠습니다. 새로 작업하면 그 파일은 옆 이름으로 옮겨 보관합니다", "err");
 		}
-		_sessionReadFailed = false;
+		_renderSeqLabel();
 		const sdata = r.data || {};
-		setSubtitles(Array.isArray(sdata.subtitles) ? sdata.subtitles : [], { reason: r.exists ? reason : reason + " (파일 없음)", persist: false });
+		setSubtitles(Array.isArray(sdata.subtitles) ? sdata.subtitles : [], { reason: failed ? reason + " (읽기 실패)" : r.exists ? reason : reason + " (파일 없음)", persist: false });
 		state.rowStates = sdata.rowStates && typeof sdata.rowStates === "object" ? sdata.rowStates : {};
 		state.trashBin = Array.isArray(sdata.trashBin) ? sdata.trashBin : [];
 		state.nextId = r.exists ? safeNextId(sdata) : 1;
@@ -301,23 +338,84 @@
 	function _sanitizeOrphanPresets() {
 		// state.presets에 없는 presetId를 rowStates에서 제거 + 색상 맵 재구성
 		Object.values(state.rowStates).forEach((rs) => {
-			if (rs.presetId && !state.presets[rs.presetId]) rs.presetId = "";
+			if (rs.presetId && !state.presets[rs.presetId]) {
+				// 끊은 id도 새 프리셋에 다시 주지 않는다 (작업 파일·다른 시퀀스가 아직 그 id를 가리킬 수 있다)
+				_notePresetRef(presetNum(rs.presetId));
+				rs.presetId = "";
+			}
 		});
 		// 유효한 presetId만 색상 맵에 등록
 		const usedPresets = new Set(Object.values(state.rowStates).map((rs) => rs.presetId).filter(Boolean));
 		usedPresets.forEach((pid) => _getPresetColorIndex(pid));
 	}
-	// 새 프리셋 id (단조 증가, 빈 번호를 다시 쓰지 않는다). state.nextPresetId를 함께 올린다.
-	// 참조: 살아 있는 프리셋, 프리셋 휴지통, 행과 자막 휴지통이 가리키는 id.
-	// (S1-5에서 mi.cast, S2-3에서 cast_defaults가 참조에 더해진다)
-	// 호출한 쪽이 savePresetsToStorage()로 저장한다.
-	function _allocPresetId() {
+	// ── 프리셋 id 참조 (메모리 밖) ──
+	// 메모리(프리셋·휴지통·지금 시퀀스의 행)에 없는데 id를 가리키는 곳: 이 프로젝트의 다른 시퀀스
+	// session.json과 히스토리, 불러온 작업 파일. v27 가져오기가 카운터를 1로 되돌리고 프리셋을
+	// 지웠으므로 그런 id가 저장된 nextPresetId보다 클 수 있다. 그 id를 새 프리셋에 주면 그 시퀀스를
+	// 열 때 행이 조용히 다른 MOGRT를 가리킨다. 프로젝트 키마다 가장 큰 번호만 기억한다 (메모리).
+	var _presetRefMax = {};   // projKey → {disk: 디스크를 훑었는가, max: 본 가장 큰 번호}
+	function _presetRefEntry() {
+		const pk = state.currentProjectKey;
+		if (!_presetRefMax[pk]) _presetRefMax[pk] = { disk: false, max: 0 };
+		return _presetRefMax[pk];
+	}
+	function _notePresetRef(n) {
+		const e = _presetRefEntry();
+		if (n > e.max) e.max = n;
+	}
+	// cache/<projKey>/*/{session,history_auto,history_manual}.json의 "presetId":"preset_N" 중 가장 큰 N.
+	// 파싱하지 않고 글자로만 찾는다 (깨진 파일도 본다). 프로젝트 키마다 한 번 (처음 id를 줄 때).
+	// 그 뒤로 디스크에 새로 생기는 참조는 살아 있거나 휴지통에 있던 프리셋의 것이라 카운터가 덮는다.
+	function _scanDiskPresetRefs() {
+		const e = _presetRefEntry();
+		if (e.disk) return;
+		const root = _getCacheRoot();
+		const fsx = window.cep && window.cep.fs;
+		if (!root || !fsx || typeof fsx.readdir !== "function") return;
+		e.disk = true;
+		try {
+			const dir = root + "/" + state.currentProjectKey;
+			const ls = fsx.readdir(dir);
+			if (!ls || ls.err !== 0 || !Array.isArray(ls.data)) return;
+			const re = /"presetId"\s*:\s*"preset_(\d+)"/g;
+			ls.data.forEach((name) => {
+				["session.json", "history_auto.json", "history_manual.json"].forEach((f) => {
+					const r = fsx.readFile(dir + "/" + name + "/" + f);
+					if (!r || r.err !== 0 || !r.data) return;
+					let m;
+					re.lastIndex = 0;
+					while ((m = re.exec(r.data))) _notePresetRef(parseInt(m[1], 10));
+				});
+			});
+		} catch (err) {
+			console.warn("[MOGRT] 프리셋 참조 훑기 실패:", err);
+		}
+	}
+	// 새 id가 피해야 할 참조: 행과 자막 휴지통이 가리키는 id + 메모리 밖에서 본 가장 큰 번호
+	function _presetRefs() {
+		_scanDiskPresetRefs();
 		const refs = [];
 		Object.values(state.rowStates || {}).forEach((rs) => { if (rs && rs.presetId) refs.push(rs.presetId); });
 		(state.trashBin || []).forEach((t) => { if (t && t.state && t.state.presetId) refs.push(t.state.presetId); });
-		const r = nextFreePresetId(state.presets, state.presetTrash, refs, state.nextPresetId);
+		const outside = _presetRefEntry().max;
+		if (outside > 0) refs.push("preset_" + outside);
+		return refs;
+	}
+	// 새 프리셋 id (단조 증가, 빈 번호를 다시 쓰지 않는다). state.nextPresetId를 함께 올린다.
+	// 참조: 살아 있는 프리셋, 프리셋 휴지통, 행과 자막 휴지통이 가리키는 id, 메모리 밖 참조(_presetRefs).
+	// (S1-5에서 mi.cast, S2-3에서 cast_defaults가 참조에 더해진다)
+	// 호출한 쪽이 savePresetsToStorage()로 저장한다.
+	function _allocPresetId() {
+		const r = nextFreePresetId(state.presets, state.presetTrash, _presetRefs(), state.nextPresetId);
 		state.nextPresetId = r.next;
 		return r.id;
+	}
+	// 카운터를 알려진 모든 id 위로 올린다 (id를 주지는 않는다, 내리지 않는다).
+	// 프리셋 휴지통을 비우기 전에 부른다: 휴지통이 그 id의 마지막 기록일 수 있고, 저장된 카운터는 낡았을 수 있다.
+	// 호출한 쪽이 savePresetsToStorage()로 저장한다.
+	function _raisePresetCounter() {
+		const r = nextFreePresetId(state.presets, state.presetTrash, _presetRefs(), state.nextPresetId);
+		if (r.next - 1 > state.nextPresetId) state.nextPresetId = r.next - 1;
 	}
 	// opts.presetsOnly: 부팅 때. 키가 정해지기 전이라 세션(목록)은 읽지 않는다.
 	// 프리셋은 v27처럼 파일이 없으면 메모리의 것을 그대로 가져간다.
@@ -2037,7 +2135,7 @@
 			nameEl.textContent = item.preset.name + (item.why === "import" ? " (가져오기로 교체됨)" : "");
 			const mogrtEl = document.createElement("span");
 			mogrtEl.className = "trash-time";
-			mogrtEl.textContent = item.preset.mogrtPath.split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? "";
+			mogrtEl.textContent = String(item.preset.mogrtPath || "").split(/[\\/]/).pop()?.replace(/\.mogrt$/i, "") ?? "";
 			const restoreBtn = document.createElement("button");
 			restoreBtn.className = "btn-restore";
 			restoreBtn.textContent = "복구";
@@ -2087,6 +2185,8 @@
 			_setStatus$3(count + "개 자막 전체 복구됨", "ok");
 		});
 		document.getElementById("btnEmptyPresetTrash")?.addEventListener("click", () => {
+			// 휴지통의 id를 잊기 전에 카운터를 그 위로 올린다 (비운 뒤 새 프리셋이 그 id를 다시 받지 않게)
+			_raisePresetCounter();
 			state.presetTrash = [];
 			renderPresetTrash();
 			savePresetsToStorage();
@@ -4093,21 +4193,25 @@ var modalState = {
 	//   _allParams에서 exposedIndices로 다시 고른다.
 	// v27은 'params가 비었으면 다시 읽기'라서 노출 속성이 없는 프리셋의 줄은 renderAll마다
 	// _allParams가 프리셋 기본값으로 돌아가 후반 작업 값이 사라졌다.
+	// 예외: 노출 속성(params)이 빈 줄의 _allParams 구조가 프리셋과 다르면(그 사이 프리셋을 다른 구조의
+	// MOGRT로 다시 저장했다) v27처럼 프리셋에서 다시 채운다. ▶·↑는 index로 쓰므로 옛 구조를 그대로 보내면
+	// 캡션이 다른 필드에 들어가고 진짜 캡션 필드가 비워진다. 속성창이 없는 줄이라 잃을 패널 편집도 없다.
+	// (S1-9 이름 쓰기·S1-10 구조 맞춤이 들어오면 이 예외를 다시 본다)
 	function _ensureRowParams(sub, rs) {
 		if (!rs) return;
 		const tBtn = document.getElementById("toggle-" + sub.id);
 		const hasAll = !!(rs._allParams && rs._allParams.length);
-		if (rs.presetId && !hasAll && (!rs.params || rs.params.length === 0)) {
+		const noExposed = !rs.params || rs.params.length === 0;
+		const preset = rs.presetId ? state.presets[rs.presetId] : null;
+		const stale = !!(preset && hasAll && noExposed && layoutMismatch(rs._allParams, preset.params));
+		if (rs.presetId && noExposed && (!hasAll || stale)) {
 			loadParamsFromPreset(sub.id, rs.presetId, sub.text, rs.open !== false);
 			if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
 			return;
 		}
-		if (rs.presetId && hasAll && (!rs.params || rs.params.length === 0)) {
-			const preset = state.presets[rs.presetId];
-			const exposed = preset && Array.isArray(preset.exposedIndices) ? preset.exposedIndices : [];
-			if (preset && exposed.length > 0 && !layoutMismatch(rs._allParams, preset.params)) {
-				rs.params = rs._allParams.filter((p) => exposed.includes(p.index));
-			}
+		if (preset && hasAll && noExposed) {
+			const exposed = Array.isArray(preset.exposedIndices) ? preset.exposedIndices : [];
+			if (exposed.length > 0) rs.params = rs._allParams.filter((p) => exposed.includes(p.index));
 		}
 		if (rs.params && rs.params.length > 0) {
 			const panel = document.getElementById("params-" + sub.id);
@@ -4727,10 +4831,21 @@ var modalState = {
 		return !!(info && (info.seqId || info.seqName) && info.seqName !== "__MOGRT_PREVIEW__");
 	}
 	function _setSeqLabel(info) {
+		_seqLabelInfo = info;
+		_renderSeqLabel();
+	}
+	// 활성 시퀀스 표시. 세션 파일을 읽지 못한 키면 앞에 경고를 붙인다 (상태 줄 오류는 다음 문구에 덮이므로)
+	function _renderSeqLabel() {
 		const el = document.getElementById("activeSeqLabel");
-		if (el) el.textContent = (info.seqName || info.seqId) ? "활성 시퀀스 : " + (info.seqName || info.seqId) : "";
+		const info = _seqLabelInfo;
+		if (!el || !info) return;
+		const name = info.seqName || info.seqId;
+		const warn = name && _keysResolved && _sessionReadFailed ? "⚠ 세션 파일 읽기 실패 · " : "";
+		el.textContent = name ? warn + "활성 시퀀스 : " + name : "";
+		el.title = warn ? "이 시퀀스의 session.json을 읽지 못했습니다. 파일은 덮지 않으며, 새로 작업하면 옆 이름으로 옮겨 보관합니다." : "현재 활성 시퀀스";
 	}
 	// 처음 키를 정한다: 프리셋+세션을 그 키로 읽고 게이트를 연다
+	// 그리기 하나가 예외를 던져도 게이트는 연다 (v27은 같은 예외를 삼키고 SRT 열기를 막지 않았다)
 	function _resolveKeys(info) {
 		if (_keysResolved || !_isRealSeqInfo(info)) return;
 		const k = _keysFromInfo(info);
@@ -4741,14 +4856,9 @@ var modalState = {
 		// 프로젝트/시퀀스 키 확정 후 프리셋+자막 모두 올바른 키로 재로드
 		loadAllFromStorage();
 		_keysResolved = true;
-		renderAll();
-		renderTrash();
-		renderPresetList();
-		renderPresetTrash();
-		refreshAllSelects();
-		updateMultiSelect();
-		updatePresetTabCount();
-		_loadTrackFromStorage();
+		[renderAll, renderTrash, renderPresetList, renderPresetTrash, refreshAllSelects, updateMultiSelect, updatePresetTabCount, _loadTrackFromStorage, _renderSeqLabel].forEach((fn) => {
+			try { fn(); } catch (e) { console.error("[MOGRT] 키 확정 뒤 그리기 실패:", fn.name, e); }
+		});
 		_updateBootGate(false);
 	}
 	function _tryResolveKeys() {
@@ -5271,12 +5381,11 @@ var modalState = {
 								rawPath = rawPath.substring(0, mogrtExtIdx + 6);
 							}
 							if (rawPath !== p.mogrtPath) p.mogrtPath = rawPath;
-							// 경로 비교: 전체 경로 일치 또는 파일명 일치 (드라이브/슬래시 차이 허용)
+							// 경로 비교: 전체 경로 일치를 먼저, 없으면 파일명 일치 (드라이브/슬래시 차이 허용).
+							// 한 번에 찾으면 스캔 목록에서 앞에 있는 같은 이름의 다른 폴더 파일(예: 옛 버전 사본)이 이긴다.
 							const pFileName = rawPath.split(/[\\/]/).pop().toLowerCase();
-							const matched = state.mogrtList.find((m) =>
-								m.path === p.mogrtPath ||
-								m.path.toLowerCase().split(/[\\/]/).pop() === pFileName
-							);
+							const exact = state.mogrtList.find((m) => m.path === p.mogrtPath);
+							const matched = exact || state.mogrtList.find((m) => m.path.toLowerCase().split(/[\\/]/).pop() === pFileName);
 							if (!matched) {
 								skipped++;
 								skippedNames.push(p.name + " (" + pFileName + ")");
@@ -5284,7 +5393,7 @@ var modalState = {
 							}
 							// 파일명 일치 시 실제 경로로 업데이트
 							if (matched.path !== p.mogrtPath) p.mogrtPath = matched.path;
-							accepted.push({ pid, p });
+							accepted.push({ pid, p, byName: !exact });
 						}
 						const plan = matchImportedPresets(accepted.map((a) => ({ id: a.pid, name: a.p.name, mogrtPath: a.p.mogrtPath })), live);
 						let lostRows = 0;
@@ -5297,10 +5406,18 @@ var modalState = {
 							lostRows = Object.values(state.rowStates).filter((rs) => rs && rs.presetId && plan.dropped.indexOf(rs.presetId) !== -1).length;
 						}
 						let kept = 0;
+						let moved = 0;
 						accepted.forEach((a, i) => {
 							const reuse = plan.ids[i];
 							const newId = reuse || _allocPresetId();
-							if (reuse) kept++;
+							if (reuse) {
+								kept++;
+								// id를 다시 쓰는데 파일의 경로가 파일명으로만 찾아졌으면(다른 PC 경로 등) 같은 이름의 여러 파일 중
+								// 아무것이나 고른 셈이다. 지금 프리셋의 MOGRT가 아직 스캔 목록에 있으면 그 경로를 지킨다.
+								const livePath = live[reuse] && live[reuse].mogrtPath;
+								if (a.byName && livePath && livePath !== a.p.mogrtPath && state.mogrtList.some((m) => m.path === livePath)) a.p.mogrtPath = livePath;
+								if (livePath && livePath !== a.p.mogrtPath) moved++;
+							}
 							state.presets[newId] = migratePreset({
 								...a.p,
 								id: newId,
@@ -5318,8 +5435,9 @@ var modalState = {
 						refreshAllSelects();
 						updatePresetTabCount();
 						let msg = "프리셋 불러오기: " + imported + "개 " + (clearFirst ? "교체" : "추가");
-						if (kept > 0) msg += " (ID 유지 " + kept + "개)";
-						const lostMsg = lostRows > 0 ? lostRows + "개 줄의 프리셋 연결이 끊어졌습니다 (프리셋 휴지통에서 복구 가능)" : "";
+						if (kept > 0) msg += " (ID 유지 " + kept + "개" + (moved > 0 ? ", 그중 MOGRT 경로가 바뀐 프리셋 " + moved + "개" : "") + ")";
+						// 끊긴 줄은 '프리셋 없음'으로 저장된다. 프리셋을 휴지통에서 복구해도 줄은 다시 이어지지 않는다
+						const lostMsg = lostRows > 0 ? lostRows + "개 줄의 프리셋 연결이 끊어졌습니다 (이전 프리셋은 프리셋 휴지통에 있습니다. 줄에는 다시 지정해야 합니다)" : "";
 						if (lostMsg) msg += " · " + lostMsg;
 						if (skipped > 0) {
 							msg += ", " + skipped + "개 스킵";
@@ -5435,10 +5553,11 @@ var modalState = {
 			if (path) _fsWrite(path, list);
 		} catch(_) {}
 	}
+	// → 히스토리 파일에 썼는가 (빈 목록·키 미확정·세션 읽기 실패면 false)
 	function _saveHistory(label, isManual) {
-		if (state.subtitles.length === 0) return;
+		if (state.subtitles.length === 0) return false;
 		// 키가 정해지기 전이거나 세션 파일을 읽지 못한 키면, 메모리 목록이 이 키의 것이 아니다
-		if (!_keysResolved || _sessionReadFailed) return;
+		if (!_keysResolved || _sessionReadFailed) return false;
 		try {
 			const list = _loadHistoryList(isManual);
 			const entry = {
@@ -5456,7 +5575,8 @@ var modalState = {
 			if (list.length > HISTORY_MAX) list.length = HISTORY_MAX;
 			_saveHistoryList(list, isManual);
 			_updateHistoryBtn();
-		} catch(_) {}
+			return true;
+		} catch(_) { return false; }
 	}
 	function _updateHistoryBtn() {
 		try {
@@ -5495,7 +5615,12 @@ var modalState = {
 			saveBtn.addEventListener("click", (e) => {
 				e.stopPropagation();
 				const label = saveInput.value.trim() || "수동저장";
-				_saveHistory(label, true);
+				const saved = _saveHistory(label, true);
+				// 목록이 있는데 쓰지 못했으면(세션 파일 읽기 실패 등) 성공이라고 하지 않는다. 빈 목록은 v27 문구 그대로
+				if (!saved && state.subtitles.length > 0) {
+					setStatus("수동저장하지 못했습니다: " + (_sessionReadFailed ? "이 시퀀스의 세션 파일을 읽지 못했습니다" : "기록을 쓰지 못했습니다"), "err");
+					return;
+				}
 				saveInput.value = "";
 				_buildHistoryDropdown();
 				setStatus("수동저장됨: " + label, "ok");

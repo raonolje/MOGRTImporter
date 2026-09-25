@@ -4,10 +4,10 @@
  *   (9) 새로 고침 예외 없음, bootDone, ▶ 핸들러
  *   (8) 키가 정해지면 SRT 열기·▶가 열린다 (시퀀스가 없을 때 막히는 것은 수동: 모든 시퀀스를 닫고 새로 고침)
  *   (1) 다른 T_ 시퀀스 3개를 돌아도 DEV 캐시 파일 수가 그대로
- *   (3) 읽지 못하는 session.json → 목록 유지, 쓰지 않음, 오류 표시 (원래 파일은 되돌린다)
+ *   (3) 읽지 못하는 session.json → 목록을 비움(이전 시퀀스 목록을 끌고 오지 않음), 쓰지 않음, 오류·남는 경고 (원래 파일은 되돌린다)
  *   (4) 체크 안 된 줄에서 '-- 프리셋 선택 --' → 예외 없음
  *   (7) 히스토리 복원 → 새로 고친 뒤에도 #trackSel 복원
- *   (10) 모달 캐시가 없을 때 V1 클립이 그대로 (프리뷰 시퀀스가 없던 프로젝트면 패널이 만든다)
+ *   (10) 스크래치 사본에서 __MOGRT_PREVIEW__를 지우고 새로 고친 뒤 모달 → setupPreviewSequence가 getMogrtParams보다 먼저, 사본 V1 그대로
  *   (11) 같은 MOGRT를 두 번째로 열 때 definition 패치(드롭다운 이름)가 캐시에 있다
  * 필요: T_ 시퀀스 4개 이상. (2) 프로젝트 전환 네 조합은 두 번째 프로젝트가 필요해 수동이다 (보고서 참조).
  * 실행: npm run hard -- s1_3
@@ -85,15 +85,20 @@ module.exports = {
 				await switchTo(api, B);
 				snap = await panel("window._mogrtDebug.snapshot()");
 				assert.equal(snap.flags.sessionReadFailed, true);
-				assert.deepEqual(snap.subtitles.map((x) => x.text), ["S13 합성 하나", "S13 합성 둘"], "메모리 목록 유지");
+				// 홈 시퀀스의 목록을 B로 끌고 오지 않는다 (남기면 ▶가 홈의 자막을 B에 놓는다)
+				assert.deepEqual(snap.subtitles, [], "목록을 비운다");
 				const st = await panel(H.PAGE_STATUS);
 				assert.equal(st.cls, "err");
 				log("오류 표시: " + st.text);
+				const label = await panel("document.getElementById('activeSeqLabel').textContent");
+				assert.ok(/^⚠ 세션 파일 읽기 실패/.test(label), "남는 경고: " + label);
 				await panel("(() => { const b = document.getElementById('btnCloseAllParams'); b.disabled = false; b.click(); window._mogrtDebug.saveSession(); return true; })()");
 				assert.equal(fs.readFileSync(bSessPath, "utf8"), "{ S13 깨진 JSON", "읽지 못한 파일을 덮어쓰지 않는다");
+				assert.deepEqual(fs.readdirSync(path.dirname(bSessPath)).filter((n) => n.indexOf("session.json.unreadable-") === 0), [], "빈 목록으로는 옮기지도 않는다");
 				await switchTo(api, home);
 				snap = await panel("window._mogrtDebug.snapshot()");
 				assert.equal(snap.flags.sessionReadFailed, false);
+				assert.deepEqual(snap.subtitles.map((x) => x.text), ["S13 합성 하나", "S13 합성 둘"], "홈 목록을 다시 읽는다");
 			} finally {
 				if (bBackup) fs.writeFileSync(bSessPath, bBackup);
 				else fs.unlinkSync(bSessPath);
@@ -125,31 +130,50 @@ module.exports = {
 			await H.waitKeys(panel);
 			assert.equal(await panel("document.getElementById('trackSel').value"), "5", "새로 고친 뒤에도 트랙 복원");
 
-			// (10)(11) 모달: V1 보호와 패치 캐시
-			const hadPreview = (await host(H.jsxHasSequenceNamed("__MOGRT_PREVIEW__"))) === "true";
-			if (hadPreview) log("주의: __MOGRT_PREVIEW__가 이미 있다 — 프로젝트 패널에서 지운 뒤 다시 돌리면 '없던 프로젝트' 경로까지 확인한다");
-			const v1Before = JSON.parse(await host(H.jsxReadVideoTrack(0)));
+			// (10)(11) 모달: V1 보호와 패치 캐시 — 스크래치 사본에서.
+			// 앞 케이스(ensurePreset·createPresetViaModal)가 프리뷰 시퀀스를 이미 만들어 두므로, 사본에서 __MOGRT_PREVIEW__를
+			// 지우고 패널을 새로 고쳐(프리뷰 확인 기록·모달 캐시가 빈 상태) '프리뷰 시퀀스가 없는 프로젝트' 경로를 실제로 탄다.
+			// 보호가 깨져 getMogrtParams가 작업 시퀀스 V1 0~5초를 잘라도 원본 T_가 아니라 사본이 잘린다.
 			const mogrts = await H.waitMogrts(panel, 1);
 			const pick = mogrts.find((m) => /라온올제/.test(m[1])) || mogrts[0];
-			await panel("document.getElementById('btnAddPreset').click(), true");
-			await panel("(() => { const s = document.getElementById('defaultMogrtSel'); s.value = " + JSON.stringify(pick[0]) + "; s.dispatchEvent(new Event('change')); return true; })()");
-			await H.waitFor(panel, "!!window._mogrtDebug.snapshot().mogrtOriginals[" + JSON.stringify(pick[0]) + "]", { timeoutMs: 120000, what: "모달 파라미터 (캐시)" });
-			const v1After = JSON.parse(await host(H.jsxReadVideoTrack(0)));
-			assert.deepEqual(v1After.clips, v1Before.clips, "V1 클립 수·시작·끝이 그대로");
-			assert.equal(await host(H.jsxHasSequenceNamed("__MOGRT_PREVIEW__")), "true", "프리뷰 시퀀스가 있다");
-			const cached = (await panel("window._mogrtDebug.snapshot()")).mogrtOriginals[pick[0]];
-			const drops = cached.filter((p) => p.type === "dropdown");
-			log("캐시 드롭다운 " + drops.length + "개: " + drops.map((p) => p.displayName + "=" + (p.dropdownOptions || []).join("/")).join(" · "));
-			drops.forEach((p) => assert.ok(Array.isArray(p.dropdownOptions) && p.dropdownOptions.length > 0, p.displayName + " 드롭다운 이름"));
-			// 두 번째 열기: 호스트를 부르지 않고 캐시(패치 포함)를 쓴다
-			await panel("(() => { const b = document.getElementById('btnCloseModal'); if (b) b.click(); return true; })()");
-			await panel("document.getElementById('btnAddPreset').click(), true");
-			await panel("(() => { const s = document.getElementById('defaultMogrtSel'); s.value = " + JSON.stringify(pick[0]) + "; s.dispatchEvent(new Event('change')); return true; })()");
-			await H.sleep(1500);
-			const cached2 = (await panel("window._mogrtDebug.snapshot()")).mogrtOriginals[pick[0]];
-			assert.deepEqual(cached2, cached, "두 번째 열기도 같은 (패치된) 캐시");
-			await panel("(() => { const b = document.getElementById('btnCloseModal'); if (b) b.click(); return true; })()");
-			return "파일 수 그대로 · 읽기 실패 보호 · 트랙 복원 · V1 그대로" + (hadPreview ? " (프리뷰 시퀀스는 원래 있었음)" : " (패널이 프리뷰 시퀀스를 만듦)");
+			await H.withScratchSequence(api, "s1_3_v1", async () => {
+				log("__MOGRT_PREVIEW__ 지우기: " + (await host(H.jsxDeletePreviewSequence())));
+				assert.equal(await host(H.jsxHasSequenceNamed("__MOGRT_PREVIEW__")), "false", "프리뷰 시퀀스가 없는 상태에서 시작");
+				await H.reloadClean(reload, assert, log);
+				await H.waitKeys(panel);
+				await H.waitMogrts(panel, 1);
+				assert.equal(await panel("Object.keys(window._mogrtDebug.snapshot().mogrtOriginals).length"), 0, "모달 캐시가 비었다");
+				await panel(H.PAGE_RECORD_HOST_CALLS);
+				const v1Before = JSON.parse(await host(H.jsxReadVideoTrack(0)));
+				assert.ok(v1Before.seqName.indexOf(H.SCRATCH_PREFIX) === 0, "사본에서 확인한다: " + v1Before.seqName);
+				await panel("document.getElementById('btnAddPreset').click(), true");
+				await panel("(() => { const s = document.getElementById('defaultMogrtSel'); s.value = " + JSON.stringify(pick[0]) + "; s.dispatchEvent(new Event('change')); return true; })()");
+				await H.waitFor(panel, "!!window._mogrtDebug.snapshot().mogrtOriginals[" + JSON.stringify(pick[0]) + "]", { timeoutMs: 120000, what: "모달 파라미터 (캐시)" });
+				const calls = await panel("window.__hostCalls.slice()");
+				const iSetup = calls.indexOf("setupPreviewSequence");
+				const iGet = calls.indexOf("getMogrtParams");
+				log("호스트 호출 순서: " + calls.join(" → "));
+				assert.ok(iSetup !== -1 && iGet !== -1 && iSetup < iGet, "setupPreviewSequence가 getMogrtParams보다 먼저: " + calls.join(","));
+				const v1After = JSON.parse(await host(H.jsxReadVideoTrack(0)));
+				assert.deepEqual(v1After.clips, v1Before.clips, "V1 클립 수·시작·끝이 그대로");
+				assert.equal(await host(H.jsxHasSequenceNamed("__MOGRT_PREVIEW__")), "true", "패널이 프리뷰 시퀀스를 만들었다");
+				const cached = (await panel("window._mogrtDebug.snapshot()")).mogrtOriginals[pick[0]];
+				const drops = cached.filter((p) => p.type === "dropdown");
+				log("캐시 드롭다운 " + drops.length + "개: " + drops.map((p) => p.displayName + "=" + (p.dropdownOptions || []).join("/")).join(" · "));
+				drops.forEach((p) => assert.ok(Array.isArray(p.dropdownOptions) && p.dropdownOptions.length > 0, p.displayName + " 드롭다운 이름"));
+				// 두 번째 열기: 호스트를 부르지 않고 캐시(패치 포함)를 쓴다
+				await panel("(() => { const b = document.getElementById('btnCloseModal'); if (b) b.click(); return true; })()");
+				const nCalls = calls.length;
+				await panel("document.getElementById('btnAddPreset').click(), true");
+				await panel("(() => { const s = document.getElementById('defaultMogrtSel'); s.value = " + JSON.stringify(pick[0]) + "; s.dispatchEvent(new Event('change')); return true; })()");
+				await H.sleep(1500);
+				const cached2 = (await panel("window._mogrtDebug.snapshot()")).mogrtOriginals[pick[0]];
+				assert.deepEqual(cached2, cached, "두 번째 열기도 같은 (패치된) 캐시");
+				const later = (await panel("window.__hostCalls.slice()")).slice(nCalls);
+				assert.equal(later.indexOf("getMogrtParams"), -1, "두 번째 열기는 getMogrtParams를 부르지 않는다: " + later.join(","));
+				await panel("(() => { const b = document.getElementById('btnCloseModal'); if (b) b.click(); return true; })()");
+			});
+			return "파일 수 그대로 · 읽기 실패 보호 · 트랙 복원 · 프리뷰 없는 프로젝트에서 V1 그대로 (사본)";
 		} finally {
 			const act = await host(JSX_ACTIVE);
 			if (act !== home.id) await host(jsxOpenSeq(home.id));

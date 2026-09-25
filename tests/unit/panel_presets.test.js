@@ -101,7 +101,8 @@ test("preset_3이 다른 MOGRT인 파일: 옛 preset_3은 휴지통(why import),
 	assert.equal(fresh.mogrtPath, "D:/MOGRT/다른 템플릿.mogrt");
 	assert.deepEqual([1, 2, 3].map((i) => s.rowStates[i].presetId), ["preset_1", "", ""]);
 	assert.deepEqual([1, 2, 3].map((i) => h.$("sel-" + i).value), ["preset_1", "", ""], "행 select도 프리셋 없음");
-	assert.match(h.status().text, /2개 줄의 프리셋 연결이 끊어졌습니다 \(프리셋 휴지통에서 복구 가능\)/);
+	// 휴지통 복구로 줄이 다시 이어지지는 않는다 → 복구 가능하다고 말하지 않는다
+	assert.match(h.status().text, /2개 줄의 프리셋 연결이 끊어졌습니다 \(이전 프리셋은 프리셋 휴지통에 있습니다\. 줄에는 다시 지정해야 합니다\)/);
 	assert.match(h.$("presetTrashWrap").textContent, /가져오기로 교체됨/);
 	const saved = h.fs.readJson(P.presets(PROJ));
 	assert.equal(saved.nextPresetId, 10);
@@ -109,22 +110,120 @@ test("preset_3이 다른 MOGRT인 파일: 옛 preset_3은 휴지통(why import),
 	noErrors(h);
 });
 
+/** 모달로 새 프리셋 하나를 저장한다 → 새 id */
+async function createPreset(h, path, name) {
+	h.$("btnAddPreset").click();
+	await h.flush();
+	h.$("defaultMogrtSel").value = path;
+	h.change(h.$("defaultMogrtSel"));
+	await h.advance(10);
+	h.$("presetNameInput").value = name;
+	h.$("btnSaveDefault").click();
+	const s = h.snapshot();
+	return Object.keys(s.presets).find((id) => s.presets[id].name === name);
+}
+
 test("새 프리셋 저장은 preset_9 (빈 번호 preset_5·7을 메우지 않고 휴지통 id도 피한다)", async () => {
 	const file = realLike();
 	const { presets } = build();
 	const path = "D:/MOGRT/다른 템플릿.mogrt";
 	const h = await bootPanel({ seq: A, mogrts: mogrtsOf(file), params: { [path]: clone(presets.preset_3.params) }, files: { [P.presets(PROJ)]: file } });
 	await h.advance(1000);
-	h.$("btnAddPreset").click();
-	await h.flush();
-	h.$("defaultMogrtSel").value = path;
-	h.change(h.$("defaultMogrtSel"));
-	await h.advance(10);
-	h.$("presetNameInput").value = "새 합성 프리셋";
-	h.$("btnSaveDefault").click();
+	assert.equal(await createPreset(h, path, "새 합성 프리셋"), "preset_9");
 	const s = h.snapshot();
-	assert.equal(s.presets.preset_9 && s.presets.preset_9.name, "새 합성 프리셋");
 	assert.equal(s.presets.preset_2.name, file.presets.preset_2.name, "preset_2를 덮어쓰지 않는다");
 	assert.equal(s.nextPresetId, 10);
+	noErrors(h);
+});
+
+test("가장 큰 id의 프리셋을 지우고 프리셋 휴지통을 비워도 그 id(와 빈 번호)를 다시 주지 않는다 (저장된 카운터가 낡은 경우)", async () => {
+	const { presets } = build();
+	const file = { presets: clone(presets), presetTrash: [], nextPresetId: 2 }; // 실제 모양: preset_1,2,3,4,6,8 / 카운터 2
+	const path = "D:/MOGRT/다른 템플릿.mogrt";
+	const h = await bootPanel({ seq: A, mogrts: mogrtsOf(file), params: { [path]: clone(presets.preset_3.params) }, files: { [P.presets(PROJ)]: file } });
+	await h.advance(1000);
+	// 목록 순서 = Object.entries(presets) → preset_8이 마지막 행
+	const delBtns = h.$("presetList").querySelectorAll("button").filter((b) => b.textContent === "삭제");
+	delBtns[delBtns.length - 1].click();
+	if (h.$("confirmModal").classList.contains("open")) h.$("confirmYes").click();
+	let s = h.snapshot();
+	assert.deepEqual(s.presetTrash.map((t) => t.preset.id), ["preset_8"]);
+	h.$("btnEmptyPresetTrash").click();
+	s = h.snapshot();
+	assert.equal(s.presetTrash.length, 0);
+	assert.equal(s.nextPresetId, 9, "비우기 전에 카운터를 휴지통 id 위로 올린다");
+	assert.equal(h.fs.readJson(P.presets(PROJ)).nextPresetId, 9, "저장도 된다");
+	const made = [await createPreset(h, path, "새 하나"), await createPreset(h, path, "새 둘")];
+	assert.deepEqual(made, ["preset_9", "preset_10"], "preset_7(빈 번호)·preset_8(지운 id)을 주지 않는다");
+	noErrors(h);
+});
+
+test("다른 시퀀스의 session.json·히스토리만 가리키는 id는 새 프리셋에 주지 않는다 (v27 가져오기가 지운 프리셋)", async () => {
+	const { presets } = build();
+	const file = { presets: { preset_1: clone(presets.preset_1), preset_2: clone(presets.preset_2) }, presetTrash: [], nextPresetId: 1 };
+	const path = "D:/MOGRT/다른 템플릿.mogrt";
+	const B = { seqId: "bbbb-0002", seqName: "T_B", projPath: PROJ };
+	const C = { seqId: "cccc-0003", seqName: "T_C", projPath: PROJ };
+	const sessB = sessionWith(["preset_3"]);
+	const histC = [Object.assign({ ts: 1, label: "기록", isManual: false, sequenceKey: "x" }, sessionWith(["preset_5"]))];
+	const h = await bootPanel({
+		seq: A, mogrts: mogrtsOf(file).concat([{ name: "다른", path }]), params: { [path]: clone(presets.preset_3.params) },
+		files: { [P.presets(PROJ)]: file, [P.session(PROJ, B.seqId)]: sessB, [P.historyAuto(PROJ, C.seqId)]: histC }
+	});
+	await h.advance(1000);
+	assert.equal(await createPreset(h, path, "새 프리셋 Y"), "preset_6", "B의 preset_3, C 히스토리의 preset_5를 피한다");
+	// B로 가면 그 줄은 '프리셋 없음' (새 프리셋 Y로 바뀌지 않는다)
+	h.host.seq = B;
+	await h.advance(300);
+	const s = h.snapshot();
+	assert.equal(s.keys.seqId, B.seqId);
+	assert.equal(s.rowStates[1].presetId, "");
+	noErrors(h);
+});
+
+test("작업 파일이 가리키던(지금은 없는) id도 새 프리셋에 주지 않는다", async () => {
+	const { presets } = build();
+	const file = { presets: { preset_1: clone(presets.preset_1) }, presetTrash: [], nextPresetId: 2 };
+	const path = "D:/MOGRT/다른 템플릿.mogrt";
+	const h = await bootPanel({ seq: A, mogrts: mogrtsOf(file).concat([{ name: "다른", path }]), params: { [path]: clone(presets.preset_3.params) }, files: { [P.presets(PROJ)]: file } });
+	await h.advance(1000);
+	const work = Object.assign({ version: 2, trackValue: "2" }, sessionWith(["preset_1", "preset_12"]));
+	await h.dropWork("work.json", work);
+	assert.deepEqual([1, 2].map((i) => h.snapshot().rowStates[i].presetId), ["preset_1", ""]);
+	assert.equal(await createPreset(h, path, "새 프리셋 Z"), "preset_13");
+	noErrors(h);
+});
+
+test("같은 파일 이름의 MOGRT가 두 폴더에 있어도 다시 가져오기가 프리셋을 다른 폴더 파일로 바꾸지 않는다", async () => {
+	const { presets } = build();
+	const p3 = clone(presets.preset_3);
+	const base = p3.mogrtPath.split(/[\\/]/).pop();
+	const other = "E:/OLD/" + base; // 스캔 목록에서 앞에 있는 옛 사본
+	const file = { presets: { preset_3: p3 }, presetTrash: [], nextPresetId: 4 };
+	const h = await bootPanel({
+		seq: A, mogrts: [{ name: "옛 사본", path: other }, { name: p3.name, path: p3.mogrtPath }],
+		files: { [P.presets(PROJ)]: file, [P.session(PROJ, A.seqId)]: sessionWith(["preset_3"]) }
+	});
+	await h.advance(1000);
+	// 1) 같은 파일 (경로가 그대로 있다) → 정확한 경로가 이긴다
+	await importPresets(h, { version: 1, presets: clone(file.presets) });
+	let s = h.snapshot();
+	assert.equal(s.presets.preset_3.mogrtPath, p3.mogrtPath);
+	assert.equal(s.rowStates[1].presetId, "preset_3");
+	assert.match(h.status().text, /\(ID 유지 1개\)/);
+	assert.doesNotMatch(h.status().text, /경로가 바뀐/);
+	// 2) 다른 PC에서 내보낸 파일 (경로가 없고 파일 이름만 맞는다) → 지금 프리셋의 경로를 지킨다
+	const foreign = clone(file.presets);
+	foreign.preset_3.mogrtPath = "C:/Users/someone/MOGRT/" + base;
+	await importPresets(h, { version: 1, presets: foreign });
+	s = h.snapshot();
+	assert.equal(s.presets.preset_3.mogrtPath, p3.mogrtPath);
+	// 3) 파일이 스캔된 다른 폴더를 정확히 가리키면 그 경로로 바꾸되, 상태에 알린다
+	const moved = clone(file.presets);
+	moved.preset_3.mogrtPath = other;
+	await importPresets(h, { version: 1, presets: moved });
+	s = h.snapshot();
+	assert.equal(s.presets.preset_3.mogrtPath, other);
+	assert.match(h.status().text, /MOGRT 경로가 바뀐 프리셋 1개/);
 	noErrors(h);
 });
