@@ -58,6 +58,8 @@ module.exports = {
 	run: async (api) => {
 		const { panel, host, mi, assert, log } = api;
 		await H.waitKeys(panel);
+		// 앞 케이스가 플래그를 꺼 둔 채 끝났을 수 있다 (스위트는 새로 고치지 않는다) → 코드 기본값(켬)
+		assert.equal(await panel(H.pageSetMiCast(null)), true, "다화자 기본값은 켬");
 		const root = await H.devCacheRoot(panel);
 		const rootFs = root.replace(/\//g, path.sep);
 		const snap0 = await panel(SNAP);
@@ -343,6 +345,7 @@ module.exports = {
 				log("(h) 스캔 " + scan.ms + "ms, 그대로 계획 " + planMs + "ms (되읽기 0)");
 			});
 		} finally {
+			await panel(H.pageSetMiCast(null));
 			if (defBefore) fs.writeFileSync(defPath, defBefore);
 			else if (fs.existsSync(defPath)) fs.unlinkSync(defPath);
 			log("cast_defaults.json 되돌림: " + (defBefore ? "시작 전 내용" : "지움 (시작 전에는 없었다)"));

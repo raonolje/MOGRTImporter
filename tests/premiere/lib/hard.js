@@ -159,9 +159,12 @@ function pageDropSrts(list) {
 		" return input.disabled ? 'sent-disabled' : 'sent'; })()";
 }
 
-/** 여러 SRT 가져오기 플래그를 켜고 끈다 (DEV 디버그 훅, 코드를 고치지 않는다) → 적용된 값 */
+/**
+ * 여러 SRT 가져오기 플래그를 켜고 끈다 (DEV 디버그 훅, 코드를 고치지 않는다) → 적용된 값
+ * on === null: 덮어쓰기를 풀고 코드 기본값(MI_CAST_ENABLED, S2-4부터 true)으로 돌린다. 스위트는 케이스 사이에 패널을 새로 고치지 않는다
+ */
 function pageSetMiCast(on) {
-	return "window._mogrtDebug.setMiCast(" + (on ? "true" : "false") + ")";
+	return "window._mogrtDebug.setMiCast(" + (on === null ? "null" : on ? "true" : "false") + ")";
 }
 
 /**

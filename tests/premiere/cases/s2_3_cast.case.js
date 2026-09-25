@@ -1,7 +1,7 @@
 "use strict";
 /**
  * S2-3 하드: 화자 표·화자 칩·필터·휴지통 라벨·cast_defaults.json (DEV 패널, MI_test.prproj의 T_ 시퀀스). 타임라인은 바꾸지 않는다.
- * 스크래치 사본(T_scratch_s2_3a / _b)에서 돈다. 플래그는 window._mogrtDebug.setMiCast로만 켜고 끝나면 끈다.
+ * 스크래치 사본(T_scratch_s2_3a / _b)에서 돈다. 플래그는 window._mogrtDebug.setMiCast로만 켜고 끄며, 끝나면 코드 기본값으로 돌린다(setMiCast(null)).
  * 프로젝트 단위 cast_defaults.json(DEV 캐시)은 시작 전 내용으로 되돌린다. 모달로 만든 시험 프리셋은 지워서 프리셋 휴지통에 남는다.
  *   (1) C1·인터뷰_C2·C3 세 파일 → 화자 표 3줄 · 칩 4개 · 줄 번호 'C2·1'
  *   (4) C2 이름 바꾸기 → session.json · cast.json · cast_defaults.json 셋에 남는다
@@ -193,7 +193,7 @@ module.exports = {
 				log("(7)(8) 단일 화자: 화자 표 없음, v27 줄 모양, 되살리기 자리 v27");
 			});
 		} finally {
-			await panel(H.pageSetMiCast(false));
+			await panel(H.pageSetMiCast(null));
 			if (defBefore) fs.writeFileSync(defPath, defBefore);
 			else if (fs.existsSync(defPath)) fs.unlinkSync(defPath);
 			log("cast_defaults.json 되돌림: " + (defBefore ? "시작 전 내용" : "지움 (시작 전에는 없었다)"));
