@@ -16,6 +16,12 @@
 		presetViewMode: "list"
 	};
 	var _cachedSystemFonts = null; // 시스템 폰트 캐시 (전역)
+	// 부팅·세션 플래그. 부팅 중 TDZ를 피하려고 맨 앞 state region에 둔다.
+	//   _keysResolved      실제(프리뷰가 아닌) 시퀀스로 프로젝트·시퀀스 키가 정해졌다. 그 전에는
+	//                      SRT 열기·적용·작업 불러오기를 막고 세션 파일에 쓰지 않는다 (부팅 게이트)
+	//   _filtersReady      main.ts의 검색·프리셋 필터 선언이 끝났다 (renderAll에서 필터를 부르기 전 확인)
+	//   _sessionReadFailed 지금 키의 session.json이 있는데 읽지 못했다. 그 키로는 저장하지 않는다
+	var _keysResolved = false, _filtersReady = false, _sessionReadFailed = false;
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -77,6 +83,33 @@
 			if (res.err !== 0 || !res.data) return null;
 			return JSON.parse(res.data);
 		} catch(_) { return null; }
+	}
+	// 파일이 있는가 (cep.fs.stat). cep.fs가 없으면 false
+	function _fsExists(filePath) {
+		try {
+			return !!(window.cep && window.cep.fs && window.cep.fs.stat(filePath).err === 0);
+		} catch (_) { return false; }
+	}
+	// _fsRead와 달리 '없음'과 '있는데 못 읽음'을 가른다 → {exists, data, error}
+	//   없음(ERR_NOT_FOUND)        {exists: false, data: null, error: null}
+	//   읽기·파싱 실패, 객체가 아님  {exists: true,  data: null, error: "…"}
+	function _fsReadEx(filePath) {
+		try {
+			if (!window.cep || !window.cep.fs) return { exists: false, data: null, error: null };
+			const st = window.cep.fs.stat(filePath);
+			if (st.err !== 0) {
+				const notFound = st.err === (window.cep.fs.ERR_NOT_FOUND || 3);
+				return notFound ? { exists: false, data: null, error: null } : { exists: true, data: null, error: "stat 오류 " + st.err };
+			}
+			const res = window.cep.fs.readFile(filePath);
+			if (res.err !== 0) return { exists: true, data: null, error: "읽기 오류 " + res.err };
+			if (!res.data) return { exists: true, data: null, error: "빈 파일" };
+			const data = JSON.parse(res.data);
+			if (!data || typeof data !== "object" || Array.isArray(data)) return { exists: true, data: null, error: "형식 오류" };
+			return { exists: true, data, error: null };
+		} catch (e) {
+			return { exists: true, data: null, error: "파싱 실패: " + ((e && e.message) || e) };
+		}
 	}
 	function _getPresetsPath() {
 		const root = _getCacheRoot();
@@ -178,16 +211,27 @@
 			if (path) _fsWrite(path, data);
 		} catch (_) {}
 	}
+	// 세션 저장. 다음 경우에는 쓰지 않는다.
+	//   - 키가 정해지기 전 (부팅 게이트): 기본 키(default_seq)의 기존 목록을 빈 목록으로 덮지 않게
+	//   - 지금 키의 session.json을 읽지 못했을 때: 읽지 못한 파일을 메모리 값으로 덮지 않게 (오류 표시)
+	//   - 자막과 휴지통이 모두 비었고 파일도 없을 때: 들르기만 한 시퀀스마다 빈 파일이 생기지 않게
 	function saveSessionToStorage() {
 		try {
+			if (!_keysResolved) return;
+			const path = _getSessionPath();
+			if (!path) return;
+			if (_sessionReadFailed) {
+				setStatus("세션 파일을 읽지 못해 이 시퀀스에는 저장하지 않습니다 (파일을 확인하세요)", "err");
+				return;
+			}
+			if (state.subtitles.length === 0 && state.trashBin.length === 0 && !_fsExists(path)) return;
 			const data = {
 				subtitles: state.subtitles,
 				rowStates: state.rowStates,
 				trashBin: state.trashBin,
 				nextId: state.nextId
 			};
-			const path = _getSessionPath();
-			if (path) _fsWrite(path, data);
+			_fsWrite(path, data);
 		} catch (_) {}
 	}
 	// ── state.subtitles / state.presets 대입 창구 ──
@@ -221,27 +265,31 @@
 		state.presets = next;
 		if (!opts || opts.persist !== false) savePresetsToStorage();
 	}
+	// 지금 키의 session.json을 메모리에 넣는다 (키가 바뀔 때마다: 같은 프로젝트든 다른 프로젝트든).
+	//   파일 있음        그 내용으로 바꾼다 (빠진 키는 빈 값)
+	//   파일 없음        세션 상태를 비운다 (이전 시퀀스·프로젝트의 목록이 새 키로 새지 않게)
+	//   있는데 못 읽음   메모리를 그대로 두고 _sessionReadFailed → 이 키로는 저장하지 않는다
+	function _loadSessionForKey(reason) {
+		const path = _getSessionPath();
+		const r = path ? _fsReadEx(path) : { exists: false, data: null, error: null };
+		if (r.exists && !r.data) {
+			_sessionReadFailed = true;
+			console.error("[MOGRT] 세션 파일 읽기 실패:", path, r.error);
+			setStatus("세션 파일을 읽지 못했습니다 (" + r.error + ") — 이 시퀀스에는 저장하지 않습니다", "err");
+			return;
+		}
+		_sessionReadFailed = false;
+		const sdata = r.data || {};
+		setSubtitles(Array.isArray(sdata.subtitles) ? sdata.subtitles : [], { reason: r.exists ? reason : reason + " (파일 없음)", persist: false });
+		state.rowStates = sdata.rowStates && typeof sdata.rowStates === "object" ? sdata.rowStates : {};
+		state.trashBin = Array.isArray(sdata.trashBin) ? sdata.trashBin : [];
+		state.nextId = r.exists ? safeNextId(sdata) : 1;
+	}
 	function loadSessionFromStorage() {
 		try {
-			const path = _getSessionPath();
-			const sdata = path ? _fsRead(path) : null;
-			if (sdata) {
-				if (sdata.subtitles) setSubtitles(sdata.subtitles, { reason: "세션 로드", persist: false });
-				if (sdata.rowStates) state.rowStates = sdata.rowStates;
-				if (sdata.trashBin) state.trashBin = sdata.trashBin;
-				if (sdata.nextId) state.nextId = sdata.nextId;
-				// 프리셋 없는 고아 presetId 정리
-				_sanitizeOrphanPresets();
-			} else {
-				// 저장된 데이터가 없을 때 기존 state를 유지 (자막 소실 방지)
-				// 새 시쿀스로 전환 시에만 초기화 (명시적 플래그로 제어)
-				if (loadSessionFromStorage._clearOnEmpty) {
-					setSubtitles([], { reason: "새 시퀀스 전환", persist: false });
-					state.rowStates = {};
-					state.trashBin = [];
-					state.nextId = 1;
-				}
-			}
+			_loadSessionForKey("세션 로드");
+			// 프리셋 없는 고아 presetId 정리
+			_sanitizeOrphanPresets();
 		} catch (_) {}
 	}
 	function migratePreset(p) {
@@ -271,7 +319,9 @@
 		state.nextPresetId = r.next;
 		return r.id;
 	}
-	function loadAllFromStorage() {
+	// opts.presetsOnly: 부팅 때. 키가 정해지기 전이라 세션(목록)은 읽지 않는다.
+	// 프리셋은 v27처럼 파일이 없으면 메모리의 것을 그대로 가져간다.
+	function loadAllFromStorage(opts) {
 		// 마이그레이션 먼저 시도 (최초 1회, 파일 없을 때만 localStorage에서 복사)
 		_migrateFromLocalStorage();
 		try {
@@ -287,16 +337,11 @@
 				if (data.nextPresetId) state.nextPresetId = data.nextPresetId;
 			}
 		} catch (_) {}
-		try {
-			const spath = _getSessionPath();
-			const sdata = spath ? _fsRead(spath) : null;
-			if (sdata) {
-				if (sdata.subtitles) setSubtitles(sdata.subtitles, { reason: "전체 로드", persist: false });
-				if (sdata.rowStates) state.rowStates = sdata.rowStates;
-				if (sdata.trashBin) state.trashBin = sdata.trashBin;
-				if (sdata.nextId) state.nextId = sdata.nextId;
-			}
-		} catch (_) {}
+		if (!(opts && opts.presetsOnly)) {
+			try {
+				_loadSessionForKey("전체 로드");
+			} catch (_) {}
+		}
 		// 프리셋 없는 고아 presetId 정리
 		_sanitizeOrphanPresets();
 	}
@@ -427,6 +472,16 @@
 
 		// ── 경로 문자열 반환 ──
 		selectExportFolder: () => _callNoArgs("selectExportFolder"),
+
+		// 프리뷰 시퀀스(__MOGRT_PREVIEW__)가 지금 프로젝트에 있는가. v27 호스트 함수 findPreviewSequence를
+		// 부르는 ExtendScript 식이다. 모르면 false (그러면 패널이 setupPreviewSequence로 만든다).
+		hasPreviewSequence: async () => {
+			try {
+				return (await _invoke("findPreviewSequence", "findPreviewSequence() ? \"yes\" : \"no\"")) === "yes";
+			} catch (_) {
+				return false;
+			}
+		},
 
 		// 호스트 함수가 아니라 ExtendScript 식이다. 프리뷰 캡처 임시 경로용으로,
 		// 실패해도 진행에 지장이 없어 여기서만 예외를 삼키고 기본값을 준다.
@@ -1256,7 +1311,8 @@
 	// 패널 공용 확인/알림 다이얼로그. index.html의 #confirmModal / #alertModal을
 	// 쓰고, 없으면 브라우저 기본 confirm/alert로 폴백한다.
 	// 의존성이 없어 어느 region에서든 부를 수 있다.
-	function showConfirm(message, onYes, onNo) {
+	// opts.yes / opts.no: 버튼 문구 (없으면 "확인" / "취소"). 닫을 때 원래 문구로 돌린다.
+	function showConfirm(message, onYes, onNo, opts) {
 		const overlay = document.getElementById("confirmModal");
 		const msgEl = document.getElementById("confirmMessage");
 		const btnYes = document.getElementById("confirmYes");
@@ -1267,8 +1323,14 @@
 			return;
 		}
 		msgEl.textContent = message;
+		btnYes.textContent = (opts && opts.yes) || "확인";
+		btnNo.textContent = (opts && opts.no) || "취소";
 		overlay.classList.add("open");
-		const cleanup = () => overlay.classList.remove("open");
+		const cleanup = () => {
+			overlay.classList.remove("open");
+			btnYes.textContent = "확인";
+			btnNo.textContent = "취소";
+		};
 		const yesHandler = () => {
 			cleanup();
 			onYes();
@@ -2450,6 +2512,29 @@
 	let _previewMogrtPath = null;
 	let _previewParamList = null;
 	let _lastPreviewSrc = null;   // 마지막 캡처된 프리뷰 data URL (프리셋 저장 시 썸네일로 사용)
+	// 프리뷰 시퀀스가 이 프로젝트에 있다고 확인된 적이 있는가 (projKey별).
+	// setupPreviewSequence가 성공할 때마다 켠다.
+	var _previewSeqKnown = {};
+	// getMogrtParams 전에 프리뷰 시퀀스를 확보한다 → true: 있다(안전), false: 만들지 못했다.
+	// 있다고 알려진 프로젝트도 한 번 더 확인한다 (사용자가 지웠을 수 있다).
+	async function _ensurePreviewSequence(mogrtPath) {
+		const pk = state.currentProjectKey;
+		if (_previewSeqKnown[pk]) {
+			if (await host.hasPreviewSequence()) return true;
+			_previewSeqKnown[pk] = false;
+		}
+		try {
+			const r = await host.setupPreviewSequence({ mogrtPath, durationSec: 5 });
+			if (String(r).indexOf("SUCCESS") === 0) {
+				_previewSeqKnown[pk] = true;
+				return true;
+			}
+			console.warn("[MOGRT] setupPreviewSequence 실패:", r);
+		} catch (e) {
+			console.warn("[MOGRT] setupPreviewSequence 예외:", (e && e.message) || e);
+		}
+		return false;
+	}
 	async function runPreviewCapture(mogrtPath, list) {
 		if (_previewRunning) return;
 		_previewRunning = true;
@@ -2468,6 +2553,7 @@
 				_previewRunning = false;
 				return;
 			}
+			_previewSeqKnown[state.currentProjectKey] = true;
 			if (statusEl) statusEl.textContent = "파라미터 적용 중...";
 			// 2. 현재 파라미터 적용
 			const applyRes = await host.applyPreviewParams({ params: list });
@@ -3480,8 +3566,11 @@ var modalState = {
 		});
 	}
 
+	// 모달 파라미터 읽기 요청 번호 (프리뷰 시퀀스를 준비하는 사이 다른 MOGRT를 고르면 이전 요청은 버린다)
+	let _modalLoadSeq = 0;
 	function loadMogrtForModal(mogrtPath, presetId) {
 		const modalBody = document.getElementById("defaultModalBody");
+		const reqNo = ++_modalLoadSeq;
 
 		// 캐시된 파라미터가 있으면 즉시 사용 (호스트 호출 생략)
 		if (state.mogrtOriginals[mogrtPath]) {
@@ -3489,6 +3578,29 @@ var modalState = {
 			return;
 		}
 
+		// getMogrtParams는 프리뷰 시퀀스가 없으면 작업 시퀀스 V1 0초에 MOGRT를 넣었다 지운다
+		// (hostscript 552-590) → V1 0~5초 영상이 잘린다. 먼저 프리뷰 시퀀스를 확보한다.
+		modalBody.innerHTML = "<p style=\"color:#64b5f6;font-size:11px;padding:10px 0;text-align:center;\">프리뷰 시퀀스 준비 중...</p>";
+		_ensurePreviewSequence(mogrtPath).then((ok) => {
+			if (reqNo !== _modalLoadSeq) return;
+			if (ok) {
+				_fetchMogrtParamsForModal(mogrtPath, presetId);
+				return;
+			}
+			showConfirm(
+				"프리뷰 시퀀스를 만들 수 없습니다. 이대로 읽으면 현재 시퀀스 V1의 0~5초 영상이 잘릴 수 있습니다.",
+				() => { if (reqNo === _modalLoadSeq) _fetchMogrtParamsForModal(mogrtPath, presetId); },
+				() => {
+					if (reqNo !== _modalLoadSeq) return;
+					modalBody.innerHTML = "<p style=\"color:#f44336;font-size:11px;padding:10px 0;\">프리뷰 시퀀스를 만들 수 없어 파라미터를 읽지 않았습니다. Premiere에서 시퀀스를 확인한 뒤 MOGRT를 다시 고르세요.</p>";
+				},
+				{ yes: "그래도 읽기", no: "취소" }
+			);
+		});
+	}
+	// 캐시가 없을 때 호스트에서 파라미터를 읽어 모달에 그린다 (프리뷰 시퀀스 확인 뒤)
+	function _fetchMogrtParamsForModal(mogrtPath, presetId) {
+		const modalBody = document.getElementById("defaultModalBody");
 		modalBody.innerHTML = "<p style=\"color:#64b5f6;font-size:11px;padding:10px 0;text-align:center;\">파라미터 로드 중... (최대 90초)</p><p style=\"color:#aaa;font-size:10px;padding:0;text-align:center;\">첫 번째 로드는 Premiere가 MOGRT를 초기화하는 시간이 필요합니다.<br>두 번째부터는 즉시 로드됩니다.</p>";
 		let timedOut = false;
 		const timeoutId = setTimeout(() => {
@@ -3501,7 +3613,12 @@ var modalState = {
 			try {
 				// getMogrtParams는 {params, mogrtPath} 객체 또는 기존 배열 형태 모두 지원
 				const freshList = Array.isArray(parsed) ? parsed : (parsed.params || []);
-				if (!state.mogrtOriginals[mogrtPath]) state.mogrtOriginals[mogrtPath] = JSON.parse(JSON.stringify(freshList));
+				// 원본(프리셋 값을 덮기 전) 사본. definition 패치를 받은 뒤에 캐시한다
+				// (v27은 패치 전에 캐시해서 두 번째로 열 때 드롭다운 이름 등 패치가 빠졌다)
+				const pristine = JSON.parse(JSON.stringify(freshList));
+				const cacheOriginals = () => {
+					if (!state.mogrtOriginals[mogrtPath]) state.mogrtOriginals[mogrtPath] = pristine;
+				};
 				const existingPreset = presetId ? state.presets[presetId] : null;
 				if (existingPreset) freshList.forEach((p) => {
 					const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
@@ -3556,12 +3673,14 @@ var modalState = {
 						if (readResult.err === 0 && readResult.data) {
 							JSZip.loadAsync(readResult.data, {base64: true}).then((zip) => {
 								const defEntry = zip.file("definition.json");
-								if (!defEntry) { renderModalLayout(modalBody, freshList, mogrtPath); return; }
+								if (!defEntry) { cacheOriginals(); renderModalLayout(modalBody, freshList, mogrtPath); return; }
 								return defEntry.async("string").then((defStr) => {
 								try {
 									const def = JSON.parse(defStr);
 									patchParamsFromDefinition(freshList, def);
+									patchParamsFromDefinition(pristine, def);
 								} catch(_) {}
+								cacheOriginals();
 								// patchParamsFromDefinition 이후 신규 프리셋이면 fontExposed 기반으로 exposedFontFields 재계산
 								if (!presetId) {
 									const recomputed = {};
@@ -3582,11 +3701,12 @@ var modalState = {
 								}
 								renderModalLayout(modalBody, freshList, mogrtPath);
 								});
-							}).catch(() => renderModalLayout(modalBody, freshList, mogrtPath));
+							}).catch(() => { cacheOriginals(); renderModalLayout(modalBody, freshList, mogrtPath); });
 							return; // renderModalLayout은 Promise 내부에서 호출
 						}
 					} catch(_) {}
 				}
+				cacheOriginals();
 				renderModalLayout(modalBody, freshList, mogrtPath);
 			} catch (ex) {
 				clearTimeout(timeoutId);
@@ -3964,18 +4084,37 @@ var modalState = {
 		state.subtitles.forEach((sub) => {
 			listWrap.appendChild(makeRow(sub));
 			// DOM 삽입 후 params 복원/렌더링
-			const rs = state.rowStates[sub.id];
-			const tBtn = document.getElementById("toggle-" + sub.id);
-			if (rs && rs.presetId && (!rs.params || rs.params.length === 0)) {
-				loadParamsFromPreset(sub.id, rs.presetId, sub.text, rs.open !== false);
-				if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
-			} else if (rs && rs.params && rs.params.length > 0) {
-				const panel = document.getElementById("params-" + sub.id);
-				if (panel) panel.className = "sub-params" + (rs.open ? " open" : "");
-				if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
-				renderParamsPanel(sub.id);
-			}
+			_ensureRowParams(sub, state.rowStates[sub.id]);
 		});
+	}
+	// 줄의 속성 목록을 준비하고 속성창을 그린다 (renderAll에서 줄마다).
+	//   프리셋이 있고 _allParams·params가 모두 비었다 → 처음 건 줄: v27처럼 프리셋 값으로 채운다
+	//   그 밖에는 값을 다시 읽지 않는다. 노출 속성(params)만 비었고 구조가 프리셋과 같으면
+	//   _allParams에서 exposedIndices로 다시 고른다.
+	// v27은 'params가 비었으면 다시 읽기'라서 노출 속성이 없는 프리셋의 줄은 renderAll마다
+	// _allParams가 프리셋 기본값으로 돌아가 후반 작업 값이 사라졌다.
+	function _ensureRowParams(sub, rs) {
+		if (!rs) return;
+		const tBtn = document.getElementById("toggle-" + sub.id);
+		const hasAll = !!(rs._allParams && rs._allParams.length);
+		if (rs.presetId && !hasAll && (!rs.params || rs.params.length === 0)) {
+			loadParamsFromPreset(sub.id, rs.presetId, sub.text, rs.open !== false);
+			if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
+			return;
+		}
+		if (rs.presetId && hasAll && (!rs.params || rs.params.length === 0)) {
+			const preset = state.presets[rs.presetId];
+			const exposed = preset && Array.isArray(preset.exposedIndices) ? preset.exposedIndices : [];
+			if (preset && exposed.length > 0 && !layoutMismatch(rs._allParams, preset.params)) {
+				rs.params = rs._allParams.filter((p) => exposed.includes(p.index));
+			}
+		}
+		if (rs.params && rs.params.length > 0) {
+			const panel = document.getElementById("params-" + sub.id);
+			if (panel) panel.className = "sub-params" + (rs.open ? " open" : "");
+			if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
+			renderParamsPanel(sub.id);
+		}
 	}
 	function makeRow(sub) {
 		let rowState = state.rowStates[sub.id];
@@ -4068,7 +4207,7 @@ var modalState = {
 					const panel = document.getElementById("params-" + sub.id);
 					if (panel) { panel.innerHTML = ""; panel.className = "sub-params"; }
 					rowState.open = false;
-					toggleBtn.style.display = "none";
+					if (toggleBtn) toggleBtn.style.display = "none"; // toggleBtn은 null이다 (v27 TypeError로 저장이 빠졌다)
 				}
 				saveSessionToStorage();
 				_applyPresetFilter();
@@ -4433,16 +4572,22 @@ var modalState = {
 		const input = e.target;
 		const file = input.files?.[0];
 		if (!file) return;
+		// 부팅 게이트: 시퀀스 키가 정해지기 전에는 열지 않는다 (label은 disabled지만 이중으로 막는다)
+		if (!_keysResolved) {
+			input.value = "";
+			setStatus("시퀀스를 열면 SRT를 열 수 있습니다", "err");
+			return;
+		}
 		const reader = new FileReader();
 		reader.onload = (ev) => {
 			const text = ev.target?.result;
 			const parsed = parseSRT(text);
 			// 아래 push 루프와 rowStates 구성이 끝난 뒤 saveSessionToStorage()가
 			// 한 번 돈다. 여기서 저장하면 빈 배열이 먼저 쓰인다.
+			// nextId는 되돌리지 않는다: 같은 시퀀스에서 id(→ 클립 태그·applied)가 다시 쓰이지 않게
 			setSubtitles([], { reason: "SRT 로드", persist: false });
 			state.rowStates = {};
 			state.trashBin = [];
-			state.nextId = 1;
 			parsed.forEach((p) => {
 				const id = state.nextId++;
 				state.subtitles.push({
@@ -4518,7 +4663,9 @@ var modalState = {
 		});
 	}
 	// UI 초기화 (로컈 스토리지 로드 등 JSX 필요 없는 작업 먼저 실행)
-	loadAllFromStorage();
+	// 키가 정해지기 전이라 프리셋만 읽는다. 목록은 실제 시퀀스 키가 정해진 뒤에 읽는다
+	// (기본 키 default_seq의 옛 목록이 보였다가 사라지거나 새 시퀀스로 새지 않게).
+	loadAllFromStorage({ presetsOnly: true });
 	renderAll();
 	renderTrash();
 	renderPresetList();
@@ -4537,36 +4684,90 @@ var modalState = {
 	// MOGRT 스캔: JSX 응답을 기다리지 않고 독립적으로 시작 (스캔이 시퀀스 정보에 의존하지 않음)
 	setTimeout(() => doScanMogrt(false), 0);
 	setInterval(() => doScanMogrt(true), 3e4);
-	// 시퀀스 정보는 백그라운드로 비동기 로드 (스캔을 블로킹하지 않음)
-	host.getActiveSequenceInfo().then((info) => {
-		try {
-			const hashFn = (s) => {
-				let h = 0;
-				for (let i = 0; i < s.length; i++) {
-					h = (h << 5) - h + s.charCodeAt(i);
-					h = h & h;
+	// ── 부팅 게이트 ──
+	// 실제(프리뷰가 아닌) 시퀀스로 키가 정해질 때까지 SRT 열기·▶ 적용·작업 불러오기를 막는다.
+	// 2초마다 다시 확인하고(폴러도 확인한다), 타이머가 게이트를 여는 일은 없다.
+	const GATE_WAIT_MSG = "시퀀스 확인 중…";
+	const GATE_NOSEQ_MSG = "시퀀스를 열면 SRT를 열 수 있습니다";
+	function _updateBootGate(noSeq) {
+		const open = _keysResolved;
+		const srtInput = document.getElementById("srtInput");
+		const workInput = document.getElementById("workInput");
+		[srtInput, workInput].forEach((inp) => {
+			if (!inp) return;
+			inp.disabled = !open;
+			const lbl = inp.closest("label");
+			if (lbl) {
+				lbl.classList.toggle("gated", !open);
+				if (!open) {
+					if (lbl.dataset.titleOrig === undefined) lbl.dataset.titleOrig = lbl.title || "";
+					lbl.title = noSeq ? GATE_NOSEQ_MSG : GATE_WAIT_MSG;
+				} else if (lbl.dataset.titleOrig !== undefined) {
+					lbl.title = lbl.dataset.titleOrig;
+					delete lbl.dataset.titleOrig;
 				}
-				return Math.abs(h).toString(36);
-			};
-			if (info.projPath) state.currentProjectKey = "proj_" + hashFn(info.projPath);
-			if (info.seqId) {
-				state.currentSequenceId = info.seqId;
-				state.currentSequenceKey = state.currentProjectKey + "_seq_" + info.seqId.replace(/[^a-zA-Z0-9\-]/g, "_");
-			} else if (info.seqName) state.currentSequenceKey = state.currentProjectKey + "_seq_name_" + hashFn(info.seqName);
-			const seqLabelInit = document.getElementById("activeSeqLabel");
-			if (seqLabelInit) seqLabelInit.textContent = (info.seqName || info.seqId) ? "활성 시퀀스 : " + (info.seqName || info.seqId) : "";
-			// 프로젝트/시퀀스 키 확정 후 프리셋+자막 모두 올바른 키로 재로드
-			loadAllFromStorage();
-			renderAll();
-			renderTrash();
-			renderPresetList();
-			renderPresetTrash();
-			refreshAllSelects();
-			updateMultiSelect();
-			updatePresetTabCount();
-			_loadTrackFromStorage();
-		} catch (_) {}
-	}).catch(() => {});
+			}
+		});
+		const btnApply = document.getElementById("btnApply");
+		if (btnApply) btnApply.disabled = !open;
+		const bar = document.getElementById("statusBar");
+		if (!open) setStatus(noSeq ? GATE_NOSEQ_MSG : GATE_WAIT_MSG, "info");
+		else if (bar && (bar.textContent === GATE_WAIT_MSG || bar.textContent === GATE_NOSEQ_MSG)) setStatus("준비", "");
+	}
+	// getActiveSequenceInfo → 키. v27과 같은 규칙 (projPath가 없으면 지금 프로젝트 키를 유지)
+	function _keysFromInfo(info) {
+		const seqId = info.seqId || "";
+		const seqName = info.seqName || "";
+		const projKey = info.projPath ? "proj_" + simpleHash(info.projPath) : state.currentProjectKey;
+		const seqPart = seqId ? seqId.replace(/[^a-zA-Z0-9\-]/g, "_") : "name_" + simpleHash(seqName);
+		return { projKey, seqKey: projKey + "_seq_" + seqPart, seqId: seqId || seqName };
+	}
+	// 실제 작업 시퀀스인가 (없음·프리뷰 시퀀스는 아니다)
+	function _isRealSeqInfo(info) {
+		return !!(info && (info.seqId || info.seqName) && info.seqName !== "__MOGRT_PREVIEW__");
+	}
+	function _setSeqLabel(info) {
+		const el = document.getElementById("activeSeqLabel");
+		if (el) el.textContent = (info.seqName || info.seqId) ? "활성 시퀀스 : " + (info.seqName || info.seqId) : "";
+	}
+	// 처음 키를 정한다: 프리셋+세션을 그 키로 읽고 게이트를 연다
+	function _resolveKeys(info) {
+		if (_keysResolved || !_isRealSeqInfo(info)) return;
+		const k = _keysFromInfo(info);
+		state.currentProjectKey = k.projKey;
+		state.currentSequenceKey = k.seqKey;
+		state.currentSequenceId = k.seqId;
+		_setSeqLabel(info);
+		// 프로젝트/시퀀스 키 확정 후 프리셋+자막 모두 올바른 키로 재로드
+		loadAllFromStorage();
+		_keysResolved = true;
+		renderAll();
+		renderTrash();
+		renderPresetList();
+		renderPresetTrash();
+		refreshAllSelects();
+		updateMultiSelect();
+		updatePresetTabCount();
+		_loadTrackFromStorage();
+		_updateBootGate(false);
+	}
+	function _tryResolveKeys() {
+		if (_keysResolved) return;
+		host.getActiveSequenceInfo().then((info) => {
+			if (_keysResolved) return;
+			if (_isRealSeqInfo(info)) {
+				try { _resolveKeys(info); } catch (e) { console.error("[MOGRT] 키 확정 실패:", e); }
+				if (_keysResolved) return;
+			} else _updateBootGate(!(info && (info.seqId || info.seqName)));
+			setTimeout(_tryResolveKeys, 2000);
+		}).catch(() => {
+			setTimeout(_tryResolveKeys, 2000);
+		});
+	}
+	// 시퀀스 정보는 백그라운드로 비동기 로드 (스캔을 블로킹하지 않음)
+	// (게이트 상수가 위에서 선언된 뒤에 부른다: 앞에서 부르면 TDZ)
+	_updateBootGate(false);
+	_tryResolveKeys();
 	function simpleHash(str) {
 		let hash = 0;
 		for (let i = 0; i < str.length; i++) {
@@ -4590,29 +4791,29 @@ var modalState = {
 			try {
 				const newSeqId = info.seqId || "";
 				const newSeqName = info.seqName || "";
-				const newProjPath = info.projPath || "";
 				const seqIdentifier = newSeqId || newSeqName;
 				if (!seqIdentifier) return;
 				// 프리뷰 시퀀스는 폴링에서 완전히 무시 (활성 시퀀스 전환 방지)
 				if (newSeqName === "__MOGRT_PREVIEW__") return;
-				const newProjKey = newProjPath ? "proj_" + simpleHash(newProjPath) : state.currentProjectKey;
-				const seqPart = newSeqId ? newSeqId.replace(/[^a-zA-Z0-9\-]/g, "_") : "name_" + simpleHash(newSeqName);
-				const newSeqKey = newProjKey + "_seq_" + seqPart;
-				const seqLabel = document.getElementById("activeSeqLabel");
-				if (seqLabel) seqLabel.textContent = (newSeqName || newSeqId) ? "활성 시퀀스 : " + (newSeqName || newSeqId) : "";
+				// 아직 키가 정해지지 않았으면 여기서 처음 정한다 (전환이 아니다)
+				if (!_keysResolved) {
+					_resolveKeys(info);
+					return;
+				}
+				const k = _keysFromInfo(info);
+				const newProjKey = k.projKey;
+				const newSeqKey = k.seqKey;
+				_setSeqLabel(info);
 				if (newSeqKey === state.currentSequenceKey) return;
 				const isSameProject = newProjKey === state.currentProjectKey;
 				saveSessionToStorage();
 				state.currentProjectKey = newProjKey;
 				state.currentSequenceKey = newSeqKey;
 				state.currentSequenceId = seqIdentifier;
-			if (!isSameProject) loadAllFromStorage();
-			else {
-				// 시퀀스 전환 시에만 빈 데이터로 초기화 허용
-				loadSessionFromStorage._clearOnEmpty = true;
-				loadSessionFromStorage();
-				loadSessionFromStorage._clearOnEmpty = false;
-			}
+				// 세션 파일이 없는 키면 목록을 비운다 (같은 프로젝트든 다른 프로젝트든).
+				// 다른 프로젝트는 프리셋도 다시 읽는다 (프리셋 파일이 없으면 v27처럼 그대로 가져간다)
+				if (!isSameProject) loadAllFromStorage();
+				else loadSessionFromStorage();
 				renderAll();
 				renderTrash();
 				renderPresetList();
@@ -4622,7 +4823,8 @@ var modalState = {
 				updatePresetTabCount();
 				// 시쿼스 전환 후 트랙 복원
 				_loadTrackFromStorage();
-				setStatus((isSameProject ? "시쿼스 전환: " : "프로젝트 변경: ") + (info.seqName || newSeqId), "ok");
+				// 세션 파일을 읽지 못했으면 그 오류 문구를 덮지 않는다
+				if (!_sessionReadFailed) setStatus((isSameProject ? "시쿼스 전환: " : "프로젝트 변경: ") + (info.seqName || newSeqId), "ok");
 			} catch (_) {}
 	}, 100);
 }
@@ -4738,6 +4940,9 @@ var modalState = {
 			if (dd) dd.classList.remove("open");
 		}
 	});
+	// 여기까지 오면 검색·프리셋 필터 선언(_subSearchInput, _presetFilterSelected)이 끝났다.
+	// 그 전에 renderAll 쪽에서 필터를 부르면 TDZ로 IIFE 전체가 멈춘다 → 부르는 쪽이 이 플래그를 본다
+	_filtersReady = true;
 
 	// ── 속성창 일괄 닫기 ──
 	document.getElementById("btnCloseAllParams")?.addEventListener("click", () => {
@@ -4865,6 +5070,10 @@ var modalState = {
 		Object.entries(state.rowStates).filter(([, rs]) => rs.checked).map(([id]) => parseInt(id, 10)).forEach((id) => deleteSubtitle(id));
 	});
 	document.getElementById("btnApply")?.addEventListener("click", async () => {
+		if (!_keysResolved) {
+			setStatus(GATE_NOSEQ_MSG, "err");
+			return;
+		}
 		if (state.subtitles.length === 0) {
 			setStatus("먼저 SRT 파일을 열어주세요.", "err");
 			return;
@@ -5169,6 +5378,12 @@ var modalState = {
 		const input = e.target;
 		const file = input.files?.[0];
 		if (!file) return;
+		// 부팅 게이트: 키가 정해지기 전에 불러오면 키가 정해질 때 목록이 바뀌어 사라진다
+		if (!_keysResolved) {
+			input.value = "";
+			setStatus(GATE_NOSEQ_MSG, "err");
+			return;
+		}
 		const reader = new FileReader();
 		reader.onload = (ev) => {
 			try {
@@ -5222,6 +5437,8 @@ var modalState = {
 	}
 	function _saveHistory(label, isManual) {
 		if (state.subtitles.length === 0) return;
+		// 키가 정해지기 전이거나 세션 파일을 읽지 못한 키면, 메모리 목록이 이 키의 것이 아니다
+		if (!_keysResolved || _sessionReadFailed) return;
 		try {
 			const list = _loadHistoryList(isManual);
 			const entry = {
@@ -5345,7 +5562,10 @@ var modalState = {
 					state.nextId = entry.nextId || 1;
 					if (entry.trackValue) {
 						const trackSel = document.getElementById("trackSel");
-						if (trackSel) trackSel.value = entry.trackValue;
+						if (trackSel) {
+							trackSel.value = entry.trackValue;
+							_saveTrackToStorage(); // 복원한 트랙도 settings.json에 (다시 열어도 그대로)
+						}
 					}
 					_sanitizeOrphanPresets();
 					renderAll();
@@ -5382,6 +5602,11 @@ var modalState = {
 	const _btnHistory = document.getElementById("btnHistory");
 	_btnHistory?.addEventListener("click", (e) => {
 		e.stopPropagation();
+		// 키가 정해지기 전에는 기본 키(default_seq)의 히스토리가 보이므로 열지 않는다
+		if (!_keysResolved) {
+			setStatus(GATE_NOSEQ_MSG, "err");
+			return;
+		}
 		_buildHistoryDropdown();
 		const dropdown = document.getElementById("historyDropdown");
 		if (dropdown) dropdown.classList.toggle("open");
@@ -5425,6 +5650,7 @@ var modalState = {
 		Object.keys(state.presets).forEach((id) => { presets[id] = slim(state.presets[id]); });
 		return JSON.parse(JSON.stringify({
 			keys: { proj: state.currentProjectKey, seq: state.currentSequenceKey, seqId: state.currentSequenceId },
+			flags: { keysResolved: _keysResolved, filtersReady: _filtersReady, sessionReadFailed: _sessionReadFailed },
 			subtitles: state.subtitles,
 			rowStates: state.rowStates,
 			trashBin: state.trashBin,
@@ -5432,10 +5658,13 @@ var modalState = {
 			presets,
 			presetTrash: state.presetTrash.map((t) => Object.assign({}, t, { preset: slim(t.preset) })),
 			nextPresetId: state.nextPresetId,
-			mogrtCount: state.mogrtList.length
+			mogrtCount: state.mogrtList.length,
+			mogrtOriginals: state.mogrtOriginals
 		}));
 	}
 	window._mogrtDebug.snapshot = _debugSnapshot;
+	// main.ts 끝까지 예외 없이 왔다 (모든 핸들러가 붙었다)
+	window._mogrtDebug.bootDone = true;
 
 	//#endregion
 })();
