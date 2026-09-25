@@ -787,7 +787,15 @@
 			// {tracks: [트랙 번호] | null(V1 뺀 전부), fromFrame, toFrame} → {ok, frameTicks, numVideoTracks, tracks: [{i, locked, clips}], ms}
 			getTracks: (payload) => _callMi("getTracks", payload),
 			// {items: [{track, nodeId}] (40개까지), want: {texts, lay, deco, params}} → {ok, results, ms}
-			readTexts: (payload) => _callMi("readClipTexts", payload)
+			readTexts: (payload) => _callMi("readClipTexts", payload),
+			// ── 쓰기 (S2-2). 배치 전에 트랙을 먼저 만든다 (importMGT는 없는 트랙 번호를 마지막 트랙에 놓는다, spike #14) ──
+			// {minCount} → {ok, before, after, added} | add-failed
+			ensureTracks: (payload) => _callMi("ensureVideoTracks", payload),
+			// {frameTicks, budgetMs, items: [{key, op, g, track, sf, ef, keepTime, own, mogrtPath, durSec, params, name, guard, motion, removeAfter}]}
+			// → {ok, done, results: [{key, status, …, before}], damaged, dur, comps, ms}. done < items.length면 예산이 다 됐다
+			placeChunk: (payload) => _callMi("placeChunk", payload),
+			// {items: [{key, track, nodeId, expectName}]} → {ok, results: [{key, status: removed|notFound|notOurs|locked|failed, before}]}
+			removeClips: (payload) => _callMi("removeClips", payload)
 		},
 
 		// 호스트 함수가 아니라 ExtendScript 식이다. 프리뷰 캡처 임시 경로용으로,
@@ -8905,9 +8913,11 @@ var modalState = {
 		if (ping.build !== MI_BUILD_PANEL) return { ok: false, msg: MI_HOST_STALE_MSG, why: "build", ping };
 		return { ok: true, ping };
 	}
-	// DEV·하드 테스트 훅: 호스트 확인과 v28 호출을 패널 어댑터 그대로 부른다 (build·seqId·U+2028 이스케이프 포함)
+	// DEV·하드 테스트 훅: 호스트 확인과 v28 호출을 패널 어댑터 그대로 부른다 (build·seqId·U+2028 이스케이프 포함).
+	// hostMi는 host.mi 그 자체 (ping·getTracks·readTexts·ensureTracks·placeChunk·removeClips)
 	window._mogrtDebug.miHostOk = () => _miHostOk();
 	window._mogrtDebug.callMi = (name, payload) => _callMi(name, payload);
+	window._mogrtDebug.hostMi = host.mi;
 	//#endregion
 	//#region src/main.ts
 	function setStatus(msg, cls) {

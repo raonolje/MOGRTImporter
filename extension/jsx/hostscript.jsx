@@ -2876,6 +2876,117 @@ function MI__frameOf(ticks, ft) {
 function MI__ticks(frame, ft) {
     return String(Math.round(Number(frame) * Number(ft)));
 }
+
+/* ── 쓰기 호스트의 순수 규칙 (S2-2) ── */
+
+/* 배치 작업 7종 */
+var MI__OPS = ["place", "update", "replace", "move", "moveRegen", "adopt", "legacyMove"];
+/* 템플릿 길이 D를 모를 때(durSec 없음, 이 청크에서 아직 놓지 않음) 뒤쪽을 살피는 범위 (초).
+   패널은 D를 늘 보낸다 (preset.mogrtDurSec 또는 definition.json 길이). 모르면 60초 안의 남의 클립을 tail 충돌로 본다 */
+var MI__DMAX_SEC = 60;
+/* 한 번에 받는 작업 수 상한 (청크 기본 8, S0-3 결정 5) */
+var MI__CHUNK_MAX = 60;
+/* MI_removeClips 한 번에 받는 수 상한 */
+var MI__REMOVE_MAX = 200;
+
+/* nodeId 목록 → {"n"+id: true} */
+function MI__set(arr) {
+    var m = {};
+    if (!MI__isArr(arr)) return m;
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i] !== null && arr[i] !== undefined) m["n" + String(arr[i])] = true;
+    }
+    return m;
+}
+/* 작업 하나의 형식 확인 → 문제 글자 | "" */
+function MI__checkItem(it) {
+    if (!it || typeof it !== "object" || MI__isArr(it)) return "item이 객체가 아니다";
+    if (typeof it.key !== "string" || !it.key) return "key";
+    if (MI__idx(MI__OPS, it.op) === -1) return "op: " + it.op;
+    if (!MI__isInt(it.track) || it.track < 0) return "track";
+    var timed = it.op !== "update" && it.op !== "adopt" ? true : !it.keepTime;
+    if (timed) {
+        if (!MI__isInt(it.sf) || it.sf < 0) return "sf";
+        if (!MI__isInt(it.ef) || it.ef <= it.sf) return "ef";
+    }
+    if (it.op === "place" || it.op === "replace" || it.op === "moveRegen" || it.op === "legacyMove") {
+        if (typeof it.mogrtPath !== "string" || !it.mogrtPath) return "mogrtPath";
+    }
+    var o = it.own;
+    if (o !== undefined && o !== null) {
+        if (typeof o !== "object" || !MI__isInt(o.track) || o.track < 0 || o.nodeId === undefined || o.nodeId === null || String(o.nodeId) === "") return "own";
+    }
+    var ra = it.removeAfter;
+    if (ra !== undefined && ra !== null) {
+        if (typeof ra !== "object" || !MI__isInt(ra.track) || ra.track < 0 || ra.nodeId === undefined || ra.nodeId === null || String(ra.nodeId) === "") return "removeAfter";
+    }
+    if (it.op === "legacyMove") {
+        if (!o && !ra) return "legacyMove에는 own이나 removeAfter가 있어야 한다";
+    } else if (it.op !== "place" && !o) {
+        return "own";
+    }
+    if (it.params !== undefined && it.params !== null && !MI__isArr(it.params)) return "params";
+    if (it.name !== undefined && it.name !== null && typeof it.name !== "string") return "name";
+    if (it.guard !== undefined && it.guard !== null && !MI__isArr(it.guard)) return "guard";
+    return "";
+}
+/* 놓을 자리 확인 (순수). list = 트랙의 클립 [{id, s, e}] (ticks), [sfT, efT)에 놓고 [sfT, hiT)까지 덮인다 (hiT = sf + max(ef−sf, D)).
+   skip: 치울 클립(own·removeAfter, {"n"+id: true}), guard: 머리를 되돌릴 이웃. guardAll이면 뒤쪽 클립을 모두 이웃으로 본다.
+   noTail: 옮기기(move)처럼 아무것도 덮어쓰지 않는 경우 — 안쪽에서 시작하는 클립은 끝만 맞추고 뒤쪽은 보지 않는다.
+   → {conflict: null | {reason: "occupied"|"tail", id}, efT(맞춘 끝), clamped, guards: [list 항목]}
+     - 시작 프레임을 덮고 있는 클립(시작 ≤ sf, 끝이 반 프레임 넘게 안쪽): occupied
+     - (sf, ef) 안에서 시작: 이웃이면 끝을 그 시작에 맞춘다(clamped), 아니면 occupied
+     - [ef, hi)에서 시작: 이웃이면 guards, 아니면 tail (놓으면 머리가 잘리거나 지워진다)
+     - 맞춘 길이가 한 프레임보다 짧으면 occupied */
+function MI__occupy(list, sfT, efT, hiT, ft, skip, guard, noTail, guardAll) {
+    var res = { conflict: null, efT: efT, clamped: false, guards: [] };
+    var xs = [];
+    var i;
+    for (i = 0; i < list.length; i++) xs.push(list[i]);
+    xs.sort(function (a, b) { return a.s - b.s; });
+    for (i = 0; i < xs.length; i++) {
+        var x = xs[i];
+        if (skip && skip["n" + x.id]) continue;
+        if (x.e <= sfT || x.s >= hiT) continue;
+        var isG = guardAll === true || (guard && guard["n" + x.id] === true);
+        if (x.s <= sfT) {
+            if (x.e > sfT + ft / 2) {
+                res.conflict = { reason: "occupied", id: x.id };
+                return res;
+            }
+            continue;
+        }
+        if (x.s < res.efT) {
+            if (noTail || isG) {
+                res.efT = x.s;
+                res.clamped = true;
+                if (!noTail) res.guards.push(x);
+                continue;
+            }
+            res.conflict = { reason: "occupied", id: x.id };
+            return res;
+        }
+        if (noTail) continue;
+        if (isG) {
+            res.guards.push(x);
+        } else {
+            res.conflict = { reason: "tail", id: x.id };
+            return res;
+        }
+    }
+    if (res.efT - sfT < ft) res.conflict = { reason: "occupied", id: "" };
+    return res;
+}
+/* fromT 뒤(초과)에서 시작하는 첫 클립의 시작 (skip 제외, 없으면 null) — 제자리 갱신의 끝 맞추기 */
+function MI__nextStart(list, fromT, skip) {
+    var best = null;
+    for (var i = 0; i < list.length; i++) {
+        var x = list[i];
+        if (skip && skip["n" + x.id]) continue;
+        if (x.s > fromT && (best === null || x.s < best)) best = x.s;
+    }
+    return best;
+}
 /* MI_PURE_END */
 
 /* ── 공통 헬퍼 ── */
@@ -3279,6 +3390,911 @@ function MI_readClipTexts(payloadStr) {
         return MI__json({ ok: true, results: results, ms: MI__now() - t0 });
     } catch (e) {
         return MI__fail("exception", MI__errText(e));
+    }
+}
+
+/* ══ 쓰기 헬퍼 (S2-2) ══ */
+
+/* 청크 하나의 작업 맥락 (한 번의 MI_placeChunk 호출 안에서만 산다) */
+function MI__ctx(seq, ft) {
+    return { seq: seq, ft: ft, maps: {}, tags: {}, cache: {}, dur: {}, comps: {}, damaged: [] };
+}
+/* 트랙 ti의 nodeId 표 (청크 안에서 다시 쓰고, 트랙을 바꾸면 MI__dirty로 버린다) */
+function MI__cmap(ctx, ti) {
+    var k = "t" + ti;
+    if (!ctx.maps[k]) {
+        var tr = MI__track(ctx.seq, ti);
+        ctx.maps[k] = tr ? MI__nodeMap(tr) : {};
+    }
+    return ctx.maps[k];
+}
+/* 트랙의 클립이 늘거나 줄거나 움직였다 → nodeId 표를 버린다 (TrackItem 참조는 다시 찾는다) */
+function MI__dirty(ctx, ti) {
+    if (ti === undefined || ti === null) {
+        ctx.maps = {};
+        return;
+    }
+    delete ctx.maps["t" + ti];
+}
+function MI__find(ctx, ti, id) {
+    return MI__cmap(ctx, ti)["n" + String(id)] || null;
+}
+/* 트랙 ti의 태그 색인 (청크 첫 루프에서 한 번): [{id, sf, uid, g}]. 자르기로 같은 태그가 둘인지 보는 데 쓴다 */
+function MI__tagIndex(ctx, ti) {
+    var k = "t" + ti;
+    if (ctx.tags[k]) return ctx.tags[k];
+    var out = [];
+    var tr = MI__track(ctx.seq, ti);
+    var cs, n = 0;
+    try { cs = tr.clips; n = cs.numItems; } catch (e) { n = 0; }
+    for (var i = 0; i < n; i++) {
+        var c = null;
+        try { c = cs[i]; } catch (e1) { continue; }
+        if (!c) continue;
+        var tg = null;
+        try { tg = MI__parseTag(String(c.name)); } catch (e2) { tg = null; }
+        if (!tg) continue;
+        var o = { id: "", sf: 0, uid: tg.salt + "-" + tg.id, g: tg.g };
+        try { o.id = String(c.nodeId); o.sf = MI__frameOf(MI__s(c), ctx.ft); } catch (e3) { continue; }
+        out.push(o);
+    }
+    ctx.tags[k] = out;
+    return out;
+}
+/* 트랙의 클립 중 [loT, hiT)와 겹치는 것 [{c, id, s, e}] (시작순). 시작만 먼저 읽어 창 밖은 건너뛴다 */
+function MI__win(tr, loT, hiT) {
+    var out = [];
+    var cs, n = 0;
+    try { cs = tr.clips; n = cs.numItems; } catch (e) { return out; }
+    for (var k = 0; k < n; k++) {
+        var c = null;
+        try { c = cs[k]; } catch (e1) { continue; }
+        if (!c) continue;
+        var s, en;
+        try { s = MI__s(c); } catch (e2) { continue; }
+        if (s >= hiT) continue;
+        try { en = MI__e(c); } catch (e3) { continue; }
+        if (en <= loT) continue;
+        var id = "";
+        try { id = String(c.nodeId); } catch (e4) {}
+        out.push({ c: c, id: id, s: s, e: en });
+    }
+    out.sort(function (a, b) { return a.s - b.s; });
+    return out;
+}
+/* 트랙의 모든 nodeId {"n"+id: true} (새로 놓인 클립을 차집합으로 찾는다) */
+function MI__idSet(tr) {
+    var m = {};
+    var cs, n = 0;
+    try { cs = tr.clips; n = cs.numItems; } catch (e) { return m; }
+    for (var k = 0; k < n; k++) {
+        try { m["n" + String(cs[k].nodeId)] = true; } catch (e1) {}
+    }
+    return m;
+}
+/* ids0에 없고 시작이 sf ±1 프레임인 클립들 (overwriteClip은 클립을 돌려주지 않는다) */
+function MI__newClips(tr, ids0, sf, ft) {
+    var out = [];
+    var cs, n = 0;
+    try { cs = tr.clips; n = cs.numItems; } catch (e) { return out; }
+    for (var k = 0; k < n; k++) {
+        var c = null;
+        var id = "";
+        try { c = cs[k]; id = String(c.nodeId); } catch (e1) { continue; }
+        if (ids0["n" + id]) continue;
+        var f = 0;
+        try { f = MI__frameOf(MI__s(c), ft); } catch (e2) { continue; }
+        if (Math.abs(f - sf) <= 1) out.push(c);
+    }
+    return out;
+}
+/* 이름 쓰기 → 되읽어 같으면 true (spike #1: TrackItem.name은 저장·재시작 뒤에도 남는다) */
+function MI__setName(c, name) {
+    try { c.name = name; } catch (e) { return false; }
+    var now = "";
+    try { now = String(c.name); } catch (e2) { return false; }
+    return now === name;
+}
+/* 속성 이름을 확인하고 쓴다 (index 쓰기의 위험을 막는다: 재저장된 MOGRT의 옛 구조 클립, S0-3 x·결정 16).
+   → {written, skipped: [이름], keyed: [이름]}
+   AE: props[p.index]의 displayName과 텍스트 여부가 p와 같을 때만 그 자리에 쓴다. 아니면 목록 안에서 같은 이름·같은
+       텍스트 여부인 param 가운데 k번째(k = 목록에서의 순서)인 속성에 쓴다. 그것도 없으면 skipped.
+       isTimeVarying(키프레임)인 속성은 keyed로 두고 쓰지 않는다 (setValue가 true를 돌려주고 조용히 무시된다, spike #8·S0-3 g).
+       확인한 목록(index를 고친 사본)을 v27 applyParamsToItem에 한 번에 넘긴다. group·textsetting은 쓰지 않는다(v27과 같다).
+   네이티브: Source Text에는 절대 쓰지 않는다 — 스크립트로 쓴 글자는 빈 글자로 렌더된다 (S0-3 §3-1a). 문구는 구운 .mogrt로
+       놓고, 문구가 바뀌면 패널이 replace로 계획한다 (S1-11). 지금 값과 같은 param은 건너뛰고(쓸 것 없음), 다른 값은 skipped.
+   그 밖(영상 등): 모두 skipped */
+function MI__applyParamsSafe(c, kind, params) {
+    var res = { written: 0, skipped: [], keyed: [] };
+    if (!MI__isArr(params) || !params.length) return res;
+    var i, j, p, ty, dn;
+    if (kind === "ae") {
+        var ps = MI__props(c);
+        var n = 0;
+        try { n = ps ? ps.numItems : 0; } catch (e) { n = 0; }
+        var info = [];
+        for (i = 0; i < n; i++) {
+            var pr = null;
+            var pdn = "";
+            var pv = "";
+            try { pr = ps[i]; pdn = String(pr.displayName); } catch (e1) {}
+            try { pv = String(pr.getValue()); } catch (e2) {}
+            info.push({ pr: pr, dn: pdn, t: String(pv).indexOf("\"textEditValue\"") !== -1 });
+        }
+        var seen = {};
+        var used = {};
+        var list = [];
+        for (i = 0; i < params.length; i++) {
+            p = params[i];
+            if (!p || typeof p !== "object") continue;
+            ty = String(p.type || "").toLowerCase();
+            if (ty === "group" || ty === "textsetting") continue;
+            dn = String(p.displayName === undefined || p.displayName === null ? "" : p.displayName);
+            var wantT = ty === "text";
+            var sk = (wantT ? "t|" : "o|") + dn;
+            var ord = seen[sk] || 0;
+            seen[sk] = ord + 1;
+            var idx = -1;
+            if (MI__isInt(p.index) && p.index >= 0 && p.index < n && info[p.index].dn === dn && info[p.index].t === wantT) {
+                idx = p.index;
+            } else {
+                var cnt = 0;
+                for (j = 0; j < n; j++) {
+                    if (info[j].dn === dn && info[j].t === wantT) {
+                        if (cnt === ord) { idx = j; break; }
+                        cnt++;
+                    }
+                }
+            }
+            if (idx === -1 || used["i" + idx]) {
+                res.skipped.push(dn);
+                continue;
+            }
+            var tv = false;
+            try { tv = info[idx].pr.isTimeVarying() === true; } catch (e3) { tv = false; }
+            if (tv) {
+                res.keyed.push(dn);
+                continue;
+            }
+            used["i" + idx] = true;
+            var q = {};
+            for (var f in p) {
+                if (Object.prototype.hasOwnProperty.call(p, f)) q[f] = p[f];
+            }
+            q.index = idx;
+            list.push(q);
+        }
+        if (list.length) {
+            try { applyParamsToItem(c, list); } catch (e4) { res.error = MI__errText(e4); }
+        }
+        res.written = list.length;
+    } else if (kind === "native") {
+        var nt = collectNativeTextProps(c);
+        for (i = 0; i < params.length; i++) {
+            p = params[i];
+            if (!p || typeof p !== "object" || String(p.type || "").toLowerCase() !== "text") continue;
+            var k = MI__isInt(p.index) ? p.index : -1;
+            dn = String(p.displayName || ("텍스트 " + (k + 1)));
+            var want = String(p.value === undefined || p.value === null ? "" : p.value);
+            if (k >= 0 && k < nt.length && MI__nativeVal(nt[k]) === want) continue;
+            res.skipped.push(dn);
+        }
+    } else {
+        for (i = 0; i < params.length; i++) {
+            p = params[i];
+            if (!p || typeof p !== "object") continue;
+            ty = String(p.type || "").toLowerCase();
+            if (ty === "group" || ty === "textsetting") continue;
+            res.skipped.push(String(p.displayName || ""));
+        }
+    }
+    return res;
+}
+/* 되읽기: nodeId, 트랙·프레임, 이름, 종류, texts, lay, pin (withDeco면 deco) → r에 채운다 */
+function MI__readback(r, c, ti, ft, withDeco) {
+    var kind = MI__kind(c);
+    var b = MI__brief(c, ti, ft);
+    r.nodeId = b.nodeId;
+    r.track = ti;
+    r.sf = b.sf;
+    r.ef = b.ef;
+    r.name = b.name;
+    r.kind = kind;
+    r.texts = MI__texts(c, kind);
+    r.lay = MI__lay(c, kind);
+    r.pin = MI__pin(c);
+    if (withDeco) r.deco = MI__deco(c);
+    return kind;
+}
+/* 되돌리기용 'before' 스냅숏 {track, sf, ef, g, name, kind, m, pi, params} (m은 패널이 아는 템플릿 경로 own.m) */
+function MI__snapOf(c, ti, ft, m) {
+    var b = MI__brief(c, ti, ft);
+    var kind = MI__kind(c);
+    var tg = MI__parseTag(b.name);
+    var pi = null;
+    try { pi = c.projectItem; } catch (e) { pi = null; }
+    var piId = null;
+    try { piId = pi ? String(pi.nodeId) : null; } catch (e2) { piId = null; }
+    return { track: ti, sf: b.sf, ef: b.ef, g: tg ? tg.g : null, name: b.name, kind: kind, m: m ? String(m) : null, pi: piId, params: MI__readParams(c, kind) };
+}
+
+/* ── 새로 놓기: 자리 확인 → 이웃 스냅숏 → importMGT/overwriteClip → 끝 → 이웃 머리 되돌리기 ── */
+
+/* 자리 계획. spec {ti, sf, ef, endT?(정확한 끝 ticks), path, pi?(덮어 놓을 projectItem), durSec, guard, skip, guardAll}
+   → {conflict} | {ti, sf, efT, clamped, path, pi, guards} */
+function MI__planPut(ctx, spec) {
+    var ft = ctx.ft;
+    var tr = MI__track(ctx.seq, spec.ti);
+    if (!tr) return { fail: "no-track" };
+    var dF = null;
+    if (typeof spec.durSec === "number" && spec.durSec > 0) {
+        dF = Math.round(spec.durSec * MI__TPS / ft);
+    } else if (spec.path && ctx.dur["p" + spec.path] !== undefined) {
+        dF = Math.round(ctx.dur["p" + spec.path] * MI__TPS / ft);
+    }
+    var span = spec.ef - spec.sf;
+    var reach = dF !== null ? dF : Math.round(MI__DMAX_SEC * MI__TPS / ft);
+    if (reach > span) span = reach;
+    var sfT = spec.sf * ft;
+    var efT = typeof spec.endT === "number" ? spec.endT : spec.ef * ft;
+    var hiT = (spec.sf + span) * ft;
+    if (efT > hiT) hiT = efT;
+    var win = MI__win(tr, sfT, hiT);
+    var oc = MI__occupy(win, sfT, efT, hiT, ft, spec.skip || {}, spec.guard || {}, false, spec.guardAll === true);
+    if (oc.conflict) return { conflict: oc.conflict, durKnown: dF !== null };
+    return { ti: spec.ti, sf: spec.sf, efT: oc.efT, clamped: oc.clamped, path: spec.path || "", pi: spec.pi || null, guards: oc.guards };
+}
+/* 클립 하나를 트랙 ti의 sf에 놓는다 → {clip, how} | {status, reason, detail}.
+   pi(또는 이 청크에서 캐시한 projectItem)가 있으면 overwriteClip으로 놓고 nodeId 차집합(sf ±1)으로 찾는다.
+   캐시로 처음 놓은 클립의 lay가 importMGT 클립과 다르면(같은 capsule로 재저장된 MOGRT는 overwriteClip이 옛 구조를 놓는다,
+   S0-3 x ③) 그 클립을 지우고 캐시를 끈다. 못 찾거나 예외면 캐시를 끄고 importMGT로 간다 (S0-3 결정 13).
+   importMGT가 돌려준 클립이 이 트랙에 없으면(트랙 번호 ≥ 트랙 수면 마지막 트랙에 놓인다, #14) 지우고 misplaced */
+function MI__put(ctx, ti, sf, path, pi) {
+    var seq = ctx.seq;
+    var ft = ctx.ft;
+    var tr = MI__track(seq, ti);
+    if (!tr) return { status: "failed", reason: "no-track" };
+    var ids0 = MI__idSet(tr);
+    var ck = path ? "p" + path : "";
+    var cache = ck && ctx.cache[ck] ? ctx.cache[ck] : null;
+    var usePi = pi || (cache && !cache.off ? cache.pi : null);
+    if (usePi) {
+        var ok = false;
+        try { ok = seq.overwriteClip(usePi, MI__at(sf, ft), ti, 0); } catch (e) { ok = false; }
+        MI__dirty(ctx, ti);
+        var found = ok === false ? [] : MI__newClips(MI__track(seq, ti), ids0, sf, ft);
+        if (found.length === 1) {
+            var nc = found[0];
+            if (!pi && cache && !cache.verified) {
+                if (MI__json(MI__lay(nc, MI__kind(nc))) !== cache.lay) {
+                    try { nc.remove(false, false); } catch (e2) {}
+                    MI__dirty(ctx, ti);
+                    cache.off = true;
+                } else {
+                    cache.verified = true;
+                    return { clip: nc, how: "overwrite" };
+                }
+            } else {
+                return { clip: nc, how: "overwrite" };
+            }
+        } else {
+            if (cache && !pi) cache.off = true;
+            if (found.length > 1) return { status: "failed", reason: "import-null", detail: "overwriteClip 뒤 새 클립 " + found.length + "개" };
+        }
+    }
+    if (!path) return { status: "failed", reason: "import-null", detail: "템플릿 경로 없음" };
+    var c = null;
+    try { c = seq.importMGT(path, MI__ticks(sf, ft), ti, 0); } catch (e3) { return { status: "failed", reason: "import-null", detail: MI__errText(e3) }; }
+    MI__dirty(ctx);
+    if (!c) return { status: "failed", reason: "import-null", detail: path };
+    var id = "";
+    try { id = String(c.nodeId); } catch (e4) { id = ""; }
+    var got = id && !ids0["n" + id] ? MI__find(ctx, ti, id) : null;
+    var gf = null;
+    try { gf = got ? MI__frameOf(MI__s(got), ft) : null; } catch (e5) { gf = null; }
+    if (!got || gf === null || Math.abs(gf - sf) > 1) {
+        try { c.remove(false, false); } catch (e6) {}
+        MI__dirty(ctx);
+        return { status: "misplaced", reason: "misplaced", detail: "nodeId " + id + (gf === null ? " 다른 트랙" : " 시작 " + gf + "f") };
+    }
+    if (ck && !ctx.cache[ck]) {
+        var gpi = null;
+        try { gpi = got.projectItem; } catch (e7) { gpi = null; }
+        if (gpi) ctx.cache[ck] = { pi: gpi, lay: MI__json(MI__lay(got, MI__kind(got))), verified: false, off: false };
+    }
+    return { clip: got, how: "import" };
+}
+/* 계획대로 놓는다: 이웃 스냅숏 → 놓기 → D·컴포넌트 수 기록(경로마다 처음 한 번) → 끝을 efT로 → 이웃 머리 되돌리기(분기 R).
+   → {clip, efT, clamped, how} | {status, reason, detail}. 되돌리지 못한 이웃은 ctx.damaged (패널이 그 줄을 다시 놓는다, 분기 C) */
+function MI__doPut(ctx, plan) {
+    var snaps = [];
+    var i;
+    for (i = 0; i < plan.guards.length; i++) {
+        var gx = plan.guards[i];
+        var inT = null;
+        try { inT = Number(gx.c.inPoint.ticks); } catch (e) { inT = null; }
+        snaps.push({ id: gx.id, s: gx.s, e: gx.e, inT: inT });
+    }
+    var put = MI__put(ctx, plan.ti, plan.sf, plan.path, plan.pi);
+    if (!put.clip) return put;
+    var c = put.clip;
+    if (plan.path && ctx.dur["p" + plan.path] === undefined) {
+        var dT = 0;
+        try { dT = MI__e(c) - MI__s(c); } catch (e2) { dT = 0; }
+        if (dT > 0) {
+            ctx.dur["p" + plan.path] = dT / MI__TPS;
+            var nComp = 0;
+            try { nComp = c.components.numItems; } catch (e3) { nComp = 0; }
+            ctx.comps["p" + plan.path] = nComp;
+        }
+    }
+    try { c.end = MI__T(plan.efT); } catch (e4) {}
+    MI__dirty(ctx, plan.ti);
+    MI__restoreGuards(ctx, plan.ti, snaps);
+    var id = "";
+    try { id = String(c.nodeId); } catch (e5) {}
+    var again = MI__find(ctx, plan.ti, id);
+    return { clip: again || c, efT: plan.efT, clamped: plan.clamped, how: put.how };
+}
+/* 잘린 이웃의 머리를 되돌린다 (S0-3 결정 1: inPoint −= Δ 다음 start −= Δ, 다시 읽어 start·end·inPoint 확인).
+   지워졌거나(통째로 덮임) 되돌리지 못한 이웃은 ctx.damaged에 넣는다 */
+function MI__restoreGuards(ctx, ti, snaps) {
+    if (!snaps.length) return;
+    MI__dirty(ctx, ti);
+    for (var i = 0; i < snaps.length; i++) {
+        var g = snaps[i];
+        var c = MI__find(ctx, ti, g.id);
+        if (!c) {
+            MI__damage(ctx, g.id);
+            continue;
+        }
+        var s = 0;
+        var e = 0;
+        try { s = MI__s(c); e = MI__e(c); } catch (e1) { MI__damage(ctx, g.id); continue; }
+        if (s === g.s && e === g.e) continue;
+        if (e !== g.e || s < g.s) {
+            MI__damage(ctx, g.id);
+            continue;
+        }
+        var d = s - g.s;
+        try {
+            var inNow = Number(c.inPoint.ticks);
+            c.inPoint = MI__T(inNow - d);
+            c.start = MI__T(g.s);
+        } catch (e2) {}
+        var s2 = 0;
+        var e2b = 0;
+        var in2 = null;
+        try { s2 = MI__s(c); e2b = MI__e(c); in2 = Number(c.inPoint.ticks); } catch (e3) {}
+        if (s2 !== g.s || e2b !== g.e || (g.inT !== null && in2 !== g.inT)) MI__damage(ctx, g.id);
+    }
+    MI__dirty(ctx, ti);
+}
+function MI__damage(ctx, id) {
+    if (MI__idx(ctx.damaged, id) === -1) ctx.damaged.push(id);
+}
+/* nodeId로 지운다 → "removed" | "gone"(이미 없음) | "left"(지웠는데 남음) */
+function MI__removeNode(ctx, ti, id) {
+    var c = MI__find(ctx, ti, id);
+    if (!c) return "gone";
+    var ok = false;
+    try { ok = c.remove(false, false); } catch (e) { ok = false; }
+    MI__dirty(ctx, ti);
+    if (ok === false) return MI__find(ctx, ti, id) ? "left" : "gone";
+    return MI__find(ctx, ti, id) ? "left" : "removed";
+}
+
+/* ── 작업 실행 ── */
+
+/* 결과 틀 */
+function MI__res(it) {
+    return {
+        key: it && typeof it.key === "string" ? it.key : "",
+        status: "",
+        track: it && MI__isInt(it.track) ? it.track : null,
+        sf: it && MI__isInt(it.sf) ? it.sf : null,
+        ef: it && MI__isInt(it.ef) ? it.ef : null,
+        g: it && MI__isInt(it.g) ? it.g : null,
+        nodeId: "",
+        clamped: false,
+        reason: "",
+        skipped: [],
+        keyed: [],
+        before: null,
+        motion: "none"
+    };
+}
+/* 첫 루프: 작업이 건드리는 기존 클립을 찾고 'before'를 읽는다 (어떤 작업보다 먼저, spec placement 14 e).
+   own을 nodeId로 찾는다. 없으면(태그 클립만) own.track에서 key(uid)와 sf ±1인 태그 클립: 하나면 그것, 둘 이상이면 ambiguous, 없으면 stale-plan.
+   찾은 클립과 같은 태그(uid·gen)의 클립이 트랙에 둘 이상이면(자르기, spike #1b) ambiguous.
+   own.sf와 1프레임 넘게 다르면(계획 뒤에 옮겨졌다) stale-plan.
+   → {status?, reason?, ti, id, kind, before, pi(projectItem 참조, replace 되돌리기용), sT, eT, raTi, raId} */
+function MI__locate(ctx, it) {
+    var pr = { status: "", reason: "", detail: "", ti: -1, id: "", kind: "", before: null, pi: null, sT: 0, eT: 0, raTi: -1, raId: "" };
+    var bad = MI__checkItem(it);
+    if (bad) {
+        pr.status = "failed";
+        pr.reason = "bad-item";
+        pr.detail = bad;
+        return pr;
+    }
+    if (it.removeAfter) {
+        pr.raTi = it.removeAfter.track;
+        pr.raId = String(it.removeAfter.nodeId);
+    }
+    if (it.op === "place") return pr;
+    var o = it.own ? it.own : it.removeAfter;
+    var ft = ctx.ft;
+    if (!MI__track(ctx.seq, o.track)) {
+        pr.status = "stale-plan";
+        pr.reason = "no-track";
+        return pr;
+    }
+    var c = MI__find(ctx, o.track, o.nodeId);
+    var i;
+    if (c) {
+        var tg = null;
+        try { tg = MI__parseTag(String(c.name)); } catch (e) { tg = null; }
+        if (tg) {
+            var ix = MI__tagIndex(ctx, o.track);
+            var same = 0;
+            for (i = 0; i < ix.length; i++) {
+                if (ix[i].uid === tg.salt + "-" + tg.id && ix[i].g === tg.g) same++;
+            }
+            if (same > 1) {
+                pr.status = "ambiguous";
+                pr.detail = "같은 태그 클립 " + same + "개";
+                return pr;
+            }
+        }
+        var cf = null;
+        try { cf = MI__frameOf(MI__s(c), ft); } catch (e2) { cf = null; }
+        if (MI__isInt(o.sf) && (cf === null || Math.abs(cf - o.sf) > 1)) {
+            pr.status = "stale-plan";
+            pr.reason = "moved";
+            pr.detail = "시작 " + cf + "f (계획 " + o.sf + "f)";
+            return pr;
+        }
+    } else {
+        if (it.own && it.name !== undefined && it.name !== null && MI__isInt(o.sf)) {
+            var tix = MI__tagIndex(ctx, o.track);
+            var hits = [];
+            for (i = 0; i < tix.length; i++) {
+                if (tix[i].uid === it.key && Math.abs(tix[i].sf - o.sf) <= 1) hits.push(tix[i]);
+            }
+            if (hits.length > 1) {
+                pr.status = "ambiguous";
+                pr.detail = "같은 태그 클립 " + hits.length + "개";
+                return pr;
+            }
+            if (hits.length === 1) c = MI__find(ctx, o.track, hits[0].id);
+        }
+        if (!c) {
+            pr.status = "stale-plan";
+            pr.reason = "not-found";
+            pr.detail = "nodeId " + o.nodeId;
+            return pr;
+        }
+    }
+    pr.ti = o.track;
+    pr.id = String(c.nodeId);
+    pr.kind = MI__kind(c);
+    try { pr.sT = MI__s(c); pr.eT = MI__e(c); } catch (e3) {}
+    if (it.op === "update" || it.op === "adopt") {
+        pr.before = MI__readParams(c, pr.kind);
+    } else {
+        pr.before = MI__snapOf(c, o.track, ft, it.own ? it.own.m : null);
+        try { pr.pi = c.projectItem || null; } catch (e4) { pr.pi = null; }
+    }
+    return pr;
+}
+/* 새로 놓은 클립 마무리: 속성(이름 확인), 이름(태그), 되읽기(deco 포함) → r.status */
+function MI__finishNew(ctx, it, r, put, okStatus) {
+    var c = put.clip;
+    var ap = MI__applyParamsSafe(c, MI__kind(c), it.params);
+    r.skipped = ap.skipped;
+    r.keyed = ap.keyed;
+    r.clamped = put.clamped === true;
+    var nameOk = true;
+    if (it.name !== undefined && it.name !== null) nameOk = MI__setName(c, it.name);
+    MI__readback(r, c, it.track, ctx.ft, true);
+    if (!nameOk) {
+        r.status = "failed";
+        r.reason = "tag-write";
+        return;
+    }
+    r.status = ap.skipped.length || ap.keyed.length ? "partial" : okStatus;
+}
+function MI__opPlace(ctx, it, pr, r) {
+    var plan = MI__planPut(ctx, { ti: it.track, sf: it.sf, ef: it.ef, path: it.mogrtPath, durSec: it.durSec, guard: MI__set(it.guard), skip: {} });
+    if (plan.fail) {
+        r.status = "failed";
+        r.reason = plan.fail;
+        return;
+    }
+    if (plan.conflict) {
+        r.status = "conflict";
+        r.reason = plan.conflict.reason;
+        r.detail = plan.conflict.id + (plan.durKnown ? "" : " (템플릿 길이를 몰라 " + MI__DMAX_SEC + "초 안을 봤다)");
+        return;
+    }
+    var put = MI__doPut(ctx, plan);
+    if (!put.clip) {
+        r.status = put.status || "failed";
+        r.reason = put.reason || "";
+        r.detail = put.detail || "";
+        return;
+    }
+    MI__finishNew(ctx, it, r, put, "placed");
+}
+/* update / adopt: 제자리. 이름 확인 쓰기 → (keepTime이 아니면) 끝 = min(ef, 다음 클립 시작) → 이름 → 되읽기 */
+function MI__opUpdate(ctx, it, pr, r) {
+    var ft = ctx.ft;
+    var c = MI__find(ctx, pr.ti, pr.id);
+    if (!c) {
+        r.status = "stale-plan";
+        r.reason = "not-found";
+        return;
+    }
+    var ap = MI__applyParamsSafe(c, pr.kind, it.params);
+    r.skipped = ap.skipped;
+    r.keyed = ap.keyed;
+    if (!it.keepTime) {
+        var s0 = MI__s(c);
+        var efT = it.ef * ft;
+        var tr = MI__track(ctx.seq, pr.ti);
+        var skip = {};
+        skip["n" + pr.id] = true;
+        var nx = MI__nextStart(MI__win(tr, s0, efT), s0, skip);
+        var endT = efT;
+        if (nx !== null && nx < endT) {
+            endT = nx;
+            r.clamped = true;
+        }
+        if (endT - s0 >= ft) {
+            try { c.end = MI__T(endT); } catch (e) {}
+        } else {
+            r.reason = "zero-length";
+        }
+    }
+    var nameOk = true;
+    if (it.name !== undefined && it.name !== null) nameOk = MI__setName(c, it.name);
+    MI__readback(r, c, pr.ti, ft, false);
+    if (!nameOk) {
+        r.status = "failed";
+        r.reason = "tag-write";
+        return;
+    }
+    r.status = ap.skipped.length || ap.keyed.length ? "partial" : (it.op === "adopt" ? "adopted" : "updated");
+}
+/* move: TrackItem.move(Δ) — nodeId·이름·속성·효과·키프레임이 그대로다 (S0-3 r). move는 겹침을 막지 않으므로
+   목적 범위 [sf, ef)를 먼저 확인한다: 시작을 덮은 클립이 있으면 conflict, 안쪽에서 시작하는 클립이 있으면 끝을 맞춘다.
+   길이를 먼저 줄인 뒤 옮기고 끝을 ef × frameTicks로 쓴다. 같은 트랙 안에서만 (다른 트랙은 moveRegen) */
+function MI__opMove(ctx, it, pr, r) {
+    var ft = ctx.ft;
+    if (pr.ti !== it.track) {
+        r.status = "failed";
+        r.reason = "bad-item";
+        r.detail = "move는 같은 트랙 안에서만 (다른 트랙은 moveRegen)";
+        return;
+    }
+    var c = MI__find(ctx, pr.ti, pr.id);
+    if (!c) {
+        r.status = "stale-plan";
+        r.reason = "not-found";
+        return;
+    }
+    var tr = MI__track(ctx.seq, pr.ti);
+    var sfT = it.sf * ft;
+    var skip = {};
+    skip["n" + pr.id] = true;
+    var oc = MI__occupy(MI__win(tr, sfT, it.ef * ft), sfT, it.ef * ft, it.ef * ft, ft, skip, {}, true, false);
+    if (oc.conflict) {
+        r.status = "conflict";
+        r.reason = oc.conflict.reason;
+        r.detail = oc.conflict.id;
+        return;
+    }
+    r.clamped = oc.clamped;
+    var s0 = MI__s(c);
+    var e0 = MI__e(c);
+    var len = oc.efT - sfT;
+    if (e0 - s0 > len) {
+        try { c.end = MI__T(s0 + len); } catch (e) {}
+    }
+    if (sfT !== s0) {
+        try { c.move(MI__T(sfT - s0)); } catch (e2) { r.status = "failed"; r.reason = "move"; r.detail = MI__errText(e2); return; }
+    }
+    MI__dirty(ctx, pr.ti);
+    var m = MI__find(ctx, pr.ti, pr.id) || c;
+    try { m.end = MI__T(oc.efT); } catch (e3) {}
+    var nowF = null;
+    try { nowF = MI__frameOf(MI__s(m), ft); } catch (e4) { nowF = null; }
+    if (nowF !== it.sf) {
+        r.status = "failed";
+        r.reason = "move";
+        r.detail = "시작 " + nowF + "f";
+        MI__readback(r, m, pr.ti, ft, false);
+        return;
+    }
+    var ap = MI__applyParamsSafe(m, pr.kind, it.params);
+    r.skipped = ap.skipped;
+    r.keyed = ap.keyed;
+    var nameOk = true;
+    if (it.name !== undefined && it.name !== null) nameOk = MI__setName(m, it.name);
+    MI__readback(r, m, pr.ti, ft, false);
+    if (!nameOk) {
+        r.status = "failed";
+        r.reason = "tag-write";
+        return;
+    }
+    r.status = ap.skipped.length || ap.keyed.length ? "partial" : "moved";
+}
+/* moveRegen / legacyMove: 새 자리에 새로 놓고(gen+1 또는 legacyMove의 gen 1) 확인한 뒤 옛 클립(own, removeAfter)을 nodeId로 지운다.
+   지우지 못하면 reason old-left (새 클립은 남는다). 자리가 막혀 있으면 아무것도 바꾸지 않는다 */
+function MI__opRegen(ctx, it, pr, r) {
+    var skip = {};
+    if (pr.id && pr.ti === it.track) skip["n" + pr.id] = true;
+    if (pr.raId && pr.raTi === it.track) skip["n" + pr.raId] = true;
+    var plan = MI__planPut(ctx, { ti: it.track, sf: it.sf, ef: it.ef, path: it.mogrtPath, durSec: it.durSec, guard: MI__set(it.guard), skip: skip });
+    if (plan.fail) {
+        r.status = "failed";
+        r.reason = plan.fail;
+        return;
+    }
+    if (plan.conflict) {
+        r.status = "conflict";
+        r.reason = plan.conflict.reason;
+        r.detail = plan.conflict.id;
+        return;
+    }
+    var put = MI__doPut(ctx, plan);
+    if (!put.clip) {
+        r.status = put.status || "failed";
+        r.reason = put.reason || "";
+        r.detail = put.detail || "";
+        return;
+    }
+    MI__finishNew(ctx, it, r, put, "moved");
+    /* 새 클립에 태그를 쓰지 못했으면 옛 클립을 남긴다 (패널이 다음 계획에서 새 클립을 태그 없는 클립으로 다룬다) */
+    if (r.status === "failed") return;
+    var left = false;
+    if (pr.id && MI__removeNode(ctx, pr.ti, pr.id) === "left") left = true;
+    if (pr.raId && !(pr.raId === pr.id && pr.raTi === pr.ti) && MI__removeNode(ctx, pr.raTi, pr.raId) === "left") left = true;
+    if (left) r.reason = "old-left";
+}
+/* replace: 템플릿이 다른 클립을 바꾼다 = 먼저 지우고 놓기. 자리 확인은 지우기 전에 한다.
+   놓지 못하면 옛 템플릿을 'before'로 되놓는다: AE는 옛 클립의 projectItem(overwriteClip), 없으면 own.m(importMGT).
+   되놓으면 failed + restored-old, 못 하면 failed + lost-old. 되놓을 길이 없으면(네이티브는 projectItem이 없다) own.m
+   (구운 경로)이 없을 때 아예 시작하지 않는다 (conflict template-unknown) */
+function MI__opReplace(ctx, it, pr, r) {
+    var own = it.own;
+    if ((pr.kind !== "ae" || !pr.pi) && !(own && own.m)) {
+        r.status = "conflict";
+        r.reason = "template-unknown";
+        return;
+    }
+    var skip = {};
+    if (pr.ti === it.track) skip["n" + pr.id] = true;
+    var plan = MI__planPut(ctx, { ti: it.track, sf: it.sf, ef: it.ef, path: it.mogrtPath, durSec: it.durSec, guard: MI__set(it.guard), skip: skip });
+    if (plan.fail) {
+        r.status = "failed";
+        r.reason = plan.fail;
+        return;
+    }
+    if (plan.conflict) {
+        r.status = "conflict";
+        r.reason = plan.conflict.reason;
+        r.detail = plan.conflict.id;
+        return;
+    }
+    if (MI__removeNode(ctx, pr.ti, pr.id) === "left") {
+        r.status = "failed";
+        r.reason = "old-left";
+        return;
+    }
+    var put = MI__doPut(ctx, plan);
+    if (put.clip) {
+        MI__finishNew(ctx, it, r, put, "replaced");
+        return;
+    }
+    r.status = "failed";
+    r.detail = (put.reason || "") + (put.detail ? ": " + put.detail : "");
+    var back = MI__restoreOld(ctx, pr);
+    if (back) {
+        r.reason = "restored-old";
+        MI__readback(r, back, pr.ti, ctx.ft, false);
+    } else {
+        r.reason = "lost-old";
+    }
+}
+/* replace가 실패했을 때 옛 템플릿을 옛 자리에 되놓는다 (속성·이름은 before로) → 새 클립 | null */
+function MI__restoreOld(ctx, pr) {
+    var b = pr.before;
+    if (!b) return null;
+    var usePi = pr.kind === "ae" ? pr.pi : null;
+    var plan = MI__planPut(ctx, { ti: pr.ti, sf: b.sf, ef: Math.max(b.ef, b.sf + 1), endT: pr.eT, path: b.m || "", pi: usePi, durSec: 0, guard: {}, skip: {}, guardAll: true });
+    if (plan.fail || plan.conflict) return null;
+    var put = MI__doPut(ctx, plan);
+    if (!put.clip) return null;
+    var c = put.clip;
+    MI__applyParamsSafe(c, MI__kind(c), b.params);
+    MI__setName(c, b.name);
+    return c;
+}
+
+/* ══ 진입점: 쓰기 (S2-2) ══ */
+
+/* 비디오 트랙을 minCount개까지 늘린다 (배치 전에, spec placement 3).
+   QE addTracks는 활성 시퀀스의 마지막 트랙 뒤에 더하고 기존 번호는 그대로 둔다 (spike #3). 더한 뒤 activeSequence를 다시 읽어 센다.
+   payload {seqId, build, minCount} → {ok, before, after, added} | add-failed */
+function MI_ensureVideoTracks(payloadStr) {
+    try {
+        var p = MI__parse(payloadStr);
+        var g = MI__guard(p);
+        if (g.err) return MI__fail(g.err, g.detail);
+        if (!MI__isInt(p.minCount) || p.minCount < 1 || p.minCount > 99) return MI__fail("bad-payload", "minCount는 1~99");
+        var before = MI__numTracks(g.seq);
+        if (before >= p.minCount) return MI__json({ ok: true, before: before, after: before, added: 0 });
+        if (!ensureQE()) return MI__fail("add-failed", "QE를 쓸 수 없다");
+        try {
+            qe.project.getActiveSequence().addTracks(p.minCount - before, before, 0);
+        } catch (e) {
+            return MI__fail("add-failed", MI__errText(e));
+        }
+        var seq2 = null;
+        try { seq2 = app.project.activeSequence; } catch (e2) { seq2 = null; }
+        var after = seq2 ? MI__numTracks(seq2) : 0;
+        if (after < p.minCount) return MI__fail("add-failed", "트랙 " + before + " → " + after + " (필요 " + p.minCount + ")");
+        return MI__json({ ok: true, before: before, after: after, added: after - before });
+    } catch (e3) {
+        return MI__fail("exception", MI__errText(e3));
+    }
+}
+
+/* 배치 청크 (작업 7종). payload {seqId, build, frameTicks, budgetMs(기본 7000), items: [
+     {key, op: place|update|replace|move|moveRegen|adopt|legacyMove, g, track, sf, ef, keepTime,
+      own: {track, sf, nodeId, m?} | null, mogrtPath, durSec, params: [ParamDef], name: 글자 | null,
+      guard: [nodeId], motion: null, removeAfter: {track, nodeId} | null}]}
+   → {ok, done, results: [{key, status, track, sf, ef, g, nodeId, clamped, reason, detail?, name, kind, texts, lay, pin,
+      skipped, keyed, before, motion, deco?}], damaged: [nodeId], dur: {경로: 초}, comps: {경로: 개수}, ms}
+   status: placed|updated|replaced|moved|adopted|partial|conflict|ambiguous|locked|stale-plan|misplaced|failed
+   - 첫 루프: 모든 작업의 기존 클립을 찾고 'before'를 읽는다 (어떤 배치보다 먼저).
+   - 둘째 루프: 작업마다 따로 try/catch. 트랙이 없으면 failed no-track(importMGT는 없는 번호를 마지막 트랙에 놓는다, #14),
+     잠겼으면 locked. 예산(budgetMs)을 넘으면 새 작업을 시작하지 않는다 (done < items.length, 첫 작업은 늘 한다).
+   - name이 null이면 이름을 건드리지 않는다 (레거시 안전 경로는 태그를 쓰지 않는다).
+   - 새로 놓는 자리 [sf, max(ef, sf + D))는 확인한다: 남의 클립이면 conflict(occupied|tail), guard 이웃은 머리를 되돌리고
+     (분기 R, 분기 P는 불가 — S0-3 a), 되돌리지 못한 이웃은 damaged (패널이 다시 놓는다, 분기 C).
+   - 끝은 늘 ef × frameTicks (clamped면 다음 클립 시작). 시작은 sf × frameTicks.
+   - projectItem 캐시는 이 호출 안에서만 쓴다 (S0-3 결정 13). */
+function MI_placeChunk(payloadStr) {
+    var t0 = MI__now();
+    try {
+        var p = MI__parse(payloadStr);
+        var g = MI__guard(p);
+        if (g.err) return MI__fail(g.err, g.detail);
+        var seq = g.seq;
+        var ft = MI__ft(seq);
+        if (p.frameTicks !== undefined && p.frameTicks !== null && Number(p.frameTicks) !== ft) {
+            return MI__fail("bad-payload", "frameTicks " + p.frameTicks + " / 시퀀스 " + ft);
+        }
+        var items = p.items;
+        if (!MI__isArr(items)) return MI__fail("bad-payload", "items는 배열");
+        if (items.length > MI__CHUNK_MAX) return MI__fail("bad-payload", "items는 " + MI__CHUNK_MAX + "개까지 (" + items.length + ")");
+        var budget = typeof p.budgetMs === "number" && p.budgetMs > 0 ? p.budgetMs : 7000;
+        var ctx = MI__ctx(seq, ft);
+        var i;
+        var pre = [];
+        for (i = 0; i < items.length; i++) {
+            try {
+                pre.push(MI__locate(ctx, items[i]));
+            } catch (e) {
+                pre.push({ status: "failed", reason: "exception", detail: MI__errText(e) });
+            }
+        }
+        var results = [];
+        var done = 0;
+        for (i = 0; i < items.length; i++) {
+            if (i > 0 && MI__now() - t0 >= budget) break;
+            var it = items[i];
+            var pr = pre[i];
+            var r = MI__res(it);
+            try {
+                if (pr.before) r.before = pr.before;
+                if (pr.status) {
+                    r.status = pr.status;
+                    r.reason = pr.reason || "";
+                    if (pr.detail) r.detail = pr.detail;
+                } else if (it.track >= MI__numTracks(seq)) {
+                    r.status = "failed";
+                    r.reason = "no-track";
+                } else if (MI__locked(MI__track(seq, it.track)) || (pr.ti >= 0 && MI__locked(MI__track(seq, pr.ti))) || (pr.raTi >= 0 && MI__track(seq, pr.raTi) && MI__locked(MI__track(seq, pr.raTi)))) {
+                    r.status = "locked";
+                } else if (it.op === "place") {
+                    MI__opPlace(ctx, it, pr, r);
+                } else if (it.op === "update" || it.op === "adopt") {
+                    MI__opUpdate(ctx, it, pr, r);
+                } else if (it.op === "move") {
+                    MI__opMove(ctx, it, pr, r);
+                } else if (it.op === "replace") {
+                    MI__opReplace(ctx, it, pr, r);
+                } else {
+                    MI__opRegen(ctx, it, pr, r);
+                }
+            } catch (e2) {
+                r.status = "failed";
+                r.reason = "exception";
+                r.detail = MI__errText(e2);
+                MI__dirty(ctx);
+            }
+            results.push(r);
+            done++;
+        }
+        var dur = {};
+        var comps = {};
+        for (var k in ctx.dur) {
+            if (Object.prototype.hasOwnProperty.call(ctx.dur, k)) {
+                dur[k.substring(1)] = ctx.dur[k];
+                comps[k.substring(1)] = ctx.comps[k];
+            }
+        }
+        return MI__json({ ok: true, done: done, results: results, damaged: ctx.damaged, dur: dur, comps: comps, ms: MI__now() - t0 });
+    } catch (e3) {
+        return MI__fail("exception", MI__errText(e3));
+    }
+}
+
+/* nodeId로 지운다 (패널이 이미 되읽은 텍스트로 정했다 — ES3에는 NFC가 없어 문장 비교는 패널 몫).
+   payload {seqId, build, items: [{key, track, nodeId, expectName: 글자 | null}]}
+   → {ok, results: [{key, status: removed|notFound|notOurs|locked|failed, before: {track, sf, ef, g, name, kind, m, pi, params}}], ms}
+   expectName이 있으면 이름이 다를 때(사용자가 이름을 바꿨다) 지우지 않는다. remove(false,false)는 true를 돌려준다 (spike #6) */
+function MI_removeClips(payloadStr) {
+    var t0 = MI__now();
+    try {
+        var p = MI__parse(payloadStr);
+        var g = MI__guard(p);
+        if (g.err) return MI__fail(g.err, g.detail);
+        var items = p.items;
+        if (!MI__isArr(items)) return MI__fail("bad-payload", "items는 배열");
+        if (items.length > MI__REMOVE_MAX) return MI__fail("bad-payload", "items는 " + MI__REMOVE_MAX + "개까지");
+        var ctx = MI__ctx(g.seq, MI__ft(g.seq));
+        var results = [];
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i] || {};
+            var r = { key: typeof it.key === "string" ? it.key : "", status: "", before: null };
+            try {
+                if (!MI__isInt(it.track) || it.nodeId === undefined || it.nodeId === null || String(it.nodeId) === "") {
+                    r.status = "failed";
+                    r.reason = "bad-item";
+                } else if (!MI__track(g.seq, it.track)) {
+                    r.status = "notFound";
+                } else {
+                    var c = MI__find(ctx, it.track, it.nodeId);
+                    if (!c) {
+                        r.status = "notFound";
+                    } else if (MI__locked(MI__track(g.seq, it.track))) {
+                        r.status = "locked";
+                    } else if (it.expectName !== undefined && it.expectName !== null && String(c.name) !== String(it.expectName)) {
+                        r.status = "notOurs";
+                        r.name = String(c.name);
+                    } else {
+                        r.before = MI__snapOf(c, it.track, ctx.ft, null);
+                        var st = MI__removeNode(ctx, it.track, String(it.nodeId));
+                        r.status = st === "left" ? "failed" : "removed";
+                        if (st === "left") r.reason = "old-left";
+                    }
+                }
+            } catch (e) {
+                r.status = "failed";
+                r.reason = "exception";
+                r.detail = MI__errText(e);
+                MI__dirty(ctx);
+            }
+            results.push(r);
+        }
+        return MI__json({ ok: true, results: results, ms: MI__now() - t0 });
+    } catch (e2) {
+        return MI__fail("exception", MI__errText(e2));
     }
 }
 /* MI:END */

@@ -50,6 +50,8 @@ class Time {
 	set ticks(v) { this._t = Math.round(Number(v)); }
 	get seconds() { return this._t / TPS; }
 	set seconds(v) { this._t = Math.round(Number(v) * TPS); }
+	// 시뮬레이터 전용: 타임코드 대신 ticks 글자 (QE razor가 그대로 받는다)
+	getFormatted() { return String(this._t); }
 }
 function ticksOf(t) {
 	if (t && typeof t === "object" && "_t" in t) return t._t;
@@ -179,6 +181,8 @@ function createSim(opts = {}) {
 			},
 			isTimeVarying: () => p.keyed,
 			setTimeVarying: (b) => { p.keyed = !!b; return true; },
+			addKey: () => true,
+			setValueAtKey: () => true,
 			areKeyframesSupported: () => true,
 			getMinValue: () => (p.min === undefined ? NaN : p.min),
 			getMaxValue: () => (p.max === undefined ? NaN : p.max)
@@ -292,10 +296,34 @@ function createSim(opts = {}) {
 					for (let k = 0; k < Number(nv); k++) S.active.tracks.push({ clips: [], locked: false });
 					return true;
 				},
-				getVideoTrackAt: (i) => ({ razor: () => { throw new Error("sim: razor는 sim.razor로"); } })
-			})
+				// QE 트랙: razor(타임코드 = 시뮬레이터에서는 ticks 글자), 항목(start.ticks, type)에 addVideoEffect
+				getVideoTrackAt: (i) => {
+					const tr = S.active.tracks[i];
+					return {
+						razor: (tc) => razorTicks(tr, Number(tc)),
+						get numItems() { return tr.clips.length; },
+						getItemAt: (k) => {
+							const m = tr.clips[k];
+							return m ? { type: "Clip", start: T(m.s), addVideoEffect: (fx) => { m.comps.push(comp("AE.ADBE " + ((fx && fx.name) || "Effect"), (fx && fx.name) || "Effect", [param({ displayName: "Amount", value: 100 })])); return true; } } : null;
+						}
+					};
+				}
+			}),
+			getVideoEffectByName: (name) => ({ name: String(name) })
 		}
 	};
+	// 트랙 tr을 ticks t에서 자른다: 앞 조각이 원래 nodeId, 뒤 조각은 새 nodeId·같은 이름 (#1b)
+	function razorTicks(tr, t) {
+		const c = tr.clips.find((x) => x.s < t && x.e > t);
+		if (!c) throw new Error("자를 클립 없음");
+		nodeIdOf(c);
+		const tail = cloneClipM(c);
+		tail.s = t;
+		tail.inT = c.inT + (t - c.s);
+		c.e = t;
+		insertSorted(tr, tail);
+		return tail;
+	}
 	const ctx = vm.createContext({
 		console,
 		Time,
@@ -367,17 +395,7 @@ function createSim(opts = {}) {
 		},
 		// 자르기: 트랙 ti에서 frame을 지나는 클립을 둘로 (앞 조각이 원래 nodeId, 뒤 조각은 새 nodeId·같은 이름)
 		razor(sm, ti, frame) {
-			const t = frame * sm.ft;
-			const tr = sm.tracks[ti];
-			const c = tr.clips.find((x) => x.s < t && x.e > t);
-			if (!c) throw new Error("자를 클립 없음");
-			nodeIdOf(c);
-			const tail = cloneClipM(c);
-			tail.s = t;
-			tail.inT = c.inT + (t - c.s);
-			c.e = t;
-			insertSorted(tr, tail);
-			return tail;
+			return razorTicks(sm.tracks[ti], frame * sm.ft);
 		},
 		addEffect(m, matchName = "AE.ADBE Tint", displayName = "Tint") {
 			m.comps.push(comp(matchName, displayName, [param({ displayName: "Amount", value: 100 })]));

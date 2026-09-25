@@ -82,8 +82,95 @@ async function aePreset(api) {
 	return P;
 }
 
+/**
+ * 스크래치 시퀀스가 활성인 상태에서 도는 단계 (가짜 Premiere로 미리 돌려 볼 수 있게 따로 내보낸다).
+ * env = {host, mi, panel(없으면 패널 어댑터 확인을 건너뛴다), assert, log, P: {mogrtPath, params, textParamIndex}, info: {orig: {id, name}, clone: {id, name}}}
+ */
+async function steps(env) {
+	const { host, mi, panel, assert, log, P, info } = env;
+	const byIdx = P.params.slice().sort((a, b) => a.index - b.index);
+	const ping = await mi("ping");
+	assert.equal(ping.seqId, info.clone.id);
+	const base = { seqId: ping.seqId, build: ping.build };
+	for (const ti of [V2, V3]) assert.equal(await host(H.jsxClearVideoTrack(ti)), "0", "V" + (ti + 1) + " 비우기");
+	assert.equal(await host(jsxSetLocked(V4, false)), "false");
+	const a1 = JSON.parse(await host(jsxPlaceNamed(P.mogrtPath, V2, 48, 120, null, -1)));
+	const a2 = JSON.parse(await host(jsxPlaceNamed(P.mogrtPath, V2, 144, 216, null, -1)));
+	const tagged = JSON.parse(await host(jsxPlaceNamed(P.mogrtPath, V3, 240, 336, TAG_NAME, P.textParamIndex, CAP)));
+	assert.ok(!a1.error && !a2.error && !tagged.error, JSON.stringify([a1, a2, tagged]));
+	assert.equal(tagged.name, TAG_NAME);
+	assert.equal(await host(jsxSetLocked(V4, true)), "true");
+	const facts = JSON.parse(await host(JSX_SEQ_FACTS));
+
+	// ── (2) getTracks ──
+	const r = await mi("getTracks", Object.assign({}, base, { tracks: null }));
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.equal(r.numVideoTracks, facts.numTracks);
+	assert.equal(r.frameTicks, facts.frameTicks);
+	if (info.orig.name === "T_23976") assert.equal(r.frameTicks, "10594584000");
+	const tr = (x, i) => x.tracks.find((t) => t.i === i);
+	assert.ok(!r.tracks.some((t) => t.i === 0), "V1은 스캔하지 않는다");
+	assert.deepEqual(r.tracks.map((t) => t.i), Array.from({ length: facts.numTracks - 1 }, (_, k) => k + 1));
+	assert.deepEqual([tr(r, V2).locked, tr(r, V3).locked, tr(r, V4).locked], [false, false, true]);
+	assert.deepEqual(tr(r, V2).clips.map((c) => [c.sf, c.ef, c.nodeId, c.salt]), [[48, 120, a1.nodeId, undefined], [144, 216, a2.nodeId, undefined]]);
+	assert.deepEqual(tr(r, V3).clips, [{ sf: 240, ef: 336, nodeId: tagged.nodeId, name: TAG_NAME, salt: "ab12", id: 1, g: 1 }]);
+	const w = await mi("getTracks", Object.assign({}, base, { tracks: [V2, V3], fromFrame: 130, toFrame: 250 }));
+	assert.deepEqual(w.tracks.map((t) => [t.i, t.clips.map((c) => c.sf)]), [[V2, [144]], [V3, [240]]]);
+	log("(2) 트랙 " + r.numVideoTracks + "개, frameTicks " + r.frameTicks + ", " + r.ms + "ms");
+
+	// ── (4) readClipTexts ──
+	const req = Object.assign({}, base, { items: [{ track: V3, nodeId: tagged.nodeId }, { track: V2, nodeId: a1.nodeId }], want: { texts: true, lay: true, deco: true, params: true } });
+	const ra = await mi("readClipTexts", req);
+	const rb = await mi("readClipTexts", req);
+	assert.equal(ra.ok, true, JSON.stringify(ra).slice(0, 300));
+	const x = ra.results[0];
+	assert.deepEqual([x.found, x.kind, x.sf, x.ef, x.name], [true, "ae", 240, 336, TAG_NAME]);
+	assert.deepEqual(rb.results[0].texts, x.texts, "두 번 읽어도 같다");
+	assert.ok(x.texts.indexOf(CAP) !== -1, "캡션이 텍스트에 있다: " + JSON.stringify(x.texts));
+	assert.deepEqual(x.lay.map((l) => l[0]), byIdx.map((p) => p.displayName), "lay 이름 = 프리셋 속성 이름");
+	assert.deepEqual(x.lay.map((l) => l[1]), byIdx.map((p) => (p.type === "text" ? "t" : "o")), "lay 텍스트 여부 = 프리셋 type");
+	assert.equal(x.params.length, byIdx.length);
+	assert.ok(x.params.every((p) => typeof p.type === "string" && p.type && !("colorHex" in p)), "type 있음, colorHex 없음");
+	assert.equal(x.params.find((p) => p.index === P.textParamIndex).value, CAP);
+	assert.equal(typeof x.deco.comps, "number");
+	assert.equal(ra.results[1].found, true);
+	log("(4) 텍스트 " + JSON.stringify(x.texts) + ", 속성 " + x.params.length + "개, 컴포넌트 " + x.deco.comps + ", " + ra.ms + "ms");
+
+	// ── (3) 자르기 → dup ──
+	assert.equal(await host(jsxRazor(V3, 288)), "ok");
+	const r3 = await mi("getTracks", Object.assign({}, base, { tracks: [V3] }));
+	const idx = CORE.scanIndex(r3, "ab12");
+	const dup = idx.dup["ab12-1"] || [];
+	assert.equal(dup.length, 2, "같은 태그 두 조각: " + JSON.stringify(r3.tracks[0].clips));
+	assert.equal(idx.current["ab12-1"], undefined);
+	assert.ok(dup.some((c) => c.nodeId === tagged.nodeId), "원래 조각은 nodeId 그대로 (spike #1b)");
+	assert.deepEqual(Array.from(dup, (c) => c.name), [TAG_NAME, TAG_NAME]);
+	log("(3) 자르기 → dup " + dup.map((c) => c.nodeId + "@" + c.sf).join(", "));
+
+	// ── (5) 프리뷰 활성 → preview-active ──
+	const pv = await host(jsxCallWhilePreview(P.mogrtPath, Object.assign({}, base, { tracks: [V3] })));
+	assert.ok(pv !== "no-preview" && pv !== "not-scratch", pv);
+	const [pvRes, activeAfter] = pv.split("|active=");
+	assert.equal(JSON.parse(pvRes).error, "preview-active", pvRes);
+	assert.equal(activeAfter, info.clone.name, "스크래치로 되돌렸다");
+	// ── (6) seq-mismatch, (7) build-mismatch ──
+	assert.equal((await mi("getTracks", Object.assign({}, base, { seqId: "not-this-seq" }))).error, "seq-mismatch");
+	assert.equal((await mi("readClipTexts", Object.assign({}, base, { seqId: info.orig.id, items: [] }))).error, "seq-mismatch", "원본 시퀀스 id도 활성이 아니면 거부");
+	assert.equal((await mi("getTracks", Object.assign({}, base, { build: base.build + "-wrong" }))).error, "build-mismatch");
+	assert.equal((await mi("getTracks", { seqId: base.seqId, tracks: null })).error, "build-mismatch", "빌드 없음");
+	log("(5)(6)(7) preview-active · seq-mismatch · build-mismatch");
+
+	// ── (+) 패널 어댑터: U+2028이 든 payload (build·seqId는 어댑터가 붙인다) ──
+	if (!panel) return;
+	const viaPanel = await panel("await window._mogrtDebug.callMi('getTracks', { tracks: [" + V3 + "], note: 'a' + String.fromCharCode(0x2028) + 'b' + String.fromCharCode(0x2029) })");
+	assert.equal(viaPanel.ok, true, JSON.stringify(viaPanel).slice(0, 300));
+	assert.equal(viaPanel.tracks[0].clips.length, 2);
+	log("(+) 패널 어댑터 U+2028 payload → ok");
+}
+
 module.exports = {
 	name: "S2-1 읽기 전용 MI_ 호스트 (ping·트랙 스캔·되읽기·가드·어댑터)",
+	steps,
 	run: async (api) => {
 		const { panel, host, mi, assert, log } = api;
 		await H.waitKeys(panel);
@@ -106,82 +193,7 @@ module.exports = {
 		log("(1) ping v28 " + ping0.build + " (" + ping0.seqName + ")");
 
 		await H.withScratchSequence(api, "s2_1", async (info) => {
-			const ping = await mi("ping");
-			assert.equal(ping.seqId, info.clone.id);
-			const base = { seqId: ping.seqId, build: ping.build };
-			for (const ti of [V2, V3]) assert.equal(await host(H.jsxClearVideoTrack(ti)), "0", "V" + (ti + 1) + " 비우기");
-			assert.equal(await host(jsxSetLocked(V4, false)), "false");
-			const a1 = JSON.parse(await host(jsxPlaceNamed(P.mogrtPath, V2, 48, 120, null, -1)));
-			const a2 = JSON.parse(await host(jsxPlaceNamed(P.mogrtPath, V2, 144, 216, null, -1)));
-			const tagged = JSON.parse(await host(jsxPlaceNamed(P.mogrtPath, V3, 240, 336, TAG_NAME, P.textParamIndex, CAP)));
-			assert.ok(!a1.error && !a2.error && !tagged.error, JSON.stringify([a1, a2, tagged]));
-			assert.equal(tagged.name, TAG_NAME);
-			assert.equal(await host(jsxSetLocked(V4, true)), "true");
-			const facts = JSON.parse(await host(JSX_SEQ_FACTS));
-
-			// ── (2) getTracks ──
-			const r = await mi("getTracks", Object.assign({}, base, { tracks: null }));
-			assert.equal(r.ok, true, JSON.stringify(r));
-			assert.equal(r.numVideoTracks, facts.numTracks);
-			assert.equal(r.frameTicks, facts.frameTicks);
-			if (info.orig.name === "T_23976") assert.equal(r.frameTicks, "10594584000");
-			const tr = (x, i) => x.tracks.find((t) => t.i === i);
-			assert.ok(!r.tracks.some((t) => t.i === 0), "V1은 스캔하지 않는다");
-			assert.deepEqual(r.tracks.map((t) => t.i), Array.from({ length: facts.numTracks - 1 }, (_, k) => k + 1));
-			assert.deepEqual([tr(r, V2).locked, tr(r, V3).locked, tr(r, V4).locked], [false, false, true]);
-			assert.deepEqual(tr(r, V2).clips.map((c) => [c.sf, c.ef, c.nodeId, c.salt]), [[48, 120, a1.nodeId, undefined], [144, 216, a2.nodeId, undefined]]);
-			assert.deepEqual(tr(r, V3).clips, [{ sf: 240, ef: 336, nodeId: tagged.nodeId, name: TAG_NAME, salt: "ab12", id: 1, g: 1 }]);
-			const w = await mi("getTracks", Object.assign({}, base, { tracks: [V2, V3], fromFrame: 130, toFrame: 250 }));
-			assert.deepEqual(w.tracks.map((t) => [t.i, t.clips.map((c) => c.sf)]), [[V2, [144]], [V3, [240]]]);
-			log("(2) 트랙 " + r.numVideoTracks + "개, frameTicks " + r.frameTicks + ", " + r.ms + "ms");
-
-			// ── (4) readClipTexts ──
-			const req = Object.assign({}, base, { items: [{ track: V3, nodeId: tagged.nodeId }, { track: V2, nodeId: a1.nodeId }], want: { texts: true, lay: true, deco: true, params: true } });
-			const ra = await mi("readClipTexts", req);
-			const rb = await mi("readClipTexts", req);
-			assert.equal(ra.ok, true, JSON.stringify(ra).slice(0, 300));
-			const x = ra.results[0];
-			assert.deepEqual([x.found, x.kind, x.sf, x.ef, x.name], [true, "ae", 240, 336, TAG_NAME]);
-			assert.deepEqual(rb.results[0].texts, x.texts, "두 번 읽어도 같다");
-			assert.ok(x.texts.indexOf(CAP) !== -1, "캡션이 텍스트에 있다: " + JSON.stringify(x.texts));
-			assert.deepEqual(x.lay.map((l) => l[0]), byIdx.map((p) => p.displayName), "lay 이름 = 프리셋 속성 이름");
-			assert.deepEqual(x.lay.map((l) => l[1]), byIdx.map((p) => (p.type === "text" ? "t" : "o")), "lay 텍스트 여부 = 프리셋 type");
-			assert.equal(x.params.length, byIdx.length);
-			assert.ok(x.params.every((p) => typeof p.type === "string" && p.type && !("colorHex" in p)), "type 있음, colorHex 없음");
-			assert.equal(x.params.find((p) => p.index === P.textParamIndex).value, CAP);
-			assert.equal(typeof x.deco.comps, "number");
-			assert.equal(ra.results[1].found, true);
-			log("(4) 텍스트 " + JSON.stringify(x.texts) + ", 속성 " + x.params.length + "개, 컴포넌트 " + x.deco.comps + ", " + ra.ms + "ms");
-
-			// ── (3) 자르기 → dup ──
-			assert.equal(await host(jsxRazor(V3, 288)), "ok");
-			const r3 = await mi("getTracks", Object.assign({}, base, { tracks: [V3] }));
-			const idx = CORE.scanIndex(r3, "ab12");
-			const dup = idx.dup["ab12-1"] || [];
-			assert.equal(dup.length, 2, "같은 태그 두 조각: " + JSON.stringify(r3.tracks[0].clips));
-			assert.equal(idx.current["ab12-1"], undefined);
-			assert.ok(dup.some((c) => c.nodeId === tagged.nodeId), "원래 조각은 nodeId 그대로 (spike #1b)");
-			assert.deepEqual(dup.map((c) => c.name), [TAG_NAME, TAG_NAME]);
-			log("(3) 자르기 → dup " + dup.map((c) => c.nodeId + "@" + c.sf).join(", "));
-
-			// ── (5) 프리뷰 활성 → preview-active ──
-			const pv = await host(jsxCallWhilePreview(P.mogrtPath, Object.assign({}, base, { tracks: [V3] })));
-			assert.ok(pv !== "no-preview" && pv !== "not-scratch", pv);
-			const [pvRes, activeAfter] = pv.split("|active=");
-			assert.equal(JSON.parse(pvRes).error, "preview-active", pvRes);
-			assert.equal(activeAfter, info.clone.name, "스크래치로 되돌렸다");
-			// ── (6) seq-mismatch, (7) build-mismatch ──
-			assert.equal((await mi("getTracks", Object.assign({}, base, { seqId: "not-this-seq" }))).error, "seq-mismatch");
-			assert.equal((await mi("readClipTexts", Object.assign({}, base, { seqId: info.orig.id, items: [] }))).error, "seq-mismatch", "원본 시퀀스 id도 활성이 아니면 거부");
-			assert.equal((await mi("getTracks", Object.assign({}, base, { build: "dev-0000000" }))).error, "build-mismatch");
-			assert.equal((await mi("getTracks", { seqId: base.seqId, tracks: null })).error, "build-mismatch", "빌드 없음");
-			log("(5)(6)(7) preview-active · seq-mismatch · build-mismatch");
-
-			// ── (+) 패널 어댑터: U+2028이 든 payload (build·seqId는 어댑터가 붙인다) ──
-			const viaPanel = await panel("await window._mogrtDebug.callMi('getTracks', { tracks: [" + V3 + "], note: 'a' + String.fromCharCode(0x2028) + 'b' + String.fromCharCode(0x2029) })");
-			assert.equal(viaPanel.ok, true, JSON.stringify(viaPanel).slice(0, 300));
-			assert.equal(viaPanel.tracks[0].clips.length, 2);
-			log("(+) 패널 어댑터 U+2028 payload → ok");
+			await steps({ host, mi, panel, assert, log, P, info });
 		});
 
 		// ── (8) 운영(MI_)과 DEV(MID_) 호스트가 같이 로드돼 있으면 각자 자기 빌드 ──

@@ -45,6 +45,8 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   - `sim.call(fn, payload)`는 패널 `_callMi`처럼 JSON(U+2028/2029 이스케이프) 문자열 하나로 부르고 결과를 파싱한다. 네이티브 Source Text 쓰기 횟수는 `sim.S.counts.nativeTextWrites`.
   - 실제 Premiere 동작은 하드 케이스(`s2_1_tracks`, `s2_2_place`)가 확인한다. 시뮬레이터가 통과해도 하드 케이스를 건너뛰지 않는다.
 - `tests/unit/host_pure.test.js` (S2-1): MI_PURE 블록(MI__json 이스케이프·NaN, 태그 왕복, 프레임 계산)과 **v27 부분의 바이트 고정**(머리 주석 뒤 ~ `/* MI:BEGIN v28 */` 앞 본문의 fnv = v27 태그에서 잰 값).
+- `tests/unit/host_place.test.js` (S2-2): 쓰기 호스트를 시뮬레이터에서 — 순수 규칙(`MI__occupy` 자리 확인·끝 맞춤, `MI__checkItem`), 하드 T1~T17과 같은 상황(ensure, 정확한 시작·끝 ticks, before로 정확히 복원, 끝 맞춤, occupied/tail, locked, no-track, moveRegen, 중단 뒤 stale, 자르기 ambiguous, removeClips, 이웃 머리 되돌리기(R)·damaged(C), replace 실패 → restored-old, 예산, keyed, 옛 구조 클립에 이름으로 쓰기, move), itemCache 구조 확인, misplaced, adopt·legacyMove, 네이티브 Source Text 쓰기 0번.
+- 하드 케이스 `s2_1_tracks`·`s2_2_place`는 스크래치 시퀀스 안의 단계를 `steps(env)`로 따로 내보낸다. env의 `host`·`mi`를 시뮬레이터(DEV 이름으로 바꾼 hostscript를 `createSim({hostFile})`로)에 이으면 Premiere 없이 케이스 로직을 미리 돌려 볼 수 있다 (vm 객체 비교는 `Array.from`으로).
 - `tests/unit/panel_host_mi.test.js` (S2-1): 패널 어댑터 `host.mi`(`_callMi`: 접두사, build·seqId 붙이기, U+2028/2029 이스케이프)와 `_miHostOk`(실행마다 ping, v 28·빌드 확인), `status.panel.build`·`status.host`.
 - `tests/compat/native_bake_real.test.js` (S1-11): 설치된 MOGRT 폴더(`MI_MOGRT_ROOT`, 기본 `%APPDATA%/Adobe/Common/Motion Graphics Templates`)가 있으면 돈다. 읽기 전용(메모리에서만 굽는다). Classic Lower Third Two Lines를 굽고, 모든 네이티브 템플릿의 prgraphic마다 Source Text 수가 TextLayer 수와 같거나 0(새 형식)인지 본다.
 - `tests/compat/` (S1-5부터, `preset_refs.test.js`는 S1-2 리뷰 반영): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지). 출력은 숫자·id만.

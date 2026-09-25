@@ -98,3 +98,27 @@ test("status: panel.build는 이 패널의 빌드, host는 v28 ping 결과 (없�
 	assert.deepEqual(st.data.host, ping);
 	noErrors(h);
 });
+
+test("host.mi 쓰기 (S2-2): ensureTracks → MI_ensureVideoTracks, placeChunk → MI_placeChunk, removeClips → MI_removeClips (build·seqId 자동)", async () => {
+	const h = await boot();
+	const seen = [];
+	for (const fn of ["MI_ensureVideoTracks", "MI_placeChunk", "MI_removeClips", "MI_readClipTexts", "MI_getTracks"]) {
+		h.host.handlers[fn] = (json) => { seen.push([fn, JSON.parse(json)]); return JSON.stringify({ ok: true, fn }); };
+	}
+	const m = h.win._mogrtDebug.hostMi;
+	assert.equal((await m.ensureTracks({ minCount: 6 })).fn, "MI_ensureVideoTracks");
+	assert.equal((await m.placeChunk({ frameTicks: 10594584000, budgetMs: 7000, items: [] })).fn, "MI_placeChunk");
+	assert.equal((await m.removeClips({ items: [] })).fn, "MI_removeClips");
+	assert.equal((await m.readTexts({ items: [] })).fn, "MI_readClipTexts");
+	assert.equal((await m.getTracks({ tracks: null })).fn, "MI_getTracks");
+	assert.deepEqual(plainOf(seen.map(([fn, p]) => [fn, p.build, p.seqId])), [
+		["MI_ensureVideoTracks", "@@BUILD@@", A.seqId],
+		["MI_placeChunk", "@@BUILD@@", A.seqId],
+		["MI_removeClips", "@@BUILD@@", A.seqId],
+		["MI_readClipTexts", "@@BUILD@@", A.seqId],
+		["MI_getTracks", "@@BUILD@@", A.seqId]
+	]);
+	assert.equal(seen[0][1].minCount, 6);
+	assert.equal(seen[1][1].frameTicks, 10594584000);
+	noErrors(h);
+});
