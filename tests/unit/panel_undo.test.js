@@ -9,6 +9,9 @@
 //   (5) 레거시 새 줄 놓기: 템플릿 길이가 뒤 줄 클립을 덮으면 스냅숏으로 다시 놓는다
 //   (6) ↑: 시간이 바뀐 레거시 줄은 v28 경로 (move), v27 ▶는 기록을 superseded로 → 히스토리 항목이 사라진다
 //   (7) 네이티브(구운 사본): 문구 교체·이동을 되돌리면 옛 구운 사본이 옛 자리에 (텍스트는 읽을 수 없어 nodeId·gen으로 확인)
+//   (8) 적용 중 덮여 다시 놓은 이웃(fix)은 되돌리기가 지우지 않는다
+//   리뷰 반영 (9)~(15): 적용 뒤 옮긴 클립, v27 목록의 고친 캡션, 못 찾은 레거시 줄은 새로 놓지 않음, 되돌린 새 줄 다시 놓기,
+//   prev 없는 기록, v27 호출이 바꾸기 전에 실패하면 superseded를 적지 않음
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { bootPanel, cachePaths: P } = require("../lib/panelHarness");
@@ -468,5 +471,186 @@ test("(8) 적용 중 덮여 사라진 이웃을 다시 놓은 기록(fix)은 되
 	assert.match(h.status().text, /덮여서 다시 놓은 이웃 1개는 그대로/);
 	assert.deepEqual(timeline(sim, seq), s0, "줄 1은 옛 템플릿, 줄 2는 남아 있다");
 	assert.equal(h.snapshot().rowStates[2].mm, undefined, "그대로 둔 줄은 표시하지 않는다");
+	noErrors(h);
+});
+
+// ── S2-5 리뷰 반영 ──
+// 시뮬레이터 클립을 Premiere에서 옮긴 것처럼 frames만큼 옮긴다 (끝도 같이)
+const shift = (m, frames) => { m.s += frames * F; m.e += frames * F; };
+
+test("(9) 리뷰: 적용 뒤 Premiere에서 옮긴 클립 — 문장을 갱신한 줄은 문장만 되돌리고 옮긴 자리는 그대로, 새로 놓은 클립은 '그 뒤로 바뀜'으로 남긴다", async () => {
+	const { sim, seq, preset, preset2 } = makeSim();
+	const h = await boot(sim, [preset, preset2], castSession(preset, [[1, "C1", 100, 160, "철수 하나"], [3, "C1", 300, 360, "철수 둘"]]));
+	await applyAll(h);
+	const b64 = Buffer.from(srt([[100, 160, "철수 하나 고침"], [300, 360, "철수 둘"], [600, 660, "철수 새 줄"]]), "utf8").toString("base64");
+	assert.equal((await cmd(h, "mergeCommit", { files: [{ name: "C1.srt", b64 }] })).ok, true);
+	await applyAll(h);
+	const la = h.fs.readJson(LA());
+	assert.deepEqual([la.updated.length, la.created.length], [1, 1]);
+	assert.deepEqual([la.updated[0].sf, la.updated[0].ef, la.updated[0].from.sf, la.updated[0].from.ef], [100, 160, 100, 160]);
+	const byNode = (id) => sim.clips(seq, 2).find((m) => sim.nodeId(m) === id);
+	const up = byNode(la.updated[0].nodeId);
+	const cr = byNode(la.created[0].nodeId);
+	shift(up, 40);
+	shift(cr, 24);
+	const r = await cmd(h, "undo", {});
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.deepEqual([r.data.restored, r.data.moved, r.data.removed, r.data.changed], [1, 0, 0, 1]);
+	assert.match(h.status().text, /^마지막 적용 되돌리기: 되돌림 1 · 그 뒤로 바뀜 1 \(건너뜀\)$/, h.status().text);
+	const v3 = sim.clips(seq, 2).slice().sort((a, b) => a.s - b.s);
+	assert.deepEqual(v3.map((m) => [Math.round(m.s / F), Math.round(m.e / F), sim.textOf(m, "텍스트")]), [[140, 200, "철수 하나"], [300, 360, "철수 둘"], [624, 684, "철수 새 줄"]],
+		"문장만 되돌리고 사용자가 옮긴 자리는 그대로, 옮긴 새 클립은 지우지 않는다");
+	const newId = h.snapshot().subtitles.find((x) => x.text === "철수 새 줄").id;
+	assert.equal(resOf(h, newId), "되돌리지 않음 — 그 뒤로 바뀜 (Premiere에서 옮기거나 길이를 바꿈)");
+	assert.equal(h.snapshot().rowStates[1].mm, "undone");
+	noErrors(h);
+});
+
+test("(10) 리뷰: 레거시 안전 경로로 옮긴 클립을 그 뒤 Premiere에서 또 옮겼으면 되돌리지 않는다 · 문장만 갱신한 클립은 옮긴 자리에서 문장만", async () => {
+	const { sim, seq, preset, preset2 } = makeSim();
+	const cues = [[1, 1, 3, "첫째 합성 줄"], [2, 4, 6, "둘째 합성 줄"], [3, 10, 12, "셋째 합성 줄"]];
+	const clips = cues.map(([, s, e, t]) => sim.place(seq, 2, MOGRT, f24(s), f24(e), null, { texts: [t] }));
+	const sess = legacySession(preset, [
+		[1, 1, 3, "첫째 합성 줄"],
+		[2, 4, 6, "둘째 합성 줄 고침", { mm: "text", mmPrev: { s: 4, e: 6, cap: "둘째 합성 줄" } }],
+		[3, 10.4, 12.4, "셋째 합성 줄", { mm: "time", mmPrev: { s: 10, e: 12, cap: "셋째 합성 줄" } }]
+	]);
+	const h = await boot(sim, [preset, preset2], sess);
+	const a = await h.win._mogrtDebug.legacySafeApply([2, 3], {});
+	assert.deepEqual([a.updated, a.moved], [1, 1]);
+	// Premiere에서: 둘째 4초 → 7초, 셋째 10.4초 → 14초
+	shift(clips[1], f24(7) - f24(4));
+	shift(clips[2], f24(14) - f24(10.4));
+	const r = await cmd(h, "undo", {});
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.deepEqual([r.data.restored, r.data.moved, r.data.changed], [1, 0, 1]);
+	const v3 = sim.clips(seq, 2).slice().sort((x, y) => x.s - y.s);
+	assert.deepEqual(v3.map((m) => [Math.round(m.s / F), Math.round(m.e / F), sim.textOf(m, "텍스트")]), [
+		[f24(1), f24(3), "첫째 합성 줄"], [f24(7), f24(9), "둘째 합성 줄"], [f24(14), f24(16), "셋째 합성 줄"]
+	]);
+	assert.equal(resOf(h, 3), "되돌리지 않음 — 그 뒤로 바뀜 (Premiere에서 옮기거나 길이를 바꿈)");
+	assert.deepEqual([h.snapshot().rowStates[2].mm, h.snapshot().rowStates[3].mm], ["undone", undefined]);
+	noErrors(h);
+});
+
+test("(11) 리뷰: v27 목록(ap 없음)에서 시간만 바뀐 줄의 캡션을 병합 뒤 패널에서 고쳤으면 [안전하게 적용]이 캡션도 쓴다 (시간이 원래대로여도)", async () => {
+	const { sim, seq, preset, preset2 } = makeSim();
+	sim.place(seq, 2, MOGRT, f24(2), f24(4), null, { texts: ["하나"] });
+	sim.place(seq, 2, MOGRT, f24(8), f24(10), null, { texts: ["둘"] });
+	const sess = legacySession(preset, [
+		[1, 2.4, 4.4, "하나 고침", { mm: "time", mmPrev: { s: 2, e: 4, cap: "하나" } }],
+		[2, 8, 10, "둘 고침", { mm: "time", mmPrev: { s: 8, e: 10, cap: "둘" } }]
+	]);
+	const h = await boot(sim, [preset, preset2], sess);
+	const r = await h.win._mogrtDebug.legacySafeApply([1, 2], {});
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.equal(h.status().text, "안전하게 적용: 갱신 1 · 옮김 1");
+	const v3 = sim.clips(seq, 2).slice().sort((a, b) => a.s - b.s);
+	assert.deepEqual(v3.map((m) => [Math.round(m.s / F), sim.textOf(m, "텍스트")]), [[f24(2.4), "하나 고침"], [f24(8), "둘 고침"]]);
+	const s = h.snapshot();
+	assert.deepEqual([s.rowStates[1].mm, s.rowStates[1].ap.cap, s.rowStates[2].mm, s.rowStates[2].ap.cap], [undefined, "하나 고침", undefined, "둘 고침"]);
+	noErrors(h);
+});
+
+test("(12) 리뷰: 병합 전부터 있던 줄의 클립을 줄 트랙(트랙 선택이 바뀜)에서 못 찾으면 [안전하게 적용]은 새로 놓지 않는다 (중복 없음, 병합 표시 남김)", async () => {
+	const { sim, seq, preset, preset2 } = makeSim();
+	sim.place(seq, 2, MOGRT, f24(2), f24(4), null, { texts: ["하나"] });
+	sim.place(seq, 2, MOGRT, f24(8), f24(10), null, { texts: ["둘"] });
+	const sess = legacySession(preset, [[1, 2, 4, "하나 고침", { mm: "text", mmPrev: { s: 2, e: 4, cap: "하나" } }], [2, 8, 10, "둘"], [3, 20, 21, "새로 더한 줄", { mm: "new" }]]);
+	const h = await boot(sim, [preset, preset2], sess);
+	h.$("trackSel").value = "3";
+	h.change(h.$("trackSel"));
+	await h.flush();
+	h.$("btnApply").click();
+	await done(h);
+	assert.equal(confirmOpen(h), true);
+	const msg = h.$("confirmMessage").textContent;
+	assert.match(msg, /새 줄 1개는 새로 놓습니다/, "새로 놓는 줄은 병합의 새 줄뿐");
+	assert.match(msg, /그 밖의 줄은 클립을 찾지 못하면 새로 놓지 않고 건너뜁니다/);
+	h.$("confirmYes").click();
+	await done(h);
+	assert.equal(h.status().text, "안전하게 적용: 놓음 1 · 건너뜀 1");
+	assert.deepEqual(sim.clips(seq, 2).map((m) => sim.textOf(m, "텍스트")), ["하나", "둘"], "옛 클립 그대로");
+	assert.deepEqual(sim.clips(seq, 3).map((m) => [Math.round(m.s / F), sim.textOf(m, "텍스트")]), [[f24(20), "새로 더한 줄"]], "V4에는 새 줄만 (줄 1의 중복 없음)");
+	const s = h.snapshot();
+	assert.deepEqual([s.rowStates[1].mm, s.rowStates[1].ap, s.rowStates[3].mm], ["text", undefined, undefined]);
+	assert.equal(resOf(h, 1), "타임라인에서 클립을 찾지 못함 (새로 놓지 않음): V4 2.0초");
+	noErrors(h);
+});
+
+test("(13) 리뷰: 새로 놓은 레거시 줄을 되돌린 뒤 다시 [안전하게 적용]하면 다시 놓는다 (마지막 적용 기록으로 놓인 적 없는 줄로 본다)", async () => {
+	const { sim, seq, preset, preset2 } = makeSim();
+	sim.place(seq, 2, MOGRT, f24(10), f24(12), null, { texts: ["다음 줄"] });
+	const sess = legacySession(preset, [[1, 3, 4.5, "새로 더한 줄", { mm: "new" }], [2, 10, 12, "다음 줄"]]);
+	const h = await boot(sim, [preset, preset2], sess);
+	assert.equal((await h.win._mogrtDebug.legacySafeApply([1], {})).created, 1);
+	assert.equal((await cmd(h, "undo", {})).data.removed, 1);
+	assert.deepEqual([h.snapshot().rowStates[1].mm, h.snapshot().rowStates[1].ap], ["undone", undefined]);
+	h.$("btnApply").click();
+	await done(h);
+	assert.match(h.$("confirmMessage").textContent, /새 줄 1개는 새로 놓습니다/);
+	h.$("confirmYes").click();
+	await done(h);
+	assert.equal(h.status().text, "안전하게 적용: 놓음 1");
+	assert.deepEqual(sim.clips(seq, 2).slice().sort((a, b) => a.s - b.s).map((m) => sim.textOf(m, "텍스트")), ["새로 더한 줄", "다음 줄"]);
+	noErrors(h);
+});
+
+// S2-5에서 last_apply 항목에 더한 키 (S2-4 모양 기록을 흉내 낼 때 지운다)
+const UNDO_KEYS_S25 = ["n", "id", "op", "k", "m", "ef", "dur"];
+
+test("(14) 리뷰: 실행 전 줄 기록(prev)이 없는 기록(S2-4 모양)은 되돌리지 않는다 — 되돌린 줄의 applied가 남아 다음 ▶가 옛 문장을 '그대로'로 본다", async () => {
+	const { sim, preset, preset2 } = makeSim();
+	const h = await boot(sim, [preset, preset2], castSession(preset, [[1, "C1", 100, 160, "철수 하나"], [3, "C1", 300, 360, "철수 둘"]]));
+	await applyAll(h);
+	const b64 = Buffer.from(srt([[100, 160, "철수 하나 고침"], [300, 360, "철수 둘"]]), "utf8").toString("base64");
+	assert.equal((await cmd(h, "mergeCommit", { files: [{ name: "C1.srt", b64 }] })).ok, true);
+	await applyAll(h);
+	const la = h.fs.readJson(LA());
+	assert.equal(la.updated.length, 1);
+	assert.equal(!!(await openHistory(h)), true, "S2-5 기록은 되돌릴 수 있다");
+	h.$("btnHistory").click();
+	// S2-4 모양: prev·n·id·op·k·m·ef·dur 없음
+	delete la.prev;
+	UNDO_KEYS_S25.forEach((k) => la.updated.forEach((e) => { delete e[k]; }));
+	h.fs.writeFile(LA(), JSON.stringify(la));
+	assert.equal(!!(await openHistory(h)), false, "히스토리 항목이 없다");
+	h.$("btnHistory").click();
+	const r = await cmd(h, "undo", {});
+	assert.equal(r.error, "not-found");
+	noErrors(h);
+});
+
+test("(15) 리뷰: v27 호출이 타임라인을 바꾸기 전에 실패하면 마지막 적용 기록을 superseded로 적지 않는다 (↑·▶ 지금 방식)", async () => {
+	const { sim, seq, preset, preset2 } = makeSim();
+	sim.place(seq, 2, MOGRT, f24(2), f24(4), null, { texts: ["하나"] });
+	sim.place(seq, 2, MOGRT, f24(8), f24(10), null, { texts: ["둘"] });
+	const sess = legacySession(preset, [[1, 2.4, 4.4, "하나", { mm: "time", mmPrev: { s: 2, e: 4, cap: "하나" } }], [2, 8, 10, "둘"]]);
+	const h = await boot(sim, [preset, preset2], sess);
+	assert.equal((await h.win._mogrtDebug.legacySafeApply([1], {})).moved, 1);
+	const sup = () => h.fs.readJson(LA()).superseded;
+	const up2 = () => h.$("row-2").querySelectorAll("button").find((b) => b.title === "이 자막만 타임라인에 업데이트");
+	// ↑ (v27 updateClipAtTime): 시퀀스 없음 · 빈 응답(함수 없음)은 아무것도 바꾸지 않았다
+	h.host.handlers.updateClipAtTime = () => "ERROR: 활성 시퀀스 없음";
+	up2().click();
+	await done(h);
+	assert.equal(sup(), false);
+	h.host.handlers.updateClipAtTime = () => "";
+	up2().click();
+	await done(h);
+	assert.match(h.status().text, /^클립 업데이트 실패/);
+	assert.equal(sup(), false);
+	// ▶ 지금 방식 (v27 applyToTimeline): 시퀀스 없음
+	h.host.handlers.applyToTimeline = () => "ERROR: 활성 시퀀스 없음";
+	h.$("btnApply").click();
+	await done(h);
+	assert.equal(sup(), false);
+	assert.equal(!!(await openHistory(h)), true, "여전히 되돌릴 수 있다");
+	h.$("btnHistory").click();
+	// JSX가 잡지 못한 예외(중간에 멈췄을 수 있다) → superseded
+	h.host.handlers.updateClipAtTime = () => { throw new Error("boom"); };
+	up2().click();
+	await done(h);
+	assert.equal(sup(), true);
 	noErrors(h);
 });

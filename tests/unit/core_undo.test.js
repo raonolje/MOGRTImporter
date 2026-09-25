@@ -2,6 +2,7 @@
 // S2-5: core 되돌리기·레거시 안전 경로 — undoChains(key마다 작업 전·뒤), buildUndoOps(가드 6범주: nodeId + gen + 텍스트 해시,
 // 네이티브는 텍스트 없이, 옛 템플릿 되놓기, 이미 되돌린 것 건너뛰기, 자리 흉내), legacyMiPlan(문장만 → update, 시간 → move,
 // 없음 → place + 이웃 보호, 모호·확인 필요, 네이티브 빼기), legacyClipOwners, repairOps, undoRetag, laUndoable, fitWindow.
+// 리뷰 반영: 자리 가드(retimed·moved-track, 제자리 갱신은 keepTime), prev 없는 기록, legacyFresh·missing·placeMissing, 클립 문장으로 캡션 비교.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { loadRegions, plain } = require("../lib/loadRegions");
@@ -40,6 +41,9 @@ test("undoRetag·laUndoable·isUidKey", () => {
 	assert.equal(C.laUndoable(Object.assign({}, la, { undone: { complete: true } }), "seq-1"), false, "이미 되돌렸다");
 	assert.equal(C.laUndoable(Object.assign({}, la, { undone: { complete: false } }), "seq-1"), true, "멈춘 되돌리기는 이어서");
 	assert.equal(C.laUndoable(la0(), "seq-1"), false, "항목 없음");
+	const s24 = Object.assign({}, la);
+	delete s24.prev;
+	assert.equal(C.laUndoable(s24, "seq-1"), false, "실행 전 줄 기록(prev)이 없는 기록(S2-4 모양)은 되돌리지 않는다 (applied·ap를 되돌릴 수 없다)");
 	assert.deepEqual([C.isUidKey(SALT + "-12"), C.isUidKey("r12"), C.isUidKey("fix:00f1")], [true, false, false]);
 });
 
@@ -245,10 +249,63 @@ test("legacyMiPlan: 위험한 줄·되돌린 줄·↑(full)은 속성 전부, �
 	p = lplan([nat, none], scan, d);
 	assert.deepEqual([p.rowOps[3].skip, p.rowOps[4].skip], ["native", "no-preset"]);
 	// 두 줄이 한 클립을 가리키면 먼저 온 줄만
-	const twin = lrow(5, 1, 3, "첫째", { mm: "text" });
-	p = lplan([lrow(1, 1, 3, "첫째", { mm: "text", ap: { s: 1, e: 3, cap: "첫째 옛", ps: "x", t: 2 } }), twin], scan, { a: det(["첫째 옛", ""]), b: d.b });
+	const first = lrow(1, 1, 3, "첫째", { mm: "text", ap: { s: 1, e: 3, cap: "첫째 옛", ps: "x", t: 2 } });
+	const twin = lrow(5, 1, 3, "첫째", { mm: "new" });
+	p = lplan([first, twin], scan, { a: det(["첫째 옛", ""]), b: d.b });
 	assert.equal(p.ops.filter((o) => o.own && o.own.nodeId === "a").length, 1);
-	assert.deepEqual([p.rowOps[5].skip, p.rowOps[5].why], ["conflict", "occupied-own"], "다른 줄은 클립이 없는 것으로 보고 놓으려 하지만 그 자리는 앞 줄의 클립");
+	assert.deepEqual([p.rowOps[5].skip, p.rowOps[5].why], ["conflict", "occupied-own"], "새 줄은 클립이 없는 것으로 보고 놓으려 하지만 그 자리는 앞 줄의 클립");
+	// 놓인 적 있는 줄(mm text)이면 놓지 않는다 (missing)
+	p = lplan([first, lrow(5, 1, 3, "첫째", { mm: "text" })], scan, { a: det(["첫째 옛", ""]), b: d.b });
+	assert.deepEqual([p.rowOps[5].skip, p.rowOps[5].detail], ["missing", "V3 1.0초"]);
+});
+
+test("legacyMiPlan (S2-5 리뷰): 못 찾은 줄은 놓인 적 없는 줄(fresh)·↑(placeMissing)만 새로 놓는다 — 병합 전부터 있던 줄·위험한 줄은 missing으로 건너뛴다", () => {
+	const f = (s) => Math.round((s * TPS) / FT);
+	// 줄 트랙(V3)에 클립이 없다 (트랙 선택이 바뀌었거나 사용자가 옮겼다)
+	const scan = scanOf({ 2: [clip(f(40), f(42), "z", "[v27]")] });
+	const rows = [
+		lrow(1, 2, 4, "하나 고침", { mm: "text", mmPrev: { s: 2, e: 4, cap: "하나" } }),
+		lrow(2, 6, 8, "둘", { mm: "time", mmPrev: { s: 5, e: 7, cap: "둘" } }),
+		Object.assign(lrow(3, 9, 11, "셋"), { unsafe: true }),
+		lrow(4, 13, 14, "새 줄", { mm: "new" }),
+		lrow(5, 16, 17, "되돌린 새 줄", { mm: "undone" })
+	];
+	let p = lplan(rows, scan);
+	assert.deepEqual([1, 2, 3, 4, 5].map((id) => (p.rowOps[id].skip || p.rowOps[id].op)), ["missing", "missing", "missing", "place", "missing"]);
+	assert.deepEqual(p.ops.map((o) => o.id), [4], "새 줄만 놓는다 (중복을 만들지 않는다)");
+	assert.equal(p.rowOps[2].detail, "V3 5.0초", "찾아본 자리 (mmPrev)");
+	// 패널이 fresh를 넘기면 그것을 쓴다 (되돌린 새 줄: 마지막 적용 기록으로 판단)
+	p = lplan(rows.map((r) => (r.sub.id === 5 ? Object.assign({}, r, { fresh: true }) : r)), scan);
+	assert.deepEqual(p.ops.map((o) => o.id), [4, 5]);
+	// ↑(placeMissing): v27 ↑처럼 못 찾으면 놓는다
+	p = lplan([rows[1]], scan, {}, { opts: { placeMissing: true, full: true } });
+	assert.deepEqual([p.ops[0].op, p.ops[0].sf, p.ops[0].params.length], ["place", f(6), 3]);
+	// legacyFresh: 되돌린 줄은 마지막 적용(레거시)이 새 줄을 놓았다가 지운 것일 때만
+	const la = { legacy: true, prev: { r5: { id: 5, ap: null, mmPrev: null, mm: "new" }, r6: { id: 6, ap: { s: 1 }, mmPrev: null, mm: null } }, undone: { keys: { r5: "remove", r6: "remove" } } };
+	assert.equal(C.legacyFresh({ mm: "undone" }, la, 5), true);
+	assert.equal(C.legacyFresh({ mm: "undone" }, la, 6), false, "실행 전에 ap가 있던 줄");
+	assert.equal(C.legacyFresh({ mm: "undone" }, Object.assign({}, la, { legacy: false }), 5), false, "화자별 배치 기록");
+	assert.equal(C.legacyFresh({ mm: "undone" }, Object.assign({}, la, { undone: { keys: { r5: "restore" } } }), 5), false);
+	assert.equal(C.legacyFresh({ mm: "new", mmPrev: { s: 1 } }, null, 7), false, "되살린 줄 (병합 전 값이 있다)");
+	assert.equal(C.legacyFresh({ mm: "new" }, null, 7), true);
+});
+
+test("legacyMiPlan (S2-5 리뷰): 캡션 비교는 찾은 클립의 문장으로 — v27 목록(ap 없음)에서 시간만 바뀐 줄의 캡션을 패널에서 고쳤으면 캡션도 보낸다", () => {
+	const f = (s) => Math.round((s * TPS) / FT);
+	const scan = scanOf({ 2: [clip(f(2), f(4), "c1", "[v27]"), clip(f(8), f(10), "c2", "[v27]")] });
+	const d = { c1: det(["하나", ""]), c2: det(["둘", ""]) };
+	const rows = [
+		lrow(1, 2.4, 4.4, "하나 고침", { mm: "time", mmPrev: { s: 2, e: 4, cap: "하나" } }),
+		lrow(2, 8, 10, "둘 고침", { mm: "time", mmPrev: { s: 8, e: 10, cap: "둘" } }),
+		lrow(3, 8, 10, "둘", { mm: "time", mmPrev: { s: 8, e: 10, cap: "둘" } })
+	];
+	let p = lplan(rows.slice(0, 2), scan, d);
+	const by = {};
+	p.ops.forEach((o) => { by[o.id] = o; });
+	assert.deepEqual([by[1].op, by[1].params.map((x) => x.value)], ["move", ["하나 고침"]], "옮기면서 캡션도");
+	assert.deepEqual([by[2].op, by[2].keepTime, by[2].params.map((x) => x.value)], ["update", true, ["둘 고침"]], "시간이 원래대로면 캡션만 (none이 아니다)");
+	p = lplan([rows[2]], scan, d);
+	assert.deepEqual(p.rowOps[3], { none: true, nodeId: "c2" }, "클립 문장이 캡션과 같으면 보내지 않는다");
 });
 
 test("fitWindow: 시작을 덮으면 occupied(-own), 안쪽 이웃은 끝 맞춤·guard, 뒤쪽 남의 클립은 tail", () => {
@@ -257,6 +314,52 @@ test("fitWindow: 시작을 덮으면 occupied(-own), 안쪽 이웃은 끝 맞춤
 	assert.deepEqual(plain(C.fitWindow(L, 100, 150, 0, { a: true })), { conflict: null, ef: 130, clamped: true, guard: ["b"] });
 	assert.equal(C.fitWindow(L, 100, 120, 80, { a: true }).conflict, "tail");
 	assert.deepEqual(plain(C.fitWindow(L, 100, 120, 60, { a: true })), { conflict: null, ef: 120, clamped: false, guard: ["b"] });
+});
+
+test("buildUndoOps (S2-5 리뷰): 적용 뒤 Premiere에서 옮기거나 길이를 바꾼 클립 — 제자리 갱신은 속성만(keepTime, 시작·끝 그대로), 우리가 옮긴·만든·다시 놓은 클립은 '그 뒤로 바뀜'(retimed)", () => {
+	const rh = C.textsHash(["문장", ""]);
+	const snap = (nodeId, track, sf, ef, name, m) => ({ nodeId, track, sf, ef, g: 1, name, kind: "ae", m, pi: "", params: P0 });
+	const la = la0({
+		// 1: 문장만 갱신 (끝 360 → 380), 2: 끝만 늘림(360 → 400), 3: TrackItem.move 100 → 130, 4: 만듦, 5: 템플릿 교체, 6: 만듦 (다른 트랙으로 옮겨짐)
+		updated: [
+			{ key: SALT + "-1", g: 1, track: 2, sf: 300, ef: 380, nodeId: "n1", rh, n: 0, k: "ae", m: M, before: P0, from: { track: 2, sf: 300, ef: 360, name: tag(1, 1) } },
+			{ key: SALT + "-2", g: 1, track: 2, sf: 600, ef: 700, nodeId: "n2", rh, n: 1, k: "ae", m: M, before: P0, from: { track: 2, sf: 600, ef: 660, name: tag(2, 1) } }
+		],
+		moved: [{ key: SALT + "-3", g: 1, track: 2, sf: 130, ef: 190, nodeId: "n3", rh, n: 2, k: "ae", m: M, op: "move", from: snap("n3", 2, 100, 160, tag(3, 1), null) }],
+		created: [
+			{ key: SALT + "-4", g: 1, track: 2, sf: 900, ef: 960, nodeId: "n4", rh, n: 3, k: "ae", m: M },
+			{ key: SALT + "-6", g: 1, track: 2, sf: 1500, ef: 1560, nodeId: "n6", rh, n: 5, k: "ae", m: M }
+		],
+		replaced: [{ key: SALT + "-5", g: 2, track: 2, sf: 1200, ef: 1260, nodeId: "n5", rh, n: 4, k: "ae", m: M, from: snap("n5o", 2, 1200, 1260, tag(5, 1), M_OLD) }]
+	});
+	const d = { n1: det(["문장", ""]), n2: det(["문장", ""]), n3: det(["문장", ""]), n4: det(["문장", ""]), n5: det(["문장", ""]), n6: det(["문장", ""]) };
+	const durs = { "c:/m/a.mogrt": 1, "c:/m/old.mogrt": 1 };
+	// 그대로면 모두 되돌린다 (끝도)
+	const same = scanOf({ 2: [clip(130, 190, "n3", tag(3, 1)), clip(300, 380, "n1", tag(1, 1)), clip(600, 700, "n2", tag(2, 1)), clip(900, 960, "n4", tag(4, 1)), clip(1200, 1260, "n5", tag(5, 2)), clip(1500, 1560, "n6", tag(6, 1))] });
+	let p = plain(C.buildUndoOps({ la, scan: same, details: d, durs, repairM: {} }));
+	assert.deepEqual(p.skipped, []);
+	const by = (q) => { const o = {}; q.ops.forEach((x) => { o[x.key] = x; }); return o; };
+	let b = by(p);
+	assert.deepEqual([b[SALT + "-1"].op, b[SALT + "-1"].ef, b[SALT + "-1"].keepTime], ["update", 360, false]);
+	assert.deepEqual([b[SALT + "-3"].op, b[SALT + "-3"].sf], ["move", 100]);
+	// 사용자가 옮겼다: 1 +40프레임, 2 끝을 줄임, 3 +70프레임, 4 +10프레임, 5 +24프레임, 6 다른 트랙
+	const moved = scanOf({
+		2: [clip(200, 260, "n3", tag(3, 1)), clip(340, 420, "n1", tag(1, 1)), clip(600, 650, "n2", tag(2, 1)), clip(910, 970, "n4", tag(4, 1)), clip(1224, 1284, "n5", tag(5, 2))],
+		3: [clip(1500, 1560, "n6", tag(6, 1))]
+	});
+	p = plain(C.buildUndoOps({ la, scan: moved, details: d, durs, repairM: {} }));
+	b = by(p);
+	assert.deepEqual([b[SALT + "-1"].op, b[SALT + "-1"].sf, b[SALT + "-1"].ef, b[SALT + "-1"].keepTime, b[SALT + "-1"].own.sf], ["update", 340, 420, true, 340], "속성만 (옮긴 자리 그대로)");
+	assert.deepEqual(b[SALT + "-1"].params, P0);
+	assert.deepEqual([b[SALT + "-2"].op, b[SALT + "-2"].ef, b[SALT + "-2"].keepTime], ["update", 650, true], "사용자가 줄인 끝을 되돌리지 않는다");
+	assert.deepEqual(p.skipped.map((s) => [s.key, s.why]), [[SALT + "-3", "retimed"], [SALT + "-4", "retimed"], [SALT + "-5", "retimed"], [SALT + "-6", "moved-track"]]);
+	assert.deepEqual(p.removals, []);
+	assert.deepEqual(Object.keys(p.acts).sort(), [SALT + "-1", SALT + "-2"]);
+	assert.equal(C.UNDO_CHANGED.retimed, true, "'그 뒤로 바뀜'으로 센다");
+	// 끝을 모르는 기록(S2-4 모양)은 시작만 본다
+	const la24 = la0({ created: [{ key: SALT + "-4", g: 1, track: 2, sf: 900, nodeId: "n4", rh, n: 0, k: "ae", m: M }] });
+	p = plain(C.buildUndoOps({ la: la24, scan: scanOf({ 2: [clip(900, 990, "n4", tag(4, 1))] }), details: d, durs, repairM: {} }));
+	assert.deepEqual(p.removals.map((x) => x.key), [SALT + "-4"]);
 });
 
 test("buildUndoOps: 첫 기록이 이웃 복구(fix)인 key는 그대로 둔다 (kept) — 뒤에 다른 기록이 있어도 실행 전 모습을 모른다", () => {

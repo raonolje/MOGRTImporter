@@ -2537,6 +2537,18 @@
 		const s = typeof res === "string" ? res : "";
 		return s.indexOf("SUCCESS") === 0 && s.indexOf("(실패") === -1;
 	}
+	// v27 호출(updateClipAtTime·applyToTimeline)이 타임라인을 바꿨을 수 있는가 → 그렇다면 마지막 적용 기록을 superseded로 (S2-5).
+	// res: 응답 글자, 또는 호출이 던진 오류(전송 실패). v27 함수는 바이트 그대로라 문구가 고정이다
+	//   SUCCESS → 예. 바꾸기 전에 멈추는 실패(페이로드·시퀀스·트랙 확인, 제자리 갱신의 '클립 없음 + mogrtPath 미지정') → 아니오.
+	//   그 밖의 ERROR(속성 쓰기·importMGT 실패는 클립을 바꾸거나 insertClip한 뒤일 수 있다) → 예.
+	//   전송 실패: 빈 응답(함수 없음·무응답) → 아니오, JSX가 잡지 못한 예외(EvalScript error.)는 중간에 멈췄을 수 있다 → 예
+	const V27_NOCHANGE_RE = /^ERROR:\s*(JSON 파싱 실패|활성 시퀀스 없음|트랙 접근 실패|트랙 없음|클립 없음 \+ mogrtPath 미지정)/;
+	function v27MayHaveChanged(res) {
+		if (res && typeof res === "object") return /ExtendScript/.test(String(res.hostReason || res.message || ""));
+		const s = typeof res === "string" ? res : "";
+		if (!s) return false;
+		return !V27_NOCHANGE_RE.test(s);
+	}
 	// v27 결과의 실패 개수 ("… (실패 3개: …)" → 3). 없으면 0
 	function v27FailCount(res) {
 		const m = /\(실패 (\d+)개/.exec(typeof res === "string" ? res : "");
@@ -4124,8 +4136,9 @@
 	//   removed = 지운 클립 {track, sf, ef, g, name, kind, m, pi, params, nodeId} + why(stale|orphan|cycle|undo), pa(지우기 전 applied 항목)
 	//   la.prev[key] = 실행 전 줄 기록 {id, ap, mmPrev, mm, a(applied 항목)} — 되돌린 줄의 rs.ap·mmPrev·applied를 되돌린다
 	const UNDO_CATS = ["removed", "created", "updated", "moved", "adopted", "replaced"];
-	// 되돌리지 않는 까닭 (패널이 문구로 바꾼다). 앞의 다섯은 '그 뒤로 바뀜'이다
-	const UNDO_CHANGED = { gone: true, renamed: true, edited: true, kind: true, "moved-track": true };
+	// 되돌리지 않는 까닭 (패널이 문구로 바꾼다). 앞의 여섯은 '그 뒤로 바뀜'이다
+	//   retimed: 적용 뒤 Premiere에서 클립을 옮기거나 길이를 바꿨다 (지금 자리가 기록한 작업 뒤 자리와 1프레임 넘게 다르다)
+	const UNDO_CHANGED = { gone: true, renamed: true, edited: true, kind: true, "moved-track": true, retimed: true };
 	// uid 모양 key ("salt-id") — 태그를 확인한다. 레거시 key "r<id>"는 태그가 없어야 한다
 	function isUidKey(key) {
 		return /^[a-z0-9]{4}-\d+$/.test(String(key == null ? "" : key));
@@ -4135,9 +4148,12 @@
 		const m = /^r(\d+)$/.exec(String(key)) || /-(\d+)$/.exec(String(key));
 		return m ? parseInt(m[1], 10) : null;
 	}
-	// 되돌릴 수 있는 기록인가: 이 시퀀스의 것이고, v27 ▶가 덮지 않았고(superseded), 다 되돌리지 않았고, 항목이 있다
+	// 되돌릴 수 있는 기록인가: 이 시퀀스의 것이고, v27 ▶가 덮지 않았고(superseded), 다 되돌리지 않았고, 항목이 있다.
+	// 실행 전 줄 기록(la.prev)이 없는 기록(S2-4 모양)은 되돌리지 않는다: 되돌린 줄의 applied·ap를 실행 전으로 돌릴 수 없어
+	// 다음 ▶가 옛 문장의 클립을 '그대로'로 보고 병합 표시까지 지운다
 	function laUndoable(la, seqId) {
 		if (!la || typeof la !== "object" || !la.seqId || String(la.seqId) !== String(seqId || "")) return false;
+		if (!la.prev || typeof la.prev !== "object") return false;
 		if (la.superseded || (la.undone && la.undone.complete)) return false;
 		return UNDO_CATS.some((c) => Array.isArray(la[c]) && la[c].length > 0);
 	}
@@ -4164,7 +4180,7 @@
 	// 기록을 key마다 순서대로 묶는다 (한 실행에서 한 줄이 여러 번 바뀔 수 있다: 이웃이 망가져 다시 놓기, 순환을 끊은 먼저 지우기).
 	// 따로 되놓는 제거(옛 gen·목록에서 빠진 줄의 클립)는 묶지 않는다 → {chains: [{key, id, cats, origin, final}], lone: [removed 항목]}
 	//   origin = 실행 전 클립 (없었으면 null) = 첫 항목의 작업 전 모습
-	//   final  = 실행 뒤 클립 = 마지막 (제거가 아닌) 항목 {nodeId, g, rh, k, m, track}. 없으면 null (순환을 끊고 놓지 못했다)
+	//   final  = 실행 뒤 클립 = 마지막 (제거가 아닌) 항목 {nodeId, g, rh, k, m, track, sf, ef (null = 모름, S2-4 기록)}. 없으면 null (순환을 끊고 놓지 못했다)
 	//   fix    = 첫 항목이 이웃 복구(분기 C: 다른 줄의 템플릿 길이에 덮여 사라진 클립을 줄 계획으로 다시 놓음)다 → 실행 전 클립의 모습이 기록에 없다
 	// n이 없는 기록(S2-4)은 범주 순서(제거 먼저)로 본다
 	function undoChains(la) {
@@ -4194,7 +4210,7 @@
 			chains.push({
 				key, id: laKeyId(key, list[0].e), cats: list.map((x) => x.cat), origin: undoOriginOf(list[0].cat, list[0].e), fix: list[0].e.fix === true,
 				final: last ? { nodeId: String(last.nodeId == null ? "" : last.nodeId), g: typeof last.g === "number" ? last.g : 0, rh: typeof last.rh === "string" ? last.rh : null,
-					k: last.k || "", m: last.m || null, track: last.track } : null
+					k: last.k || "", m: last.m || null, track: last.track, sf: typeof last.sf === "number" ? last.sf : null, ef: typeof last.ef === "number" ? last.ef : null } : null
 			});
 		});
 		return { chains, lone };
@@ -4209,8 +4225,12 @@
 	// 모든 되돌리기는 확인한다 (spec: nodeId + g + 지금 텍스트 해시 == 기록한 rh): 마지막 클립(final)이 그 nodeId로 있고,
 	// 이름의 태그가 key·g와 같고(레거시는 태그 없음), AE면 텍스트 해시가 rh와 같아야 한다. 아니면 '그 뒤로 바뀜'으로 건너뛴다.
 	// 네이티브는 Source Text가 늘 ""로 읽혀(S0-3 w) 텍스트로 확인할 수 없다 → nodeId·gen·종류만 보고, 되놓을 때는 기록한 구운 사본 경로(m)를 쓴다.
+	// 자리도 확인한다: 지금 클립의 트랙·시작·끝이 기록한 작업 뒤 자리(final)와 1프레임 넘게 다르면 적용 뒤 Premiere에서 옮기거나 길이를 바꾼 것이다.
+	//   그러면 자리를 되돌리거나 클립을 지우는 되돌리기(만든 클립, 우리가 옮긴 클립, 다시 놓은 클립)는 '그 뒤로 바뀜'(retimed·moved-track)으로 건너뛰고,
+	//   시작을 옮기지 않은 제자리 작업(updated·adopted)은 속성·이름만 되돌린다 (keepTime — 사용자가 바꾼 자리·끝은 그대로)
 	//   origin 없음                  → 지운다 (removeClips, expectName)
-	//   origin이 같은 클립(nodeId)   → 제자리 되돌리기: 자리가 같으면 update(속성 전부 = 작업 전 ParamDef, 이름, 끝), 다르면 move (TrackItem.move)
+	//   origin이 같은 클립(nodeId)   → 제자리 되돌리기: 우리 작업이 시작을 옮기지 않았으면 update(속성 전부 = 작업 전 ParamDef, 이름, 끝 — 끝은 지금 자리가
+	//                                  작업 뒤 그대로일 때만), 옮겼으면 move (TrackItem.move)
 	//   origin이 다른 클립           → 옛 템플릿(origin.m)을 옛 자리에 되놓고 지금 클립을 지운다: 같은 트랙이면 replace, 다른 트랙이면 moveRegen.
 	//                                  이름은 태그 gen을 올려(g + 1) 되놓는다 — 지금 클립이 남아도 옛 gen으로 정리되게. 레거시(태그 없음)는 원래 이름
 	//   따로 지운 클립(옛 gen·목록 밖) → 기록한 자리에 되놓는다 (place, 자리가 비어 있어야 한다)
@@ -4282,28 +4302,38 @@
 			if (d.kind === "ae" && fin.rh !== null && textsHash(d.texts || []) !== fin.rh) return skip(ch.key, ch.id, "edited");
 			const src = { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name, g: fin.g };
 			const own = { track: c.track, sf: c.sf, nodeId: c.nodeId };
+			// 적용 뒤 자리가 바뀌었나 (기록한 작업 뒤 트랙·시작·끝과 비교. 끝을 모르는 S2-4 기록은 시작만)
+			const trackMoved = typeof fin.track === "number" && c.track !== fin.track;
+			const retimed = trackMoved || (fin.sf !== null && Math.abs(c.sf - fin.sf) > 1) || (fin.ef !== null && Math.abs(c.ef - fin.ef) > 1);
+			const posText = "V" + (c.track + 1) + " " + c.sf + "~" + c.ef + "f";
 			if (!org) {
+				if (retimed) return skip(ch.key, ch.id, trackMoved ? "moved-track" : "retimed", posText);
 				out.removals.push({ uid: ch.key, key: ch.key, id: ch.id, track: c.track, nodeId: c.nodeId, expectName: c.name, g: fin.g, why: "undo" });
 				out.acts[ch.key] = "remove";
 				return;
 			}
 			if (org.nodeId && org.nodeId === fin.nodeId) {
 				// 같은 클립: 속성 전부·이름·자리를 작업 전으로 (다른 트랙으로 옮겨졌으면 TrackItem.move로 되돌릴 수 없다)
-				if (org.track !== c.track) return skip(ch.key, ch.id, "moved-track", "V" + (c.track + 1));
+				if (org.track !== c.track || trackMoved) return skip(ch.key, ch.id, "moved-track", "V" + (c.track + 1));
 				const efT = typeof org.ef === "number" ? Math.max(org.sf + 1, org.ef) : c.ef;
 				const name = org.name && org.name !== c.name ? org.name : null;
-				if (Math.abs(org.sf - c.sf) > 1) {
+				// 우리 작업이 시작을 옮겼다 (move·legacy move): 지금 자리가 작업 뒤 그대로일 때만 옛 자리로 되돌린다
+				const ourMove = Math.abs(org.sf - (fin.sf !== null ? fin.sf : c.sf)) > 1;
+				if (ourMove) {
+					if (retimed) return skip(ch.key, ch.id, "retimed", posText);
 					ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: "move", phase: 3, g: fin.g, track: c.track, sf: org.sf, ef: efT, own, removeAfter: null, m: fin.m || org.m,
 						durSec: durOf(fin.m || org.m), D: 0, params: org.params, name, src, alt: { name: org.name || c.name }, undo: "move" });
 				} else {
-					const keep = Math.abs(efT - c.ef) < 1;
+					// 시작은 그대로 (spec: updated → update keepTime with before). 우리 작업이 바꾼 끝은 지금 자리가 작업 뒤 그대로일 때만 되돌린다
+					const keep = retimed || Math.abs(efT - c.ef) < 1;
 					ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: "update", phase: !keep && efT > c.ef ? 5 : 2, g: fin.g, track: c.track, sf: c.sf, ef: keep ? c.ef : efT, keepTime: keep, own,
 						removeAfter: null, m: fin.m || org.m, params: org.params, name, src, undo: "restore" });
 				}
 				out.acts[ch.key] = ops[ops.length - 1].undo;
 				return;
 			}
-			// 다른 클립: 옛 템플릿을 옛 자리에 되놓고 지금 클립을 지운다
+			// 다른 클립: 옛 템플릿을 옛 자리에 되놓고 지금 클립을 지운다 (적용 뒤 옮긴 클립은 지우지 않는다)
+			if (retimed) return skip(ch.key, ch.id, trackMoved ? "moved-track" : "retimed", posText);
 			if (!org.m) return skip(ch.key, ch.id, "template-unknown");
 			const g2 = uidKey ? Math.max(fin.g, typeof org.g === "number" ? org.g : 0) + 1 : 0;
 			const dur = durOf(org.m);
@@ -4382,17 +4412,33 @@
 	}
 
 	// ── 레거시 안전 경로 (v28 호스트, S2-5) — 계획서 §6.13, spec placement 13 ──
+	// 레거시 줄이 타임라인에 놓인 적 없는 줄인가 (레거시 안전 경로가 클립을 못 찾으면 새로 놓아도 되는 줄):
+	//   병합의 새 줄(mm new, ap·mmPrev 없음), 또는 마지막 적용(레거시 안전 경로 기록 la)이 그런 새 줄을 놓았다가 되돌린 줄(mm undone).
+	// 그 밖의 줄(병합 전부터 있던 줄, v27에 위험한 줄, 되돌린 줄)은 클립을 못 찾으면 트랙 선택이 바뀌었거나 옮긴 것일 수 있다 → 놓지 않는다
+	function legacyFresh(rs, la, id) {
+		if (!rs || rs.ap || rs.mmPrev) return false;
+		if (rs.mm === "new") return true;
+		if (rs.mm !== "undone" || !la || !la.legacy) return false;
+		const key = "r" + id;
+		const p = la.prev && la.prev[key];
+		return !!(la.undone && la.undone.keys && la.undone.keys[key] === "remove") && !!p && p.mm === "new" && !p.ap && !p.mmPrev;
+	}
 	// 화자 표가 없는 목록의 바뀐 줄을 태그 없이(name null — 단일 화자 타임라인은 v27과 같은 모습) nodeId로 적용한다:
-	//   문장만 바뀜 → 제자리 갱신(update keepTime), 시간이 바뀜 → TrackItem.move (S0-3 r), 타임라인에 없음 → 새로 놓기(place, 이웃 보호).
+	//   문장만 바뀜 → 제자리 갱신(update keepTime), 시간이 바뀜 → TrackItem.move (S0-3 r), 타임라인에 없는 새 줄 → 새로 놓기(place, 이웃 보호).
 	// 줄의 클립 = 그 트랙에서 마지막 검증 적용(ap) → 병합 전 값(mmPrev) → 지금 시간(applyLocate)의 프레임 ±1에 시작하는 태그 없는 AE 클립 가운데
 	// 줄 문장(ap.cap·mmPrev.cap·캡션·sub.text 중 하나)을 담은 것 하나. 둘 이상이면 ambiguous, 담은 것이 없고 그 자리에 클립이 하나뿐이면
-	// uncertain (확인창에서 고르면 opts.uncertain으로 다시 계획), 없으면 missing → 새로 놓는다.
+	// uncertain (확인창에서 고르면 opts.uncertain으로 다시 계획), 없으면 missing:
+	//   놓인 적 없는 줄(r.fresh, 없으면 legacyFresh(rs))과 ↑(opts.placeMissing — v27 ↑처럼 못 찾으면 놓는다)만 새로 놓는다.
+	//   나머지는 건너뛰고 병합 표시를 남긴다 (spec placement 13은 'missing → place'지만, 트랙 선택이 바뀌었거나 옮긴 옛 클립 옆에 같은 줄이
+	//   하나 더 생긴다 — 1단계 경로처럼 '클립 없음'으로 둔다)
 	// 보내는 속성: v27에 위험한 줄·되돌린 줄·복구한 줄·새로 놓는 줄·↑(opts.full)은 전부 (호스트가 이름으로 확인해 쓴다),
-	//   문장이 바뀐 줄은 캡션 속성 하나, 시간만 바뀐 줄은 없음. 네이티브 줄(구운 사본)은 이 경로에서 다루지 않는다 (v27 ▶·↑의 굽기 경로).
-	// inp {rows: [{sub, rs, preset, unsafe, track}], scan, details, durs, owners: legacyClipOwners 결과 (다른 줄의 클립: 이웃 보호·복구 대상), opts {uncertain, full}}
+	//   캡션이 바뀐 줄(문장 병합, 또는 찾은 클립의 문장이 줄 캡션과 다름 — 병합 뒤 패널에서 고친 캡션)은 캡션 속성 하나, 시간만 바뀐 줄은 없음.
+	//   네이티브 줄(구운 사본)은 이 경로에서 다루지 않는다 (v27 ▶·↑의 굽기 경로).
+	// inp {rows: [{sub, rs, preset, unsafe, track, fresh?}], scan, details, durs, owners: legacyClipOwners 결과 (다른 줄의 클립: 이웃 보호·복구 대상),
+	//   opts {uncertain, full, placeMissing}}
 	// → {ops (단계 순, guard 포함), removals (순환 끊기), rowOps {id: {op, …} | {skip, why, detail} | {none: true}}, uncertain: [id], needReads}
 	function legacyMiPlan(inp) {
-		const o = Object.assign({ uncertain: false, full: false }, (inp && inp.opts) || {});
+		const o = Object.assign({ uncertain: false, full: false, placeMissing: false }, (inp && inp.opts) || {});
 		const scan = (inp && inp.scan) || { tracks: [] };
 		const ft = Number(scan.frameTicks) || 0;
 		const details = (inp && inp.details) || {};
@@ -4465,9 +4511,16 @@
 					clip = ae[0].c;
 				} else if (ae.length > 1) return skip(id, "ambiguous", "같은 자리 클립 " + ae.length + "개");
 			}
-			// 보낼 속성
+			// 못 찾았다: 놓인 적 없는 줄·↑만 새로 놓는다 (위 설명)
+			const fresh = typeof r.fresh === "boolean" ? r.fresh : legacyFresh(rs, null, id);
+			if (!clip && !fresh && !o.placeMissing) return skip(id, "missing", "V" + (T + 1) + " " + loc.s.toFixed(1) + "초");
+			// 보낼 속성. 캡션이 바뀌었나: 타임라인에 있는 문장(ap.cap → mmPrev.cap)과 다르거나, 찾은 클립의 문장(되읽기)에 줄 캡션이 없다
+			// (v27로 놓은 목록은 ap가 없고, 병합 뒤 패널에서 고친 캡션은 mm이 'time'이어도 클립에 없다)
 			const unsafe = !!r.unsafe;
-			const capChanged = !!rs.ap && typeof rs.ap.cap === "string" && cap !== null && normText(rs.ap.cap) !== normText(cap);
+			const capN = cap !== null ? normText(cap) : null;
+			const onTl = rs.ap && typeof rs.ap.cap === "string" ? rs.ap.cap : rs.mmPrev && typeof rs.mmPrev.cap === "string" ? rs.mmPrev.cap : null;
+			const clipD = clip ? details[clip.nodeId] : null;
+			const capChanged = capN !== null && ((onTl !== null && normText(onTl) !== capN) || (!!clip && !((clipD && clipD.texts) || []).some((t) => normText(t) === capN)));
 			let params;
 			if (!clip || o.full || unsafe || FULL_MM[rs.mm]) params = all;
 			else if (TEXT_MM[rs.mm] || capChanged) {
@@ -8827,8 +8880,7 @@ var modalState = {
 		const trackIndex = parseInt(trackSel.value, 10);
 		_setStatus("클립 업데이트 중...", "info");
 		const seq = _importSeqToken();
-		// v27 호스트로 쓴다: 마지막 적용 기록(last_apply)은 더 이상 되돌리지 않는다
-		_supersedeLastApply();
+		// v27 호스트로 쓴다: 타임라인을 바꿨으면(바꿨을 수 있으면) 마지막 적용 기록(last_apply)은 더 이상 되돌리지 않는다
 		let res;
 		try {
 			res = await host.updateClipAtTime({
@@ -8839,9 +8891,11 @@ var modalState = {
 				params
 			});
 		} catch (err) {
+			if (v27MayHaveChanged(err)) _supersedeLastApply();
 			_setStatus("클립 업데이트 실패: " + (err.hostReason || err.message), "err");
 			return;
 		}
+		if (v27MayHaveChanged(res)) _supersedeLastApply();
 		if (res.startsWith("SUCCESS")) {
 			// 시간이 바뀐 줄에서 찾은 클립은 옛 자리 그대로다 → 새로 놓았을 때만 검증된 적용으로 본다
 			const placed = res.indexOf("새 클립") !== -1;
@@ -10111,13 +10165,22 @@ var modalState = {
 			after = el;
 		});
 	}
-	// 대상 줄 → [{sub, rs, preset, unsafe, track}]. track은 마지막 검증 적용의 트랙(ap.t), 없으면 지금 트랙 선택
+	// 대상 줄 → [{sub, rs, preset, unsafe, track, fresh}]. track은 마지막 검증 적용의 트랙(ap.t), 없으면 지금 트랙 선택.
+	// fresh: 타임라인에 놓인 적 없는 줄 (core legacyFresh — 되돌린 줄은 마지막 적용 기록을 본다. 레거시 안전 경로가 못 찾으면 새로 놓는 줄)
 	function _legacyTargets(subs) {
 		const trackIndex = _trackValueNum();
+		let la;
+		const laOf = () => {
+			if (la === undefined) {
+				try { la = _readLastApply(); } catch (_) { la = null; }
+			}
+			return la;
+		};
 		return subs.map((sub) => {
 			const rs = state.rowStates[sub.id];
 			const preset = rs && rs.presetId ? state.presets[rs.presetId] || null : null;
-			return { sub, rs, preset, unsafe: isV27Unsafe(rs, preset), track: rs && rs.ap && typeof rs.ap.t === "number" ? rs.ap.t : trackIndex };
+			const fresh = legacyFresh(rs, rs && rs.mm === "undone" && !rs.ap && !rs.mmPrev ? laOf() : null, sub.id);
+			return { sub, rs, preset, unsafe: isV27Unsafe(rs, preset), track: rs && rs.ap && typeof rs.ap.t === "number" ? rs.ap.t : trackIndex, fresh };
 		});
 	}
 	// 대상 중 확인이 필요한 줄 (병합 표시가 있거나 v27에 위험)
@@ -10133,8 +10196,8 @@ var modalState = {
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
 		const seq = _importSeqToken();
-		// v27 ▶는 마지막 적용 기록(last_apply)의 클립을 다시 놓거나 바꿀 수 있다 → 그 기록은 되돌리지 않는다 (S2-5)
-		_supersedeLastApply();
+		// v27 ▶는 마지막 적용 기록(last_apply)의 클립을 다시 놓거나 바꿀 수 있다 → 그 기록은 되돌리지 않는다 (S2-5).
+		// 타임라인을 바꾼 뒤에 적는다: 네이티브 클립을 지웠을 때(_removeNativeSpots), applyToTimeline이 바꿨을(수 있을) 때 (v27MayHaveChanged)
 		// 네이티브 줄이 없는 목록은 기다리지 않고 v27 그대로 (굽기·지우기 없음)
 		const nat = _hasNativeWork(targetSubs) ? await _nativePrepare(targetSubs, trackIndex, seq) : null;
 		if (nat === false) return;
@@ -10187,10 +10250,12 @@ var modalState = {
 				subtitles: items
 			});
 		} catch (err) {
+			if (v27MayHaveChanged(err)) _supersedeLastApply();
 			btnApply.disabled = false;
 			setStatus("타임라인 적용 실패: " + (err.hostReason || err.message), "err");
 			return;
 		}
+		if (v27MayHaveChanged(res)) _supersedeLastApply();
 		btnApply.disabled = false;
 		if (nat && seq === _importSeqToken()) _markNativeRisk(nat.risk);
 		if (res.startsWith("SUCCESS")) {
@@ -10232,12 +10297,15 @@ var modalState = {
 		let safeRun = null;
 		const ids = flagged.map((t) => t.sub.id);
 		if (v28) {
-			const nat = flagged.filter((t) => !t.preset || _isNativePreset(t.preset) || (t.rs.ap && t.rs.ap.nk)).length;
-			const newN = flagged.filter((t) => t.rs.mm === "new" && !t.rs.ap).length;
+			const isNat = (t) => !t.preset || _isNativePreset(t.preset) || !!(t.rs.ap && t.rs.ap.nk);
+			const nat = flagged.filter(isNat).length;
+			// 새로 놓을 수 있는 줄 = 타임라인에 놓인 적 없는 줄(fresh)뿐이다 (legacyMiPlan: 나머지는 못 찾으면 건너뛴다)
+			const newN = flagged.filter((t) => t.fresh && !isNat(t)).length;
 			sendN = flagged.length - nat;
 			lines.push("안전하게 적용: 이 줄들의 클립만 타임라인에서 찾아(nodeId) 제자리 갱신·시간 이동·새로 놓기를 합니다. 다른 줄의 클립은 건드리지 않고, 클립 이름에 태그를 붙이지 않습니다.");
 			if (timeN) lines.push("  · 시간이 바뀐 줄 " + timeN + "개는 클립을 새 시간으로 옮깁니다.");
 			if (newN) lines.push("  · 새 줄 " + newN + "개는 새로 놓습니다 (뒤 클립의 앞부분을 보호합니다).");
+			if (sendN > newN) lines.push("  · 그 밖의 줄은 클립을 찾지 못하면 새로 놓지 않고 건너뜁니다 (줄에 까닭이 표시됩니다).");
 			if (nat) lines.push("  · 네이티브·프리셋 없는 줄 " + nat + "개는 건너뜁니다 (지금 방식으로 전체 적용·↑가 교체합니다).");
 			safeRun = () => _legacySafeApply(ids);
 		} else {
@@ -10287,7 +10355,7 @@ var modalState = {
 		});
 		const todo = plan.filter((p) => p.op === "update");
 		const seq = _importSeqToken();
-		if (todo.length) _supersedeLastApply();
+		// v27 호스트로 쓴 줄이 타임라인을 바꿨으면(바꿨을 수 있으면) 마지막 적용 기록은 되돌리지 않는다 (줄마다 결과를 보고 적는다)
 		const run = { stop: false };
 		_legacyRun = run;
 		const btnApply = document.getElementById("btnApply");
@@ -10308,11 +10376,14 @@ var modalState = {
 				const t = byId[p.id];
 				setStatus("안전하게 적용 중… " + (k + 1) + "/" + todo.length, "info");
 				let res;
+				let got;
 				try {
-					res = await host.updateClipAtTime({ videoTrackIndex: p.track, startSec: p.startSec, endSec: p.endSec, mogrtPath: "", params: p.params });
+					got = res = await host.updateClipAtTime({ videoTrackIndex: p.track, startSec: p.startSec, endSec: p.endSec, mogrtPath: "", params: p.params });
 				} catch (err) {
+					got = err;
 					res = "ERROR: " + (err.hostReason || err.message);
 				}
+				if (v27MayHaveChanged(got)) _supersedeLastApply();
 				if (seq !== _importSeqToken()) {
 					report.aborted = true;
 					break;
@@ -10603,7 +10674,8 @@ var modalState = {
 			return _isNativePreset(_rowPreset(sub)) || !!(rs && rs.ap && rs.ap.nk);
 		});
 	}
-	// 자리 [{t, s}]의 네이티브 클립을 지운다 (트랙마다 한 번) → {ok, removed, error}. seqId: 작업 시퀀스 식별자 (활성이 다르면 지우지 않는다)
+	// 자리 [{t, s}]의 네이티브 클립을 지운다 (트랙마다 한 번) → {ok, removed, error}. seqId: 작업 시퀀스 식별자 (활성이 다르면 지우지 않는다).
+	// 지운 클립이 있으면 마지막 적용 기록(last_apply)은 되돌리지 않는다 (v27 ▶·↑의 네이티브 교체, S2-5 superseded)
 	async function _removeNativeSpots(spots, seqId) {
 		const byTrack = {};
 		(spots || []).forEach((p) => {
@@ -10619,7 +10691,9 @@ var modalState = {
 			}
 			const m = /^SUCCESS:\s*(\d+)/.exec(String(res));
 			if (!m) return { ok: false, removed, error: String(res).replace(/^ERROR:\s*/, "") };
-			removed += parseInt(m[1], 10);
+			const n = parseInt(m[1], 10);
+			if (n > 0 && removed === 0) _supersedeLastApply();
+			removed += n;
 		}
 		return { ok: true, removed };
 	}
@@ -10793,7 +10867,7 @@ var modalState = {
 	// updateClipAtTime은 쓰지 않는다: 시작 ±0.5초 안의 다른 줄 클립을 잡아 속성만 쓰거나(네이티브 사본은 빈 목록 → 아무것도 안 함),
 	// 클립을 못 찾으면 insertClip(뒤 클립을 민다)·importMGT로 놓는다. applyToTimeline은 같은 시작(10ms 키)만 보고, 없으면 덮어 놓는다
 	async function _nativeReplaceOne(sub, item, plan, trackIndex, seq, seqId, book, doneText) {
-		_supersedeLastApply();
+		// 마지막 적용 기록(last_apply)은 타임라인을 바꾼 뒤에 superseded로 적는다 (_removeNativeSpots·v27MayHaveChanged)
 		const rm = await _nativeRemoveFor(plan, seqId);
 		if (_nativeSeqChanged(seq, rm)) return;
 		if (!rm.ok) {
@@ -10808,9 +10882,11 @@ var modalState = {
 		try {
 			res = await host.applyToTimeline({ videoTrackIndex: trackIndex, subtitles: items });
 		} catch (err) {
+			if (v27MayHaveChanged(err)) _supersedeLastApply();
 			setStatus("클립 업데이트 실패: " + (err.hostReason || err.message), "err");
 			return;
 		}
+		if (v27MayHaveChanged(res)) _supersedeLastApply();
 		const same = seq === _importSeqToken();
 		const note = _nativeNote({ failed: 0, extra, risk: plan.risk });
 		if (v27ResultOk(res)) {
@@ -11820,14 +11896,17 @@ var modalState = {
 	// (답하지 않으면 1단계 경로 _legacySafeUpdateV27). 태그를 쓰지 않는다(name null) → 단일 화자 타임라인은 v27과 같은 모습이다.
 	//   1) 줄 트랙(ap.t, 없으면 #trackSel)을 줄 자리 ±30초로 스캔 (MI_getTracks)
 	//   2) 줄 자리(ap → mmPrev → 지금 시간) ±1프레임의 태그 없는 클립을 되읽어 core legacyMiPlan: 문장만 바뀜 → update(nodeId),
-	//      시간이 바뀜 → move (TrackItem.move), 없음 → place (뒤 클립 머리 보호). 문장이 다른 한 클립(uncertain)은 확인창에서 고른다
+	//      시간이 바뀜 → move (TrackItem.move), 없음 → 놓인 적 없는 줄(_legacyTargets fresh)과 ↑만 place (뒤 클립 머리 보호),
+	//      나머지는 '타임라인에서 클립을 찾지 못함'으로 건너뛴다. 문장이 다른 한 클립(uncertain)은 확인창에서 고른다
 	//   3) last_apply.json {legacy: true, key "r<id>", g 0}을 쓰고 청크로 보낸다. 덮인 이웃 클립은 스냅숏으로 다시 놓는다
 	//   4) 검증된 줄은 ap를 적고 mm을 지운다 (markApplied). 일부 속성만 쓴 줄은 자리(ap)만 적고 mm을 남긴다
 	// ─────────────────────────────────────────────────────────────
 	const LEGACY_MI_WHY = Object.assign({}, LEGACY_WHY, {
 		ambiguous: "같은 자리에 문장이 맞는 클립이 여럿 — 건너뜀",
 		uncertain: "같은 자리 클립의 문장이 다름 (확인 필요)",
-		"no-track": "트랙 없음"
+		"no-track": "트랙 없음",
+		// 타임라인에 놓였던 줄인데 그 자리(줄 트랙 ±1프레임)에 클립이 없다: 새로 놓지 않는다 (트랙 선택이 바뀌었거나 옮긴 옛 클립 옆에 중복이 생긴다)
+		missing: "타임라인에서 클립을 찾지 못함 (새로 놓지 않음)"
 	});
 	// 레거시 줄의 클립 주인 (core legacyClipOwners 입력): 살아 있는 줄과 휴지통 항목의 자리·트랙·템플릿(AE 프리셋)
 	function _legacyOwnerRows() {
@@ -11922,7 +12001,7 @@ var modalState = {
 			const planFor = async (uncertain) => {
 				let p = null;
 				for (let it = 0; it < 4; it++) {
-					p = legacyMiPlan({ rows: targets, scan, details: ctx.details, durs: ctx.durs, owners, opts: { uncertain, full: !!o.full } });
+					p = legacyMiPlan({ rows: targets, scan, details: ctx.details, durs: ctx.durs, owners, opts: { uncertain, full: !!o.full, placeMissing: !!o.single } });
 					const reads = p.needReads.filter((r) => !ctx.details[r.nodeId]);
 					if (!reads.length) break;
 					_miShowBusy("클립 읽는 중… (" + reads.length + "개)");
@@ -12070,6 +12149,7 @@ var modalState = {
 	const UNDO_CONFIRM_MSG = "타임라인만 되돌립니다. 자막 목록과 후반 작업 값은 그대로이며, 되돌린 줄은 '변경 줄'로 표시됩니다.";
 	const UNDO_WHY_TEXT = {
 		gone: "클립이 없음", renamed: "클립 이름(태그)이 바뀜", edited: "Premiere에서 문장을 고침", kind: "템플릿 종류가 바뀜", "moved-track": "다른 트랙으로 옮겨짐",
+		retimed: "Premiere에서 옮기거나 길이를 바꿈",
 		"template-unknown": "되놓을 템플릿을 모름", exists: "그 자리에 같은 클립이 있음", occupied: "되놓을 자리가 막힘", "occupied-own": "되놓을 자리가 막힘", tail: "되놓을 자리 뒤가 막힘",
 		locked: "잠긴 트랙", ambiguous: "같은 태그 클립이 여럿", "stale-plan": "계획 뒤 타임라인이 바뀜", misplaced: "다른 트랙에 놓여 지움", failed: "실패"
 	};

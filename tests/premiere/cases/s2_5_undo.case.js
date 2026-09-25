@@ -147,9 +147,13 @@ module.exports = {
 			}
 			return out;
 		};
-		// S0의 클립이 모두 같은가: (uid, 트랙, 시작, 끝), AE는 MGT 속성 raw (색은 ARGB)·projectItem, 네이티브(MGT 없음)는 자리만 (문구는 따로)
+		// S0의 클립이 모두 같은가: (uid, 트랙, 시작, 끝), AE는 MGT 속성 raw, 네이티브(MGT 없음)는 자리만 (문구는 따로).
+		// spec과 다른 점 두 가지 (계획서 §6.11): 색 속성은 getColorValue ARGB 8비트로 비교한다 — 되돌리기는 setColorValue(8비트)로 되쓰므로
+		// 64비트 raw getValue는 S0과 달라질 수 있다. projectItem(pi)은 비교하지 않는다 — 옛 템플릿은 pi가 아니라 기록한 경로 m(importMGT)으로
+		// 되놓으므로 같은 프로젝트 항목을 다시 쓰는지는 단언하지 않고 다른 클립 수만 로그에 남긴다
 		const sameAs = (s0, now, what, skipKeys) => {
 			let n = 0;
+			const piDiff = [];
 			Object.keys(s0).forEach((k) => {
 				if (skipKeys && skipKeys.indexOf(k) !== -1) return;
 				const a = s0[k];
@@ -164,9 +168,11 @@ module.exports = {
 						return q[1] === p[1] || (p[2] && q[2] === p[2]) ? null : p[0] + ": " + p[1].slice(0, 80) + " → " + q[1].slice(0, 80);
 					}).filter(Boolean);
 					assert.deepEqual(diff, [], what + ": " + k + " 속성 raw 값 (색은 ARGB 8비트)");
+					if (a.pi && b.pi !== a.pi) piDiff.push(k);
 				}
 				n++;
 			});
+			if (piDiff.length) log(what + ": projectItem이 S0과 다른 AE 클립 " + piDiff.length + "개 (단언하지 않음): " + piDiff.join(", "));
 			return n;
 		};
 		// ▶ → 점검 창이 뜨면 onPf(창 정보)를 부르고 [적용] → 끝날 때까지 → {pf, status}
