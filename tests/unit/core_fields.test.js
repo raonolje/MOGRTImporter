@@ -267,3 +267,12 @@ test("nativeTextLabels: TextLayer(type 6) 순서대로 기본 문구, UI 로캘 
 	] };
 	assert.deepEqual(plain(core.nativeTextLabels(odd, 5, "")), ["Ligne 1 / Ligne 2", "텍스트 2", "Title", "Title (2)", "x".repeat(39) + "…"]);
 });
+
+test("nativeTextDefaults: 라벨과 같은 규칙으로 고른 원문 기본 문구 (줄바꿈 LF, 자르거나 번호를 붙이지 않음)", () => {
+	const layer = (en, ko) => ({ type: 6, value: { strDB: [{ localeString: "en_US", str: en }].concat(ko ? [{ localeString: "ko_KR", str: ko }] : []) } });
+	const def = { clientControls: [layer("Insert Name Here", "이름을 넣으세요"), { type: 2 }, layer("LINE ONE\rLINE TWO"), layer("Title"), layer("Title")] };
+	assert.deepEqual(plain(core.nativeTextDefaults(def, 4, "")), ["Insert Name Here", "LINE ONE\nLINE TWO", "Title", "Title"]);
+	assert.deepEqual(plain(core.nativeTextDefaults(def, 4, "ko_KR")).slice(0, 1), ["이름을 넣으세요"]);
+	assert.equal(core.nativeTextDefaults(def, 3, ""), null, "개수가 다르면 null");
+	assert.equal(core.nativeTextDefaults(null, 1, ""), null);
+});

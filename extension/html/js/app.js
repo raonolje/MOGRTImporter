@@ -1075,6 +1075,26 @@
 		});
 	}
 
+	// 네이티브 템플릿 텍스트 필드의 기본 문구(원문). 호스트는 네이티브 Source Text를 읽지 못해(한 글자 자리표시)
+	// 손대지 않은 후반 작업 필드가 빈 글자로 구워진다 → 프리셋 기본값으로 이 문구를 쓴다.
+	// 고르는 규칙은 nativeTextLabels와 같다 (UI 로캘 → en_US → 첫 항목). 줄바꿈은 LF로. 개수가 다르면 null
+	function nativeTextDefaults(def, count, locale) {
+		const ctrls = def && Array.isArray(def.clientControls) ? def.clientControls.filter((c) => c && Number(c.type) === 6) : [];
+		if (!(count > 0) || ctrls.length !== count) return null;
+		const loc = String(locale == null ? "" : locale).replace("-", "_");
+		return ctrls.map((c) => {
+			const v = c.value;
+			let str = "";
+			if (typeof v === "string") str = v;
+			else if (v && Array.isArray(v.strDB)) {
+				const db = v.strDB.filter((e) => e && typeof e.str === "string");
+				const hit = db.find((e) => loc && e.localeString === loc) || db.find((e) => e.localeString === "en_US") || db[0];
+				str = hit ? hit.str : "";
+			}
+			return str.replace(/\r\n?/g, "\n");
+		});
+	}
+
 	// ── 속성 구조 서명 ──
 
 	// 목록 비교 해시: index 순으로 "index:t|o:displayName"을 이은 fnv. 네이티브는 "n:텍스트 개수"
@@ -5671,6 +5691,9 @@ var modalState = {
 			const texts = params.filter((p) => p && p.type === "text");
 			const labels = nativeTextLabels(def, texts.length, _uiLocale());
 			if (labels) texts.forEach((p, k) => { p.displayName = labels[k]; });
+			// 값이 비었거나 자리표시 한 글자면 템플릿 기본 문구를 기본값으로 (손대지 않은 필드가 빈 글자로 구워지지 않게)
+			const defaults = nativeTextDefaults(def, texts.length, _uiLocale());
+			if (defaults) texts.forEach((p, k) => { if (String(p.value == null ? "" : p.value).length <= 1) p.value = defaults[k]; });
 		}
 	}
 	// Premiere UI 로캘 ("ko_KR" 등, CSInterface hostEnvironment). 모르면 ""

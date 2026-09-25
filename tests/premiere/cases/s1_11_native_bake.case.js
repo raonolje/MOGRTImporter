@@ -33,7 +33,7 @@ function jsxClips(idx) {
 	return "(function(){var seq=app.project.activeSequence;if(String(seq.name).indexOf('" + H.SCRATCH_PREFIX + "')!==0)return JSON.stringify({error:'not-scratch'});" +
 		"var t=seq.videoTracks[" + Number(idx) + "];var out=[];for(var k=0;k<t.clips.numItems;k++){var c=t.clips[k];" +
 		"var mg=null;try{mg=c.getMGTComponent();}catch(e){}var txt=0;try{for(var ci=0;ci<c.components.numItems;ci++){if(String(c.components[ci].matchName).indexOf('Text')!==-1)txt++;}}catch(e){}" +
-		"out.push({s:c.start.seconds,e:c.end.seconds,nodeId:String(c.nodeId),name:String(c.name),native:(!mg&&txt>0),textComps:txt});}" +
+		"out.push({s:c.start.seconds,e:c.end.seconds,nodeId:String(c.nodeId),name:String(c.name),isNative:(!mg&&txt>0),textComps:txt});}" +
 		"return JSON.stringify(out);})()";
 }
 /** 프로젝트 항목 수와 이름에 '[MI]'가 든 항목 [{name, nodeId, path}] (JSON) */
@@ -95,6 +95,11 @@ async function applyPlain(api) {
 }
 const nodeIds = (clips) => clips.map((c) => c.nodeId);
 
+/** 호스트 JSON 결과: 파싱 실패면 어느 호출이 무엇을 돌려줬는지 보여 준다 */
+async function hostJson(host, jsx, what) {
+	const raw = await host(jsx);
+	try { return JSON.parse(raw); } catch (_) { throw new Error("호스트 결과를 읽지 못함 (" + what + "): " + String(raw).slice(0, 200)); }
+}
 module.exports = {
 	name: "S1-11 네이티브 MOGRT 굽기 (문구가 화면에 보인다, 같은 문구는 같은 항목, 바뀌면 교체)",
 	run: async (api) => {
@@ -114,7 +119,7 @@ module.exports = {
 		await H.withScratchSequence(api, "s1_11", async () => {
 			assert.equal(await host(H.jsxClearVideoTrack(TRACK)), "0", "V3 비우기");
 			assert.equal(await panel(H.pageSelectTrack(TRACK)), String(TRACK));
-			const tb = JSON.parse(await host(H.jsxReadVideoTrack(TRACK)));
+			const tb = await hostJson(host, H.jsxReadVideoTrack(TRACK), "H.jsxReadVideoTrack(TRACK)");
 			const frameSec = Number(tb.timebase) / TPS;
 			// 첫째는 떨어져 있고(2초), 둘째(10초)와 셋째(12.5초)는 2.5초 간격: 둘째를 다시 놓으면 새 클립(약 5초)이 셋째 자리를 덮는다
 			const starts = [alignedSec(2, frameSec), alignedSec(10, frameSec), alignedSec(12.5, frameSec)];
@@ -122,7 +127,7 @@ module.exports = {
 			const cues = starts.map((st, i) => [st, Math.round((st + 2) * 1000) / 1000, CAP[i]]);
 			log("프레임 " + (1 / frameSec).toFixed(3) + "fps, 시작 " + starts.join(" / ") + "초");
 			const ids = await H.loadRowsWithPreset(api, "s1_11_native.srt", cues, P.id);
-			const items0 = JSON.parse(await host(JSX_PROJECT_ITEMS));
+			const items0 = await hostJson(host, JSX_PROJECT_ITEMS, "JSX_PROJECT_ITEMS");
 			const intact = (c, i, what) => {
 				assert.ok(Math.abs(c.s - cues[i][0]) < frameSec, what + " 시작 " + i + ": " + c.s + " (자막 " + cues[i][0] + ")");
 				assert.ok(Math.abs(c.e - cues[i][1]) < frameSec, what + " 끝 " + i + ": " + c.e + " (자막 " + cues[i][1] + ")");
@@ -133,10 +138,10 @@ module.exports = {
 			const st1 = await applyPlain(api);
 			let calls = await panel("window.__hostCalls.slice()");
 			assert.equal(calls.filter((c) => c === "updateClipAtTime" || c === "applyPreviewParams").length, 0, "Source Text에 쓰는 호출 없음: " + calls.join(","));
-			const c1 = JSON.parse(await host(jsxClips(TRACK)));
+			const c1 = await hostJson(host, jsxClips(TRACK), "jsxClips(TRACK)");
 			assert.equal(c1.length, 3, "클립 3개");
 			c1.forEach((c, i) => {
-				assert.equal(c.native, true, "네이티브 그래픽 클립 " + i);
+				assert.equal(c.isNative, true, "네이티브 그래픽 클립 " + i);
 				assert.equal(c.textComps, 2, "Text 컴포넌트 2개");
 				intact(c, i, "(1)");
 			});
@@ -153,7 +158,7 @@ module.exports = {
 				Object.keys(r.graphics).forEach((g) => assert.deepEqual(r.graphics[g].entries.map((e) => e.texts[0]), [CAP[i]], g + " Source Text"));
 				log("구운 사본 #" + (i + 1) + ": " + f + " (capsuleID " + r.def.capsuleID + ", prgraphic " + Object.keys(r.graphics).join("·") + ")");
 			});
-			const items1 = JSON.parse(await host(JSX_PROJECT_ITEMS));
+			const items1 = await hostJson(host, JSX_PROJECT_ITEMS, "JSX_PROJECT_ITEMS");
 			log("(1) " + st1.text + " — 프로젝트 항목 " + items0.total + " → " + items1.total + ", [MI] 항목 " + items0.mi.length + " → " + items1.mi.length +
 				(items1.mi.length ? " (" + items1.mi.slice(-3).map((x) => x.path).join(", ") + ")" : ""));
 			await exportFrames(api, "1_first", c1, CAP);
@@ -163,21 +168,21 @@ module.exports = {
 			await applyPlain(api);
 			calls = await panel("window.__hostCalls.slice()");
 			assert.equal(calls.filter((c) => c === "removeNativeClipsAt").length, 0, "지우지 않는다: " + calls.join(","));
-			const c2 = JSON.parse(await host(jsxClips(TRACK)));
+			const c2 = await hostJson(host, jsxClips(TRACK), "jsxClips(TRACK)");
 			assert.deepEqual(nodeIds(c2), nodeIds(c1), "클립 그대로 (nodeId)");
-			const items2 = JSON.parse(await host(JSX_PROJECT_ITEMS));
+			const items2 = await hostJson(host, JSX_PROJECT_ITEMS, "JSX_PROJECT_ITEMS");
 			assert.equal(items2.total, items1.total, "프로젝트 항목 수 그대로");
 			log("(2) 같은 문구 다시 ▶: 클립·항목 그대로");
 
 			// ── (3) 첫째 클립을 지우고 ▶: 같은 사본(같은 capsuleID) → 이미 가져온 항목을 다시 쓴다 ──
 			assert.equal(await host(jsxRemoveClip(TRACK, 0)), "ok");
 			await applyPlain(api);
-			const c3 = JSON.parse(await host(jsxClips(TRACK)));
+			const c3 = await hostJson(host, jsxClips(TRACK), "jsxClips(TRACK)");
 			assert.equal(c3.length, 3, "다시 놓았다");
 			assert.notEqual(c3[0].nodeId, c1[0].nodeId, "첫째는 새 클립");
 			assert.deepEqual(nodeIds(c3).slice(1), nodeIds(c1).slice(1), "둘째·셋째 그대로");
 			intact(c3[0], 0, "(3)");
-			const items3 = JSON.parse(await host(JSX_PROJECT_ITEMS));
+			const items3 = await hostJson(host, JSX_PROJECT_ITEMS, "JSX_PROJECT_ITEMS");
 			assert.equal(items3.total, items2.total, "같은 문구를 다시 놓아도 프로젝트 항목이 늘지 않는다 (capsule 재사용)");
 			s = await panel(SNAP);
 			assert.equal(s.rowStates[ids[0]].ap.nk, nk[0], "같은 사본");
@@ -191,13 +196,13 @@ module.exports = {
 			await applyPlain(api);
 			calls = await panel("window.__hostCalls.slice()");
 			assert.equal(calls.filter((c) => c === "removeNativeClipsAt").length, 1, "네이티브 클립 지우기 (트랙 하나에 한 번): " + calls.join(","));
-			const c4 = JSON.parse(await host(jsxClips(TRACK)));
+			const c4 = await hostJson(host, jsxClips(TRACK), "jsxClips(TRACK)");
 			assert.equal(c4.length, 3);
 			assert.equal(c4[0].nodeId, c3[0].nodeId, "첫째 그대로");
 			assert.notEqual(c4[1].nodeId, c3[1].nodeId, "둘째 교체");
 			assert.notEqual(c4[2].nodeId, c3[2].nodeId, "셋째는 연쇄로 다시 놓았다");
 			[1, 2].forEach((i) => intact(c4[i], i, "(4)"));
-			const items4 = JSON.parse(await host(JSX_PROJECT_ITEMS));
+			const items4 = await hostJson(host, JSX_PROJECT_ITEMS, "JSX_PROJECT_ITEMS");
 			assert.ok(items4.total - items3.total <= 1, "새 문구 하나에 항목은 많아야 하나 (셋째는 같은 capsule): " + items3.total + " → " + items4.total);
 			s = await panel(SNAP);
 			assert.notEqual(s.rowStates[ids[1]].ap.nk, nk[1], "둘째 새 사본");
@@ -211,11 +216,12 @@ module.exports = {
 			await panel(H.PAGE_RECORD_HOST_CALLS);
 			await panel(H.PAGE_CLEAR_STATUS);
 			await panel("document.querySelector('#row-" + Number(ids[0]) + " .btn-update').click(), true");
-			const st5 = await H.waitStatus(panel, /네이티브 클립|굽지 못|지우지 못|실패/, { timeoutMs: 120000 });
+			// '네이티브 클립 지우는 중…'(진행 중)이 아니라 끝난 상태를 기다린다
+			const st5 = await H.waitStatus(panel, /교체 완료|굽지 못|지우지 못|실패/, { timeoutMs: 120000 });
 			assert.equal(st5.text, "[1] 네이티브 클립 교체 완료", st5.text);
 			calls = await panel("window.__hostCalls.slice()");
 			assert.deepEqual(calls.filter((c) => /^(removeNativeClipsAt|applyToTimeline|updateClipAtTime)$/.test(c)), ["removeNativeClipsAt", "applyToTimeline"], calls.join(","));
-			const c5 = JSON.parse(await host(jsxClips(TRACK)));
+			const c5 = await hostJson(host, jsxClips(TRACK), "jsxClips(TRACK)");
 			assert.equal(c5.length, 3);
 			assert.notEqual(c5[0].nodeId, c4[0].nodeId, "첫째 교체");
 			assert.deepEqual(nodeIds(c5).slice(1), nodeIds(c4).slice(1), "둘째·셋째 그대로");
