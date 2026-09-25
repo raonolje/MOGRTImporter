@@ -441,9 +441,11 @@
 		// nextId를 내리고 mi 없이 저장한 경우). 줄·휴지통은 위에서 거른 배열로 본다 (파일의 타입이 틀려도 던지지 않게)
 		state.mi = _miForLoadedSession(r.data || null);
 		state.nextId = r.exists ? safeNextId({ nextId: sdata.nextId, subtitles: state.subtitles, trashBin: state.trashBin }, state.mi.hwm) : 1;
-		// 화자 칩 필터·배치 결과는 시퀀스마다 새로 (다른 시퀀스에서 고른 화자로 줄이 숨지 않게)
+		// 화자 칩 필터·배치 결과·트랙 수는 시퀀스마다 새로 (다른 시퀀스에서 고른 화자로 줄이 숨지 않게,
+		// 화자 표의 '새로 만듦' 미리보기가 다른 시퀀스의 트랙 수로 계산되지 않게)
 		_speakerFilter.clear();
 		_miRowStatus = {};
+		_miNumTracks = null;
 	}
 	function loadSessionFromStorage() {
 		try {
@@ -3422,7 +3424,8 @@
 		return [op.sf, op.sf + Math.max(op.ef - op.sf, op.D || 0)];
 	}
 	// 3단계(이동·교체) 순서: 작업 X의 범위가 다른 작업 Y가 떠날 자리(Y.src)와 겹치면 X는 Y 뒤에 (같은 트랙).
-	// 순환은 하나(시작이 가장 이른 것)를 '먼저 지우고 나중에 놓기'로 끊는다: 그 작업의 옛 클립은 1단계 제거, 새 클립은 4단계 배치
+	// 순환은 하나(시작이 가장 이른 것)를 '먼저 지우고 나중에 놓기'로 끊는다: 그 작업의 옛 클립은 1단계 제거, 새 클립은 4단계 배치.
+	// 새 클립은 템플릿 기본값에서 시작하므로 바뀐 속성만 보내는 이동(move)은 alt(다음 gen·속성 전부·새 태그·그 의도 해시)로 바꿔 놓는다
 	// → {ordered: [작업] (단계 순, 단계 안은 의존·시작 순), removals: [순환을 끊으며 생긴 제거]}
 	function orderOps(ops) {
 		const list = (ops || []).filter(Boolean);
@@ -3455,6 +3458,7 @@
 			x.phase = 4;
 			if (x.src) extraRemove.push({ uid: x.uid, id: x.id, track: x.src.track, nodeId: x.src.nodeId, expectName: x.src.name || null, g: x.src.g, why: "cycle" });
 			x.op = "place";
+			if (x.alt) Object.assign(x, x.alt);
 			x.own = null;
 			x.removeAfter = null;
 			breakers.push(x);
@@ -3495,19 +3499,35 @@
 			mogrtPath: op.m || "", durSec: op.durSec || 0, params: op.params || [], name: op.name === undefined ? null : op.name, guard, motion: null, removeAfter: op.removeAfter || null };
 		return item;
 	}
-	// 검증된 결과 → applied 항목 {g, m, ls, h, fh, rh, k, t, sf, ef, cef}. t·sf·ef는 줄이 원한 자리(제자리 갱신이어도), cef는 클립의 실제 끝
-	function appliedEntryOf(op, r) {
+	// 결과 → applied 항목 {g, m, ls, h, fh, rh, k, t, sf, ef, cef}. prev = 그 uid의 지난 applied 항목 (없으면 undefined)
+	//   t·sf·ef는 줄이 원한 자리(제자리 갱신이어도), cef는 클립의 실제 끝.
+	//   효과가 있어 옮기지 않은 제자리 갱신(op.stay)은 클립이 있는 자리를 적는다 → 다음 계획도 시간 변경을 보고 decorated로 둔다
+	//   partial(키프레임·옛 버전이라 못 쓴 속성, r.skipped·r.keyed = 이름): 못 쓴 속성의 fh를 빼고 h를 비운다
+	//     → 다음 계획이 그 속성을 다시 보내고(그대로로 보지 않는다) 줄의 병합 표시(mm)도 남는다
+	//   rh(Premiere에서 고침을 보는 기준)는 텍스트를 쓴 작업(새 클립, 텍스트 속성을 보냄)일 때만 되읽은 값으로 바꾼다.
+	//     텍스트를 쓰지 않은 작업(시간만 옮김·끝만·이름만·텍스트 아닌 속성)은 prev.rh를 그대로 둔다 — 고친 문장을 우리 것으로 받아들이지 않게
+	function appliedEntryOf(op, r, prev) {
+		const partial = !!r && r.status === "partial";
+		let fh = op.fhAll || {};
+		if (partial) {
+			const miss = {};
+			(r.skipped || []).concat(r.keyed || []).forEach((n) => { miss[String(n)] = true; });
+			fh = Object.assign({}, fh);
+			(op.params || []).forEach((p) => { if (p && typeof p.index === "number" && miss[String(p.displayName == null ? "" : p.displayName)]) delete fh[p.index]; });
+		}
+		const wroteText = opCreates(op) || (op.params || []).some((p) => p && p.type === "text");
+		const at = op.intent && !op.stay ? op.intent : { t: op.track, sf: op.sf, ef: op.ef };
 		return {
 			g: r && typeof r.g === "number" ? r.g : op.g,
 			m: op.m || "",
 			ls: clipLs(r && r.lay),
-			h: op.h,
-			fh: op.fhAll || {},
-			rh: textsHash((r && r.texts) || []),
+			h: partial ? "" : op.h,
+			fh,
+			rh: !wroteText && prev && typeof prev.rh === "string" ? prev.rh : textsHash((r && r.texts) || []),
 			k: (r && r.kind) || op.kind || "",
-			t: op.intent ? op.intent.t : op.track,
-			sf: op.intent ? op.intent.sf : op.sf,
-			ef: op.intent ? op.intent.ef : op.ef,
+			t: at.t,
+			sf: at.sf,
+			ef: at.ef,
 			cef: r && typeof r.ef === "number" ? r.ef : op.ef
 		};
 	}
@@ -3596,6 +3616,18 @@
 			const n = normText(t);
 			return !!n && x.caps.some((c) => n.indexOf(c) !== -1);
 		});
+		// 인식 후보의 증거 세기 (문장): 3 = 텍스트 값 하나가 줄 문장과 같다, 2 = 줄 문장을 담는다, 0 = 없다.
+		// (1은 문장 없이 마지막 적용 자리(ap)만 맞는 네이티브 후보 — 아래 cands)
+		const textEv = (d, x) => {
+			let ev = 0;
+			(d.texts || []).forEach((t) => {
+				const n = normText(t);
+				if (!n) return;
+				if (x.caps.indexOf(n) !== -1) ev = 3;
+				else if (ev < 2 && x.caps.some((c) => n.indexOf(c) !== -1)) ev = 2;
+			});
+			return ev;
+		};
 		const apAt = (x, c) => !!(x.rs.ap && typeof x.rs.ap.t === "number" && x.rs.ap.t === c.track && typeof x.rs.ap.s === "number" && Math.abs(frameOf(x.rs.ap.s, ft) - c.sf) <= 1);
 		const framesOf = (x) => [x.sf].concat(x.locF !== null && x.locF !== x.sf ? [x.locF] : []);
 		const nearF = (c, x) => framesOf(x).some((f) => Math.abs(c.sf - f) <= 1);
@@ -3621,8 +3653,7 @@
 		const rt = resolveTracks(mi.castOrder, cast, base, { spans, scan, salt, rowSpk, affinity });
 		plan.tracks = rt.tracks;
 		plan.blocked = rt.blocked;
-		plan.minCount = rt.minCount;
-		plan.tracksToAdd = rt.minCount > 0 && typeof scan.numVideoTracks === "number" ? rt.minCount - scan.numVideoTracks : 0;
+		// minCount·tracksToAdd·create는 작업을 다 정한 뒤 (아래): 이번에 쓰는 트랙까지만 만든다
 		const blocked = {};
 		rt.blocked.forEach((b) => b.keys.forEach((k) => { blocked[k] = b; }));
 		const ownIds = {};
@@ -3636,6 +3667,7 @@
 		};
 		const clipText = (c) => trackName(c.track) + " " + secOf(c.sf).toFixed(1) + "~" + secOf(c.ef).toFixed(1) + (c.name ? " " + c.name : "");
 		const ops = [];
+		const claims = []; // 우리 클립이 없는 줄의 인식 후보 {scored, finish} (아래에서 클립마다 한 줄에 나눈다)
 		infos.forEach((x) => {
 			const sub = x.sub;
 			const rs = x.rs;
@@ -3688,12 +3720,13 @@
 			const writes = (op) => opCreates(op) || (op.params || []).some((p) => p && p.type === "text");
 			const cur = x.cur;
 			if (!cur) {
-				// 우리 클립이 없다: 태그 없는 클립·다른 salt 태그 클립을 알아보고(같은 트랙·기본 트랙에 있던 옛 클립), 없으면 새로 놓는다
+				// 우리 클립이 없다: 태그 없는 클립·다른 salt 태그 클립을 알아보고(같은 트랙·기본 트랙에 있던 옛 클립), 없으면 새로 놓는다.
+				// 후보 클립 하나는 한 줄만 가진다 → 여기서는 후보를 모으고(claims), 모든 줄을 본 뒤 나눠 finish(pick)로 작업을 정한다
 				const g = ap && typeof ap.g === "number" ? ap.g + 1 : 1;
 				const cands = [];
 				idx.untagged.forEach((c) => { if ((c.track === T || c.track === legacyTrack) && nearF(c, x)) cands.push({ c, foreign: false }); });
 				idx.foreignMi.forEach((c) => { if ((c.track === T || c.track === legacyTrack) && nearF(c, x)) cands.push({ c, foreign: true }); });
-				let pick = null;
+				const scored = [];
 				let pending = false;
 				cands.forEach((k) => {
 					const d = detailOf(k.c);
@@ -3701,58 +3734,58 @@
 						pending = true;
 						return;
 					}
-					if (!d) return;
-					const kindOk = d.kind === wantKind(x);
-					const certain = kindOk && (textOk(d, x) || (x.native && !k.foreign && apAt(x, k.c)));
-					const uncertain = kindOk && !certain;
-					if (!certain && !uncertain) return;
-					const score = (certain ? 4 : 0) + (k.c.track === T ? 2 : 0) + (Math.abs(k.c.sf - x.sf) <= 1 ? 1 : 0);
-					if (!pick || score > pick.score) pick = Object.assign({ d, certain, score }, k);
+					if (!d || d.kind !== wantKind(x)) return;
+					// certain = 문장을 담는다 (네이티브는 문장을 읽을 수 없어 마지막 적용 자리 ap로), 아니면 uncertain (같은 자리, 문장이 다름)
+					const ev = textEv(d, x) || (x.native && !k.foreign && apAt(x, k.c) ? 1 : 0);
+					scored.push(Object.assign({ d, ev, certain: ev > 0, same: k.c.track === T, dsf: Math.abs(k.c.sf - x.sf) }, k));
 				});
 				if (pending) return skip(x, "pending");
-				const place = () => {
-					ops.push(Object.assign({}, baseOp, { op: "place", phase: 4, g, track: T, sf: x.sf, ef: x.ef, own: null, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: null }));
-				};
-				if (pick && pick.c.track === T) {
-					const c = pick.c;
-					const bucket = pick.foreign ? plan.foreignAdopt : plan.adopt;
-					if (pick.certain) bucket.certain++;
-					else bucket.uncertain++;
-					const allow = pick.foreign ? o.adoptForeign && pick.certain : pick.certain ? o.adopt : o.adoptUncertain;
-					if (!allow) return conflict(x, "occupied", clipText(c) + (pick.certain ? "" : " (문장이 다름)"));
-					ownIds[c.nodeId] = true;
-					const own = { track: c.track, sf: c.sf, nodeId: c.nodeId };
-					if (Math.abs(c.sf - x.sf) <= 1) {
-						// 제자리 인식: 이름(태그)·속성·끝
-						ops.push(Object.assign({}, baseOp, { op: "adopt", phase: x.ef < c.ef ? 2 : 5, g, track: T, sf: c.sf, ef: x.ef, keepTime: false, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
-							src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, intent: { t: T, sf: x.sf, ef: x.ef } }));
-					} else {
-						// 옛 자리(ap·mmPrev)에 있는 클립: 인식하면서 줄 시간으로 옮긴다 (TrackItem.move: 효과·키가 남는다)
-						ops.push(Object.assign({}, baseOp, { op: "move", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
-							src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, adopting: true }));
-					}
-					return;
-				}
-				if (pick && pick.certain) {
-					// 기본 트랙(legacyTrack)에 있던 옛 클립 (나눈 레거시 목록): 화자 트랙에 새로 놓고 옛 클립은 nodeId로 지운다
-					const c = pick.c;
-					const deco = decoratedOf(pick.d, preset);
-					if (o.moveLegacy && (!deco || o.moveDecorated)) {
-						plan.legacyMove++;
+				claims.push({ scored, finish: (pick) => {
+					const place = () => {
+						ops.push(Object.assign({}, baseOp, { op: "place", phase: 4, g, track: T, sf: x.sf, ef: x.ef, own: null, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: null }));
+					};
+					if (pick && pick.c.track === T) {
+						const c = pick.c;
+						const bucket = pick.foreign ? plan.foreignAdopt : plan.adopt;
+						if (pick.certain) bucket.certain++;
+						else bucket.uncertain++;
+						const allow = pick.foreign ? o.adoptForeign && pick.certain : pick.certain ? o.adopt : o.adoptUncertain;
+						if (!allow) return conflict(x, "occupied", clipText(c) + (pick.certain ? "" : pick.contested ? " (다른 줄도 이 자리 — 문장으로 가릴 수 없음)" : " (문장이 다름)"));
 						ownIds[c.nodeId] = true;
-						ops.push(Object.assign({}, baseOp, { op: "legacyMove", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own: null, removeAfter: { track: c.track, nodeId: c.nodeId },
-							params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name }));
+						const own = { track: c.track, sf: c.sf, nodeId: c.nodeId };
+						if (Math.abs(c.sf - x.sf) <= 1) {
+							// 제자리 인식: 이름(태그)·속성·끝
+							ops.push(Object.assign({}, baseOp, { op: "adopt", phase: x.ef < c.ef ? 2 : 5, g, track: T, sf: c.sf, ef: x.ef, keepTime: false, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
+								src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, intent: { t: T, sf: x.sf, ef: x.ef } }));
+						} else {
+							// 옛 자리(ap·mmPrev)에 있는 클립: 인식하면서 줄 시간으로 옮긴다 (TrackItem.move: 효과·키가 남는다)
+							ops.push(Object.assign({}, baseOp, { op: "move", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
+								src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, adopting: true }));
+						}
 						return;
 					}
-					if (deco) plan.legacyDecorated++;
-					plan.legacyKept.push(sub.id);
+					if (pick && pick.certain) {
+						// 기본 트랙(legacyTrack)에 있던 옛 클립 (나눈 레거시 목록): 화자 트랙에 새로 놓고 옛 클립은 nodeId로 지운다
+						const c = pick.c;
+						const deco = decoratedOf(pick.d, preset);
+						if (o.moveLegacy && (!deco || o.moveDecorated)) {
+							plan.legacyMove++;
+							ownIds[c.nodeId] = true;
+							ops.push(Object.assign({}, baseOp, { op: "legacyMove", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own: null, removeAfter: { track: c.track, nodeId: c.nodeId },
+								params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name }));
+							return;
+						}
+						if (deco) plan.legacyDecorated++;
+						plan.legacyKept.push(sub.id);
+						return place();
+					}
+					if (ap) {
+						plan.missing.push(sub.id);
+						if (!o.replaceMissing && !o.forceRegen[sub.id]) return skip(x, "missing");
+					}
 					return place();
-				}
-				if (ap) {
-					plan.missing.push(sub.id);
-					if (!o.replaceMissing && !o.forceRegen[sub.id]) return skip(x, "missing");
-				}
-				return place();
+				} });
+				return;
 			}
 			// 우리 클립이 있다
 			const same = cur.track === T && Math.abs(cur.sf - x.sf) <= 1;
@@ -3822,16 +3855,19 @@
 				ops.push(op);
 				return;
 			}
+			let stay = false;
 			if (retime) {
 				if (cur.track === T) {
+					// alt: 순환을 끊을 때(orderOps '먼저 지우고 새로 놓기')의 모양 — 새 클립은 템플릿 기본값이라 속성 전부, 다음 gen 태그
 					const op = Object.assign({}, baseOp, { op: "move", phase: 3, g: g0, track: T, sf: x.sf, ef: x.ef, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
-						params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src });
+						params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src, alt: { g: regenG, params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef) } });
 					if (guardEdited(op)) return;
 					ops.push(op);
 					return;
 				}
 				if (deco && !o.moveDecorated) {
 					plan.decorated.push(sub.id);
+					stay = true;
 				} else {
 					const op = Object.assign({}, baseOp, { op: "moveRegen", phase: 3, g: regenG, track: T, sf: x.sf, ef: x.ef, own: regenOwn, params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), src });
 					if (guardEdited(op)) return;
@@ -3841,12 +3877,34 @@
 			} else {
 				plan.userMoved.push(sub.id);
 			}
-			// 제자리 갱신 (사용자가 옮긴 클립, 또는 효과가 있어 옮기지 않는 클립): 속성·이름만, 시간은 그대로
+			// 제자리 갱신 (사용자가 옮긴 클립, 또는 효과가 있어 옮기지 않는 클립): 속성·이름만, 시간은 그대로.
+			// 효과가 있어 옮기지 않는 클립(stay)은 시간 변경이 아직 남은 줄이다: 결과는 검증된 적용으로 치지 않고(mm·'효과 있어 제자리' 남김,
+			// applied·ap는 클립이 있는 자리) 다음 계획도 decorated로 둔다(#pfMoveDecorated). 쓸 것(바뀐 속성·이름)이 없으면 보내지 않는다
+			const name = cur.name === nameOf(g0) ? null : nameOf(g0);
+			if (stay && !changed.length && name === null) return skip(x, "decorated", "효과·키프레임이 있는 클립 (옮기지 않음)");
 			const op = Object.assign({}, baseOp, { op: "update", phase: 2, g: g0, track: cur.track, sf: cur.sf, ef: cur.ef, keepTime: true, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
-				params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } });
+				params: changed, name, h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } }, stay ? { stay: true } : {});
 			if (guardEdited(op)) return;
 			ops.push(op);
 		});
+		// 인식 후보 나누기: 태그 없는·다른 salt 클립 하나는 한 줄만 가진다 (동시 발화 '네'·'네'가 한 클립을 두고 한 줄은 제자리 인식,
+		// 다른 줄은 옮기기(옛 클립 지움)를 하면 인식한 클립이 지워진다). 순서: 확실함 → 그 줄의 트랙에 있음 → 문장이 같음 > 문장을 담음 >
+		// 마지막 적용 자리만 같음(네이티브) → 시작이 가까움 → 목록 순. 진 줄은 다음 후보로, 없으면 새로 놓는다.
+		// 문장으로 가릴 수 없는 네이티브 후보(ap 자리만)를 다른 줄도 원하면 제자리 인식은 '확인 필요'(uncertain)로 둔다 (클립 문구를 다시 쓰지 않는다)
+		const pairs = [];
+		claims.forEach((cl, i) => cl.scored.forEach((k) => pairs.push({ i, k })));
+		pairs.sort((a, b) => (b.k.certain - a.k.certain) || (b.k.same - a.k.same) || (b.k.ev - a.k.ev) || (a.k.dsf - b.k.dsf) || (a.i - b.i));
+		const picks = claims.map(() => null);
+		const taken = {};
+		pairs.forEach((p) => {
+			const id = p.k.c.nodeId;
+			if (picks[p.i] || taken[id]) return;
+			let k = p.k;
+			if (k.ev === 1 && k.same && pairs.some((q) => q.i !== p.i && !picks[q.i] && q.k.c.nodeId === id && q.k.ev === 1)) k = Object.assign({}, k, { certain: false, contested: true });
+			picks[p.i] = k;
+			taken[id] = true;
+		});
+		claims.forEach((cl, i) => cl.finish(picks[i]));
 		// 목록 밖: 중단된 적용이 남긴 옛 gen, 목록에서 빠진 줄의 클립 (한 줄 적용에서는 보지 않는다)
 		const removals = [];
 		if (!o.single) {
@@ -3863,9 +3921,10 @@
 				const why = trashWhy[c.id];
 				const ap = applied[uid];
 				let pre = false;
-				if ((why === "merge" || why === "replace") && ap && ap.rh) {
+				// 고치지 않았는지는 AE 클립만 알 수 있다 (네이티브 Source Text는 늘 ""로 읽힌다) → 네이티브는 미리 체크하지 않는다
+				if ((why === "merge" || why === "replace") && ap && ap.rh && (ap.k || "ae") === "ae") {
 					const d = detailOf(c);
-					pre = !!d && textsHash(d.texts) === ap.rh;
+					pre = !!d && d.kind === "ae" && textsHash(d.texts) === ap.rh;
 				}
 				plan.orphans.push({ uid, id: c.id, track: c.track, nodeId: c.nodeId, name: c.name, g: c.g, pre, why: why === undefined ? null : why });
 				if (o.orphans === "all" || (o.orphans !== "none" && pre)) removals.push({ uid, id: c.id, track: c.track, nodeId: c.nodeId, expectName: c.name, g: c.g, why: "orphan" });
@@ -3968,6 +4027,14 @@
 		plan.ops = final;
 		plan.removals = allRemovals;
 		final.forEach((op) => { plan.rowOps[op.id] = op; });
+		// 새 트랙: 이번 작업이 쓰는 트랙까지만 만든다 (↑ 한 줄이나 줄이 없는 화자의 미리보기 트랙 때문에 만들지 않는다).
+		// 트랙은 뒤에 붙으므로 그 사이의 없는 트랙도 생긴다 → create = 지금 없고 minCount 안
+		const nt = typeof scan.numVideoTracks === "number" ? scan.numVideoTracks : null;
+		let needT = 0;
+		final.forEach((op) => { if (op.track + 1 > needT) needT = op.track + 1; });
+		plan.minCount = nt !== null && needT > nt ? needT : 0;
+		plan.tracksToAdd = plan.minCount > 0 ? plan.minCount - nt : 0;
+		Object.keys(rt.tracks).forEach((K) => { rt.tracks[K].create = nt !== null && rt.tracks[K].track >= nt && rt.tracks[K].track < plan.minCount; });
 		// 화자별 요약
 		(mi.castOrder || []).forEach((K) => {
 			if (!rt.tracks[K]) return;
@@ -10350,7 +10417,8 @@ var modalState = {
 	// _miApply(대상 줄, opts):
 	//   1) 호스트 확인 (_miHostOk: 실행마다 ping, v28·같은 빌드), 활성 시퀀스 = 패널 시퀀스. seqId를 한 번 잡아 모든 호출에 싣는다
 	//   2) 네이티브 줄 굽기(문구를 .mogrt 사본에, S1-11), AE 템플릿 길이(preset.mogrtDurSec, 없으면 definition.json)
-	//   3) getTracks: V1 뺀 비디오 트랙, 대상 줄 자리 ±30초 (+ 템플릿 길이). 시작·끝·nodeId·이름만 (S0-3 결정 12)
+	//   3) getTracks: 기본 트랙부터 위·화자 트랙·legacyTrack·줄이 마지막으로 놓인 트랙 (_miScanTracks), 대상 줄 자리 ±30초
+	//      (+ 템플릿 길이). 시작·끝·nodeId·이름만 (S0-3 결정 12). 우리 클립을 못 찾은 줄이 있으면 나머지 트랙도 한 번 더 읽는다
 	//   4) salt가 비었으면 복구 (태그 클립 표본의 80%가 줄 문장을 담을 때만, remapped면 하지 않는다), 못 하면 새로
 	//   5) core planPlacement → 되읽기가 필요한 클립(readClipTexts, 40개씩)을 읽고 다시 계획 (최대 4번)
 	//   6) 적용 전 점검 (#preflightModal): 볼 것이 있을 때만. 한 줄(↑)은 충돌·Premiere에서 고침·옛 버전·새 트랙일 때만.
@@ -10359,7 +10427,7 @@ var modalState = {
 	//   8) 제거(removeClips: 옛 gen·목록에서 빠진 줄의 클립) → 청크(placeChunk, 8개, 예산 7초: done이 보낸 수보다 적으면 나머지는 다음 청크로)
 	//      청크마다 last_apply를 다시 쓰고, 진행률·[중지](청크 사이)·20초 워치독. 이웃이 망가진 줄(damaged)은 다시 스캔해
 	//      줄 자리에 다시 놓는다 (분기 C, 최대 2번)
-	//   9) 결과 → mi.applied(clipLs·텍스트 해시), rs.ap (검증된 줄은 mm을 지운다. partial은 남긴다), 자동 화자 autoTrack, 프리셋 학습 필드,
+	//   9) 결과 → mi.applied(clipLs·텍스트 해시), rs.ap (검증된 줄은 mm을 지운다. partial·효과 있어 제자리는 남긴다), 자동 화자 autoTrack, 프리셋 학습 필드,
 	//      줄 표시(.sub-res), last_apply complete, 히스토리 '타임라인 적용 (n개)'
 	// 실행 중에는 _miBusy: 폴러·30초 MOGRT 재스캔·SRT 열기·▶·↑를 멈추고 #miBusy가 패널을 덮는다.
 	// 빈 응답·EvalScript error.·예외·seq-mismatch 같은 호스트 실패는 그 자리에서 멈춘다 ("중단됨 — 다시 적용하면 이어서 진행").
@@ -10473,6 +10541,27 @@ var modalState = {
 		ctx.saltRecovered = !!salt;
 		saveSessionToStorage();
 	}
+	// 스캔할 비디오 트랙 번호 (계획서 §6.7, S0-3 결정 12: 화자 트랙·기본 트랙·legacyTrack만):
+	//   기본 트랙부터 위 전부 (자동 화자가 비어 있는 트랙을 찾는다. 없는 번호는 호스트가 건너뛴다), 고정·기억한 화자 트랙,
+	//   legacyTrack, 대상 줄이 마지막으로 놓인 트랙(applied.t·ap.t). 기본 트랙 아래의 다른 트랙(V1 영상, B-roll)은 읽지 않는다
+	const MI_SCAN_TRACK_MAX = 99;
+	function _miScanTracks(subs, base) {
+		const want = {};
+		const add = (t) => { if (typeof t === "number" && t >= 0 && t < MI_SCAN_TRACK_MAX && t === Math.floor(t)) want[t] = true; };
+		for (let t = base; t < MI_SCAN_TRACK_MAX; t++) add(t);
+		(state.mi.castOrder || []).forEach((K) => {
+			const c = state.mi.cast[K];
+			if (c) { add(c.track); add(c.autoTrack); }
+		});
+		add(state.mi.legacyTrack);
+		(subs || []).forEach((s) => {
+			const ap = state.mi.salt ? state.mi.applied[state.mi.salt + "-" + s.id] : null;
+			if (ap) add(ap.t);
+			const rs = state.rowStates[s.id];
+			if (rs && rs.ap) add(rs.ap.t);
+		});
+		return Object.keys(want).map(Number).sort((a, b) => a - b);
+	}
 	// 줄들의 계획: 줄 입력(굽기·템플릿 길이, 줄마다 한 번) → 스캔 → (salt) → planPlacement ↔ 되읽기
 	async function _miPlanFor(subs, pf, ctx) {
 		const rowsIn = [];
@@ -10513,11 +10602,26 @@ var modalState = {
 			if (loc && loc.from !== "sub") see(frameOf(loc.s, ctx.ft), frameOf(loc.e, ctx.ft));
 		});
 		const pad = frameOf(SCAN_PAD_SEC + PLACE_DUR_FALLBACK * 2, ctx.ft);
+		const win = { fromFrame: Math.max(0, lo - pad), toFrame: hi + pad };
 		_miShowBusy("타임라인 읽는 중…");
-		const scan = await _miCallWatch(() => host.mi.getTracks({ seqId: ctx.seqId, tracks: null, fromFrame: Math.max(0, lo - pad), toFrame: hi + pad }));
+		const scan = await _miCallWatch(() => host.mi.getTracks(Object.assign({ seqId: ctx.seqId, tracks: _miScanTracks(subs, ctx.base) }, win)));
 		if (!scan || scan.ok !== true) throw _miHostFail("getTracks", scan);
 		_miNumTracks = scan.numVideoTracks;
 		if (!state.mi.salt) await _miEnsureSalt(scan, all, ctx);
+		// 마지막 적용(applied)이 있는데 읽은 트랙에 우리 클립이 없는 줄: 사용자가 기본 트랙 아래로 옮겼을 수 있다 → 나머지 트랙(V1 빼고)도 읽는다.
+		// 드물다 (지운 클립·다른 트랙으로 옮긴 클립). 못 찾으면 그 줄은 지운 클립(missing)으로 다시 놓는다
+		const idx0 = scanIndex(scan, state.mi.salt);
+		if (subs.some((s) => { const u = state.mi.salt + "-" + s.id; return !!state.mi.applied[u] && !idx0.own[u]; })) {
+			const seen = {};
+			(scan.tracks || []).forEach((t) => { seen[t.i] = true; });
+			const rest = [];
+			for (let t = 1; t < scan.numVideoTracks; t++) if (!seen[t]) rest.push(t);
+			if (rest.length) {
+				const more = await _miCallWatch(() => host.mi.getTracks(Object.assign({ seqId: ctx.seqId, tracks: rest }, win)));
+				if (!more || more.ok !== true) throw _miHostFail("getTracks", more);
+				scan.tracks = (scan.tracks || []).concat(more.tracks || []).sort((a, b) => a.i - b.i);
+			}
+		}
 		const trash = {};
 		(state.trashBin || []).forEach((t) => { if (t && t.sub) trash[t.sub.id] = t.why || ""; });
 		let plan = null;
@@ -10706,12 +10810,14 @@ var modalState = {
 		const st = String((r && r.status) || "");
 		const ok = !!PLACE_OK[st];
 		const partial = st === "partial";
+		// 효과가 있어 제자리에서 속성만 바꾼 줄 (op.stay): 시간 변경은 아직이다 → 검증된 적용으로 치지 않는다
+		const stay = !!op.stay;
 		const sub = ctx.byId[op.id] || null;
 		const rs = sub ? state.rowStates[sub.id] : null;
 		const preset = rs && rs.presetId ? state.presets[rs.presetId] || null : null;
 		ctx.spkDone[op.K] = (ctx.spkDone[op.K] || 0) + 1;
 		ctx.doneOps++;
-		_miRowStatus[op.id] = { st, why: (r && r.reason) || "", detail: (r && r.detail) || "" };
+		_miRowStatus[op.id] = { st: stay && ok ? "decorated" : st, why: (r && r.reason) || "", detail: (r && r.detail) || "" };
 		if (!ok && !partial) {
 			if (st === "conflict" || st === "locked" || st === "ambiguous") ctx.stats.conflict++;
 			else ctx.stats.failed++;
@@ -10723,12 +10829,16 @@ var modalState = {
 			if (opCreates(op)) ctx.created[op.uid] = String(r.nodeId);
 			ctx.nodeToUid[String(r.nodeId)] = op.uid;
 		}
-		state.mi.applied[op.uid] = appliedEntryOf(op, r);
+		state.mi.applied[op.uid] = appliedEntryOf(op, r, state.mi.applied[op.uid]);
 		const T = op.intent ? op.intent.t : op.track;
 		if (sub && rs) {
-			if (ok) markApplied(rs, sub, preset, T, op.nk);
-			else rs.ap = apRecord(sub, rs, preset, T, op.nk);
-			_setRowRes(op.id, partial ? "속성 " + ((r.skipped || []).length + (r.keyed || []).length) + "개 적용 안 됨" + ((r.keyed || []).length ? " (키프레임)" : " (옛 버전)") : null);
+			if (ok && !stay) markApplied(rs, sub, preset, T, op.nk);
+			else if (stay) {
+				// ap는 클립이 있는 자리 (applyLocate·시간 변경 판단이 그 자리를 본다), 병합 표시(mm)는 남긴다
+				const secOf = (f) => (f * ctx.ft) / TICKS_PER_SEC;
+				rs.ap = Object.assign(apRecord(sub, rs, preset, op.track, op.nk), { s: secOf(op.sf), e: secOf(op.ef) });
+			} else rs.ap = apRecord(sub, rs, preset, T, op.nk);
+			_setRowRes(op.id, partial ? "속성 " + ((r.skipped || []).length + (r.keyed || []).length) + "개 적용 안 됨" + ((r.keyed || []).length ? " (키프레임)" : " (옛 버전)") : stay ? MI_SKIP_TEXT.decorated : null);
 			_refreshRowMarks(sub);
 		}
 		if (opCreates(op) && preset && !isNativeList(preset.params)) _miLearn(preset, op, r, res, ctx);
@@ -10826,6 +10936,8 @@ var modalState = {
 		_miCancel = false;
 		let ctx = null;
 		let plan = null;
+		// ▶를 누른 때의 시퀀스: ping을 기다리는 동안 이미 떠난 폴러 호출이 패널을 다른 시퀀스로 옮겼으면 그 목록을 적용하지 않는다
+		const seqTok0 = _importSeqToken();
 		try {
 			const hk = await _miHostOk();
 			if (!hk.ok) {
@@ -10837,7 +10949,7 @@ var modalState = {
 				setStatus("프리뷰 시퀀스가 활성입니다 — 작업 시퀀스를 연 뒤 다시 적용하세요", "err");
 				return { ok: false, error: "preview-active" };
 			}
-			if (!ping.seqId || String(ping.seqId) !== String(state.currentSequenceId)) {
+			if (!ping.seqId || String(ping.seqId) !== String(state.currentSequenceId) || seqTok0 !== _importSeqToken()) {
 				setStatus("Premiere의 활성 시퀀스가 패널의 시퀀스와 다릅니다 — 패널이 따라간 뒤 다시 적용하세요", "err");
 				return { ok: false, error: "seq-mismatch" };
 			}
@@ -11183,6 +11295,8 @@ var modalState = {
 			} catch (_) {
 				return;
 			}
+			// 기다리는 동안 적용이 시작됐을 수 있다 (▶가 이 호출 뒤에 줄을 섰다) → 이 결과로 시퀀스를 옮기지 않는다
+			if (_miBusy) return;
 			try {
 				const newSeqId = info.seqId || "";
 				const newSeqName = info.seqName || "";

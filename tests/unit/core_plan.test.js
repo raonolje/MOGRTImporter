@@ -257,9 +257,21 @@ test("시간이 바뀐 줄: 같은 트랙이면 move(효과 유지), 다른 트�
 	p = planRead([moved], { scan, applied: { "ab12-1": e }, cast: castOf(["C1", "C2"], { C1: { track: 4 } }) }, () => det(["a", ""]));
 	assert.deepEqual(ops(p), [["moveRegen", 1, 4, 200, 260]]);
 	assert.deepEqual([p.ops[0].g, p.ops[0].name], [2, "철수 [MI:ab12-1.2]"]);
-	// 효과가 있으면 옮기지 않는다 → 제자리 갱신(keepTime), decorated 목록
-	p = planRead([moved], { scan, applied: { "ab12-1": e }, cast: castOf(["C1", "C2"], { C1: { track: 4 } }) }, () => det(["a", ""], { deco: { comps: 3, keyed: ["AE.ADBE Motion"] } }));
-	assert.deepEqual([ops(p)[0][0], p.ops[0].keepTime, plain(p.decorated)], ["update", true, [1]]);
+	// 효과가 있으면 옮기지 않는다 → decorated 목록. 쓸 것이 없으면 보내지 않고(건너뜀 '효과 있어 제자리'), 문장이 바뀌었으면 제자리 갱신(keepTime, stay)
+	const keyed = () => det(["a", ""], { deco: { comps: 3, keyed: ["AE.ADBE Motion"] } });
+	p = planRead([moved], { scan, applied: { "ab12-1": e }, cast: castOf(["C1", "C2"], { C1: { track: 4 } }) }, keyed);
+	assert.deepEqual([p.ops.length, plain(p.decorated), plain(p.rowOps[1]).skip], [0, [1], "decorated"]);
+	const movedT = row(1, "C1", 200, 260, "a 고침");
+	p = planRead([movedT], { scan, applied: { "ab12-1": e }, cast: castOf(["C1", "C2"], { C1: { track: 4 } }) }, keyed);
+	assert.deepEqual([ops(p)[0], p.ops[0].keepTime, p.ops[0].stay, plain(p.decorated)], [["update", 1, 2, 100, 160], true, true, [1]]);
+	assert.deepEqual(plain(p.ops[0].params).map((x) => x.index), [0]);
+	// 결과 applied는 클립이 있는 자리(V3 100~160)를 적는다 → 다음 계획도 시간 변경을 보고 decorated (다시 놓기를 고를 수 있다)
+	const e2 = plain(C.appliedEntryOf(plain(p.ops[0]), { status: "updated", g: 1, texts: ["a 고침", ""], kind: "ae", ef: 160 }, e));
+	assert.deepEqual([e2.t, e2.sf, e2.ef], [2, 100, 160]);
+	p = planRead([movedT], { scan, applied: { "ab12-1": e2 }, cast: castOf(["C1", "C2"], { C1: { track: 4 } }) }, () => det(["a 고침", ""], { deco: { comps: 3, keyed: ["AE.ADBE Motion"] } }));
+	assert.deepEqual([p.ops.length, plain(p.decorated), plain(p.rowOps[1]).skip, plain(p.userMoved)], [0, [1], "decorated", []]);
+	p = planRead([movedT], { scan, applied: { "ab12-1": e2 }, cast: castOf(["C1", "C2"], { C1: { track: 4 } }), opts: { moveDecorated: true } }, () => det(["a 고침", ""], { deco: { comps: 3, keyed: ["AE.ADBE Motion"] } }));
+	assert.deepEqual(ops(p), [["moveRegen", 1, 4, 200, 260]]);
 	// 줄은 그대로인데 클립이 다른 자리 (사용자가 옮김) → intent가 같으면 보내지 않는다, 되돌리기를 고르면 move
 	const scanU = scanOf(3, { 2: [clip(130, 190, "n1", tag("C1", 1, 1))] });
 	p = plan([r], { scan: scanU, applied: { "ab12-1": e } });
@@ -355,6 +367,88 @@ test("orderOps: 이동이 다른 이동의 옛 자리를 쓰면 그 뒤에, 순�
 	assert.deepEqual(plain(p.removals).map((x) => x.nodeId), ["n2"]);
 	assert.deepEqual(ops(p), [["move", 1, 2, 200, 300], ["place", 2, 2, 100, 200]]);
 	assert.deepEqual(plain(p.ops[1].guard), ["n1"], "옮긴 A가 B 템플릿 길이 창 안 → 이웃");
+	// 끊은 배치는 새 클립(템플릿 기본값)에 놓으므로 줄의 속성 전부와 다음 gen 태그를 싣는다 (바뀐 속성만 보내는 move 모양이 아니다)
+	const br = plain(p.ops[1]);
+	assert.deepEqual([br.g, br.name, br.params.length, br.params[0].value], [2, "철수 [MI:ab12-2.2]", 3, "b"]);
+	assert.equal(plain(p.ops[0]).params.length, 0, "옮기기만 하는 줄은 바뀐 속성 없음");
+	// 의도 해시도 새 gen·새 이름으로 (지운 클립을 다시 놓는 계획과 같다) → 다시 적용하면 그대로
+	const again = plan([row(2, "C1", 100, 200, "b")], { applied: { "ab12-2": e2 } });
+	assert.deepEqual([ops(again), again.ops[0].g], [[["place", 2, 2, 100, 200]], 2]);
+	assert.equal(br.h, again.ops[0].h);
+});
+
+test("인식 후보는 한 클립에 한 줄 (동시 발화): 같은 문장이면 그 트랙의 줄이 제자리 인식, 다른 줄은 새로 놓는다 — 옛 클립을 옮기며 지우지 않는다", () => {
+	const v27 = (text, ef) => scanOf(3, { 2: [clip(100, ef, "v1", "[라온올제] 자막")] });
+	// C1 '네'와 C2 '네'가 같은 자리: 태그 없는 클립 하나(V3 = C1 트랙 = legacyTrack)
+	let p = planRead([row(1, "C1", 100, 160, "네"), row(2, "C2", 100, 160, "네")], { scan: v27("네", 160), legacyTrack: 2 }, () => det(["네", ""]));
+	assert.deepEqual(ops(p), [["place", 2, 3, 100, 160], ["adopt", 1, 2, 100, 160]], "배치(4단계) → 끝이 같은 인식(5단계)");
+	assert.deepEqual([plain(p.conflicts), plain(p.removals), p.legacyMove, plain(p.adopt)], [[], [], 0, { certain: 1, uncertain: 0 }]);
+	// C1 '네' + C2 '네 맞아요' (v27이 같은 트랙에서 앞 줄을 덮어써 '네 맞아요' 클립만 남았다): C1이 제자리 인식하며 문장을 다시 쓰고, C2는 C2 트랙에 새로
+	p = planRead([row(1, "C1", 100, 160, "네"), row(2, "C2", 100, 180, "네 맞아요")], { scan: v27("네 맞아요", 180), legacyTrack: 2 }, () => det(["네 맞아요", ""]));
+	assert.deepEqual(ops(p), [["adopt", 1, 2, 100, 160], ["place", 2, 3, 100, 180]]);
+	assert.deepEqual([plain(p.conflicts), plain(p.removals), p.legacyMove], [[], [], 0]);
+	// 문장이 C2에만 맞으면 C2가 가져가 옮기고(옛 클립 지움), C1은 새로 놓는다
+	p = planRead([row(1, "C1", 100, 160, "네 맞아요"), row(2, "C2", 100, 160, "네")], { scan: v27("네", 160), legacyTrack: 2 }, () => det(["네", ""]));
+	assert.deepEqual(ops(p), [["legacyMove", 2, 3, 100, 160], ["place", 1, 2, 100, 160]]);
+	assert.deepEqual(plain(p.conflicts), []);
+	// 네이티브 (문장을 읽을 수 없다): 두 줄의 마지막 적용 자리(ap)가 같은 클립 → 그 트랙의 줄은 '확인 필요'(충돌), 다른 줄은 새로
+	const NP = PRESET({ id: "preset_n", mogrtPath: "C:/m/native.mogrt", params: [{ index: 0, type: "text", displayName: "텍스트 1", value: "", rawValue: "", nativeText: true }], exposedIndices: [0] });
+	const nrow = (id, spk, text) => row(id, spk, 100, 160, text, { preset: NP, baked: { path: "C:/cache/baked/" + id + ".mogrt", key: "k" + id, durSec: 5.005 }, rs: { ap: { s: sec(100), e: sec(160), cap: text, ps: "x", t: 2 } } });
+	const nscan = scanOf(3, { 2: [clip(100, 160, "g1", "Graphic")] });
+	const nread = () => det([""], { kind: "native", lay: { n: 1 }, pin: null });
+	p = planRead([nrow(1, "C1", "하나"), nrow(2, "C2", "둘")], { scan: nscan, legacyTrack: 2 }, nread);
+	assert.deepEqual(ops(p), [["place", 2, 3, 100, 160]]);
+	assert.deepEqual(plain(p.conflicts).map((c) => [c.id, c.why]), [[1, "occupied"]]);
+	assert.match(p.conflicts[0].detail, /문장으로 가릴 수 없음/);
+	assert.deepEqual([plain(p.adopt), plain(p.removals)], [{ certain: 0, uncertain: 1 }, []]);
+	// 한 줄만 원하면 그대로 인식
+	p = planRead([nrow(1, "C1", "하나")], { scan: nscan, legacyTrack: 2 }, nread);
+	assert.deepEqual(ops(p), [["adopt", 1, 2, 100, 160]]);
+});
+
+test("새 트랙은 이번 작업이 쓰는 트랙까지만: ↑ 한 줄이나 줄이 없는 화자의 트랙은 만들지 않는다 (자리 미리보기는 그대로)", () => {
+	const scan = scanOf(3, { 1: [], 2: [] });
+	let p = plan([row(1, "C1", 100, 160, "a")], { scan, opts: { single: true } });
+	assert.deepEqual([plain(p.tracks.C2), p.minCount, p.tracksToAdd, ops(p)], [{ track: 3, auto: true, create: false, locked: false }, 0, 0, [["place", 1, 2, 100, 160]]]);
+	// C2 줄이 있어도 건너뛰면(프리셋 없음) 만들지 않는다
+	const np = row(2, "C2", 300, 360, "b");
+	np.preset = null;
+	np.rs.presetId = "";
+	p = plan([row(1, "C1", 100, 160, "a"), np], { scan });
+	assert.deepEqual([p.minCount, p.tracks.C2.create], [0, false]);
+	// C3(V6)만 줄이 있으면 사이의 V5(C2)도 생긴다 → C2도 create
+	p = plan([row(3, "C3", 100, 160, "c")], { scan, cast: castOf(["C1", "C2", "C3"], { C3: { track: 5 } }), castOrder: ["C1", "C2", "C3"] });
+	assert.deepEqual([p.minCount, p.tracksToAdd, p.tracks.C2.create, p.tracks.C3.create, p.tracks.C1.create], [6, 3, true, true, false]);
+});
+
+test("목록에서 빠진 네이티브 클립은 미리 체크하지 않는다 (Source Text는 늘 \"\"로 읽혀 고쳤는지 알 수 없다)", () => {
+	const rows = [row(1, "C1", 100, 160, "a")];
+	const scan = scanOf(3, { 2: [clip(300, 360, "n7", tag("C1", 7, 1))] });
+	const e7 = { g: 1, m: "C:/cache/baked/x.mogrt", ls: "", h: "h", fh: {}, rh: C.textsHash(["", ""]), k: "native", t: 2, sf: 300, ef: 360, cef: 360 };
+	let p = planRead(rows, { scan, applied: { "ab12-7": e7 }, trash: { 7: "merge" } }, () => det(["", ""], { kind: "native", lay: { n: 2 }, pin: null }));
+	assert.deepEqual([plain(p.orphans).map((x) => [x.uid, x.pre]), plain(p.removals)], [[["ab12-7", false]], []]);
+	// AE는 그대로: 고치지 않았으면 미리 체크
+	const a7 = Object.assign({}, e7, { k: "ae", rh: C.textsHash(["옛 문장", ""]) });
+	p = planRead(rows, { scan, applied: { "ab12-7": a7 }, trash: { 7: "merge" } }, () => det(["옛 문장", ""]));
+	assert.deepEqual(plain(p.orphans).map((x) => x.pre), [true]);
+});
+
+test("appliedEntryOf: partial은 못 쓴 속성의 fh를 빼고 h를 비운다 → 다음 계획이 그 속성을 다시 보낸다. 텍스트를 쓰지 않은 작업은 rh를 그대로 둔다", () => {
+	const r = row(1, "C1", 100, 160, "새 문장");
+	const op = plain(plan([r]).ops[0]);
+	const e = plain(C.appliedEntryOf(op, { status: "partial", g: 1, texts: ["옛 문장", ""], kind: "ae", ef: 160, keyed: ["텍스트"], skipped: [] }));
+	assert.deepEqual([e.h, Object.keys(e.fh).sort()], ["", ["1", "2"]]);
+	const scan = scanOf(3, { 2: [clip(100, 160, "n1", tag("C1", 1, 1))] });
+	const p = planRead([r], { scan, applied: { "ab12-1": e } }, () => det(["옛 문장", ""]));
+	assert.deepEqual([ops(p), plain(p.none)], [[["update", 1, 2, 100, 160]], []]);
+	assert.deepEqual(plain(p.ops[0].params).map((x) => x.index), [0], "키프레임이라 못 쓴 캡션만 다시");
+	// 텍스트를 쓰지 않은 이동(바뀐 속성 없음): Premiere에서 고친 문장이 되읽혀도 rh는 지난 값 (다음에 '고침'으로 보인다)
+	const prev = { rh: C.textsHash(["우리가 쓴 문장", ""]) };
+	const mv = { op: "move", g: 1, m: "C:/m/a.mogrt", h: "h", fhAll: {}, kind: "ae", track: 2, sf: 110, ef: 170, params: [] };
+	assert.equal(C.appliedEntryOf(mv, { status: "moved", texts: ["편집자가 고친 문장", ""], kind: "ae" }, prev).rh, prev.rh);
+	assert.equal(C.appliedEntryOf(mv, { status: "moved", texts: ["편집자가 고친 문장", ""], kind: "ae" }).rh, C.textsHash(["편집자가 고친 문장", ""]), "지난 값이 없으면 되읽은 값");
+	const up = Object.assign({}, mv, { op: "update", params: [T(0, "텍스트", "새")] });
+	assert.equal(C.appliedEntryOf(up, { status: "updated", texts: ["새", ""], kind: "ae" }, prev).rh, C.textsHash(["새", ""]), "텍스트를 쓴 작업은 되읽은 값");
 });
 
 test("chunkOps·hostItemOf: 8개씩, 같은 청크에서 만들 클립을 이웃으로 가리키면 끊는다. 'new:uid' 이웃은 만든 nodeId로 푼다", () => {

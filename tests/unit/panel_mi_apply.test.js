@@ -498,3 +498,225 @@ test("plan·apply 명령: plan은 타임라인을 바꾸지 않고 요약, apply
 	assert.equal(r.data.busy, false);
 	noErrors(h);
 });
+
+// ── 리뷰 반영 (S2-3·S2-4) ──
+
+// 세션 파일을 바꾸고 다시 읽는다 (다른 시퀀스로 갔다가 돌아온다: 떠날 때 A를 저장한다)
+async function reloadWith(h, edit) {
+	h.host.seq = { seqId: "other", seqName: "T_OTHER", projPath: PROJ };
+	await h.advance(300);
+	const sess = h.fs.readJson(P.session(PROJ, A.seqId));
+	edit(sess);
+	h.fs.files.set(P.session(PROJ, A.seqId), JSON.stringify(sess));
+	h.host.seq = A;
+	await h.advance(300);
+}
+const srtB64 = (cues) => Buffer.from(cues.map(([sf, ef, t], i) => (i + 1) + "\n" + tc(sec(sf)).replace(".", ",") + " --> " + tc(sec(ef)).replace(".", ",") + "\n" + t + "\n").join("\n"), "utf8").toString("base64");
+const resText = (h, id) => { const el = h.$("row-" + id).querySelector(".sub-res"); return el ? el.textContent : null; };
+const withTexts = (sim, seq, ti) => sim.clips(seq, ti).map((m) => [Math.round(m.s / F), Math.round(m.e / F), m.name, textOf(sim, m)]);
+
+test("자리 바꾸기(순환): 끊은 줄은 속성 전부·다음 gen 태그로 새로 놓는다 → 문장·태그가 맞고, 다시 적용하면 그대로", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 6 });
+	const h = await boot(sim, preset, castSession(preset, [[1, "C1", 100, 200, "첫째 문장"], [2, "C1", 200, 300, "둘째 문장"]]));
+	await applyAll(h);
+	await reloadWith(h, (s) => {
+		const [a, b] = s.subtitles;
+		const t = [a.startSec, a.endSec, a.startTime, a.endTime];
+		[a.startSec, a.endSec, a.startTime, a.endTime] = [b.startSec, b.endSec, b.startTime, b.endTime];
+		[b.startSec, b.endSec, b.startTime, b.endTime] = t;
+		s.subtitles = [b, a];
+		s.rowStates[1].mm = "time";
+		s.rowStates[2].mm = "time";
+	});
+	await applyAll(h);
+	assert.match(h.status().text, /^화자별 배치: 놓음 1 · 옮김 1 · 지움 1$/);
+	assert.deepEqual(withTexts(sim, seq, 2), [[100, 200, "철수 [MI:ab12-2.2]", "둘째 문장"], [200, 300, "철수 [MI:ab12-1.1]", "첫째 문장"]]);
+	assert.deepEqual([h.snapshot().rowStates[1].mm, h.snapshot().rowStates[2].mm], [undefined, undefined]);
+	await applyAll(h);
+	assert.match(h.status().text, /^변경 없음 — 보낼 줄이 없습니다 \(2줄 그대로\)$/);
+	noErrors(h);
+});
+
+test("partial(키프레임이라 캡션을 못 씀)은 검증된 적용이 아니다: 다시 적용해도 그 속성을 다시 보내고 병합 표시·'속성 N개 적용 안 됨'이 남는다", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 6 });
+	const h = await boot(sim, preset, castSession(preset, [[1, "C1", 100, 200, "첫째 문장입니다"], [2, "C1", 300, 400, "둘째 문장입니다"]]));
+	await applyAll(h);
+	sim.prop(sim.clips(seq, 2)[0], "텍스트").keyed = true;
+	const r = await cmd(h, "mergeCommit", { files: [{ name: "C1.srt", b64: srtB64([[100, 200, "첫째 문장입니다 고침"], [300, 400, "둘째 문장입니다"]]) }] });
+	assert.equal(r.ok, true);
+	assert.equal(h.snapshot().rowStates[1].mm, "text");
+	await applyAll(h);
+	assert.match(h.status().text, /일부 속성 빠짐 1/);
+	assert.deepEqual([h.snapshot().rowStates[1].mm, resText(h, 1)], ["text", "속성 1개 적용 안 됨 (키프레임)"]);
+	const n = calls(h, "MI_placeChunk").length;
+	await applyAll(h);
+	assert.equal(calls(h, "MI_placeChunk").length, n + 1, "못 쓴 캡션을 다시 보낸다");
+	assert.match(h.status().text, /일부 속성 빠짐 1/);
+	assert.deepEqual([h.snapshot().rowStates[1].mm, resText(h, 1)], ["text", "속성 1개 적용 안 됨 (키프레임)"]);
+	assert.equal(textOf(sim, sim.clips(seq, 2)[0]), "첫째 문장입니다", "클립은 여전히 옛 문장");
+	// 키프레임을 풀면 다음 적용에서 쓰고 표시를 지운다
+	sim.prop(sim.clips(seq, 2)[0], "텍스트").keyed = false;
+	await applyAll(h);
+	assert.equal(textOf(sim, sim.clips(seq, 2)[0]), "첫째 문장입니다 고침");
+	assert.deepEqual([h.snapshot().rowStates[1].mm, resText(h, 1)], [undefined, null]);
+	noErrors(h);
+});
+
+test("Premiere에서 고친 클립을 시간만 옮겨도 rh는 우리가 쓴 값 그대로: 다음 캡션 변경은 '고친 클립'으로 건너뛴다", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 6 });
+	const h = await boot(sim, preset, castSession(preset, [[1, "C1", 100, 200, "첫째 문장입니다"], [2, "C1", 300, 400, "둘째 문장입니다"]]));
+	await applyAll(h);
+	const edited = "첫째 문장입니다 (편집자가 Premiere에서 고침)";
+	sim.prop(sim.clips(seq, 2)[0], "텍스트").value = aeTextValue(edited);
+	await cmd(h, "mergeCommit", { files: [{ name: "C1.srt", b64: srtB64([[110, 210, "첫째 문장입니다"], [300, 400, "둘째 문장입니다"]]) }] });
+	await applyAll(h);
+	assert.match(h.status().text, /^화자별 배치: 옮김 1/);
+	assert.deepEqual(withTexts(sim, seq, 2)[0], [110, 210, "철수 [MI:ab12-1.1]", edited]);
+	await cmd(h, "mergeCommit", { files: [{ name: "C1.srt", b64: srtB64([[110, 210, "첫째 문장입니다 새 버전"], [300, 400, "둘째 문장입니다"]]) }] });
+	h.$("btnApply").click();
+	await settle(h);
+	assert.equal(pfOpen(h), true, "고친 클립이 있어 점검 창");
+	assert.deepEqual(pfOpt(h, "pfOverwriteEdited"), { shown: true, checked: false, text: "Premiere에서 고친 클립 1개 덮어쓰기" });
+	h.$("pfOk").click();
+	await done(h);
+	assert.equal(textOf(sim, sim.clips(seq, 2)[0]), edited, "고친 문장은 그대로");
+	assert.equal(resText(h, 1), "Premiere에서 고침");
+	noErrors(h);
+});
+
+test("효과가 있어 옮기지 않은 클립은 시간 변경이 남는다: mm·'효과 있어 제자리'를 남기고, 다음에도 '효과 있는 클립도 다시 놓기'를 고를 수 있다", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 6 });
+	const h = await boot(sim, preset, castSession(preset, [[1, "C1", 100, 200, "첫째 문장입니다"], [2, "C1", 300, 400, "둘째 문장입니다"]]));
+	await applyAll(h);
+	sim.keyMotion(sim.clips(seq, 2)[0]);
+	await cmd(h, "mergeCommit", { files: [{ name: "C1.srt", b64: srtB64([[130, 230, "첫째 문장입니다 새"], [300, 400, "둘째 문장입니다"]]) }] });
+	await reloadWith(h, (s) => { s.mi.cast.C1.track = 4; }); // C1을 V5에 고정 → 다른 트랙으로 옮겨야 한다
+	assert.equal(h.snapshot().rowStates[1].mm, "both");
+	h.$("btnApply").click();
+	await settle(h);
+	assert.equal(pfOpen(h), true);
+	assert.ok(pfLines(h).indexOf("효과·키프레임이 있는 클립 1개는 자리를 옮기지 않음") !== -1, pfLines(h).join(" | "));
+	h.$("pfOk").click();
+	await done(h);
+	// 문장은 제자리에서 바꿨지만 시간은 아직: V3 100~200 그대로, 표시가 남는다
+	const m1 = sim.clips(seq, 2)[0];
+	assert.deepEqual([Math.round(m1.s / F), Math.round(m1.e / F), m1.name, textOf(sim, m1)], [100, 200, "철수 [MI:ab12-1.1]", "첫째 문장입니다 새"]);
+	let s = h.snapshot();
+	assert.deepEqual([s.rowStates[1].mm, resText(h, 1), s.rowStates[1].ap.t, Math.round(s.rowStates[1].ap.s / sec(1))], ["both", "효과 있어 제자리", 2, 100]);
+	assert.deepEqual([s.mi.applied["ab12-1"].t, s.mi.applied["ab12-1"].sf], [2, 100], "applied는 클립이 있는 자리");
+	// 다음 적용: 다시 효과 있는 클립으로 보인다 (사용자가 옮긴 클립이 아니다). 고르면 옮긴다
+	h.$("btnApply").click();
+	await settle(h);
+	assert.equal(pfOpen(h), true);
+	assert.deepEqual([pfOpt(h, "pfMoveDecorated").shown, pfOpt(h, "pfRestoreMoved").shown], [true, false]);
+	h.$("pfMoveDecorated").checked = true;
+	h.$("pfOk").click();
+	await done(h);
+	assert.equal(sim.clips(seq, 2).length, 0, "V3에서 떠났다");
+	assert.deepEqual(withTexts(sim, seq, 4).map((c) => c.slice(0, 3)), [[130, 230, "철수 [MI:ab12-1.2]"], [300, 400, "철수 [MI:ab12-2.2]"]]);
+	s = h.snapshot();
+	assert.deepEqual([s.rowStates[1].mm, resText(h, 1)], [undefined, null]);
+	noErrors(h);
+});
+
+test("동시 발화 두 줄이 옛 클립 하나를 두고: 한 줄만 가진다 (C1은 제자리 인식하며 문장을 다시 쓰고, C2는 C2 트랙에 새로) — 클립이 사라지지 않는다", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 4 });
+	const rows = [[1, "C1", 100, 160, "네"], [2, "C2", 100, 180, "네 맞아요"]];
+	const old = sim.place(seq, 2, MOGRT, 100, 180, null, { texts: ["네 맞아요"] }); // v27이 같은 트랙에서 앞 줄을 덮어썼다
+	const sess = castSession(preset, rows, { mi: { legacyTrack: 2 } });
+	rows.forEach(([id, , sf, ef, text]) => { sess.rowStates[id].ap = { s: sec(sf), e: sec(ef), cap: text, ps: "x", t: 2 }; });
+	const h = await boot(sim, preset, sess);
+	h.$("btnApply").click();
+	await settle(h);
+	assert.equal(pfOpen(h), true);
+	assert.deepEqual(pfOpt(h, "pfAdopt"), { shown: true, checked: true, text: "태그 없는 기존 클립 1개를 이 목록 클립으로 인식" });
+	assert.equal(pfOpt(h, "pfMoveLegacy").shown, false, "같은 클립을 옮기기로 또 세지 않는다");
+	h.$("pfOk").click();
+	await done(h);
+	assert.deepEqual(withTexts(sim, seq, 2), [[100, 160, "철수 [MI:ab12-1.1]", "네"]]);
+	assert.equal(sim.nodeId(sim.clips(seq, 2)[0]), sim.nodeId(old), "C1은 같은 클립");
+	assert.deepEqual(withTexts(sim, seq, 3), [[100, 180, "영희 [MI:ab12-2.1]", "네 맞아요"]]);
+	assert.equal(sim.all(seq), 2);
+	assert.match(h.status().text, /^화자별 배치: 놓음 1 · 인식 1/);
+	await applyAll(h);
+	assert.match(h.status().text, /^변경 없음 — 보낼 줄이 없습니다 \(2줄 그대로\)$/);
+	noErrors(h);
+});
+
+test("스캔은 기본 트랙부터 위·화자 트랙만 (기본 트랙 아래 B-roll은 읽지 않는다). 우리 클립을 못 찾은 줄이 있으면 나머지 트랙을 한 번 더 읽는다", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 6 });
+	sim.placeOther(seq, 1, 0, 3000, "B-roll.mp4");
+	const h = await boot(sim, preset, castSession(preset, [[1, "C1", 100, 160, "철수 하나"]]));
+	await applyAll(h);
+	const gt = calls(h, "MI_getTracks").map((c) => JSON.parse(c.args[0]).tracks);
+	assert.equal(gt.length, 1);
+	assert.deepEqual([gt[0][0], gt[0].indexOf(1), gt[0].indexOf(0), gt[0].indexOf(5)], [2, -1, -1, 3], "V3부터, V1·V2 없음");
+	// 사용자가 클립을 V2(기본 트랙 아래)로 옮겼다 → 첫 스캔에 없다 → V2도 읽어 찾는다 (다시 놓지 않는다)
+	const m = sim.clips(seq, 2)[0];
+	seq.tracks[2].clips.splice(seq.tracks[2].clips.indexOf(m), 1);
+	seq.tracks[1].clips.push(m);
+	m.track = seq.tracks[1];
+	await applyAll(h);
+	const gt2 = calls(h, "MI_getTracks").slice(1).map((c) => JSON.parse(c.args[0]).tracks);
+	assert.equal(gt2.length, 2);
+	assert.deepEqual(gt2[1], [1], "나머지 트랙 (V1 빼고)");
+	assert.match(h.status().text, /^변경 없음 — 보낼 줄이 없습니다 \(1줄 그대로\)$/);
+	assert.equal(sim.all(seq), 2, "다시 놓지 않았다 (B-roll + 옮긴 자막)");
+	noErrors(h);
+});
+
+test("적용을 누를 때 이미 떠난 폴러 호출이 늦게 돌아와도(CEP 호출은 차례대로) 다른 시퀀스로 옮겨 그 목록을 적용하지 않는다", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 6 });
+	const B = { seqId: "seq-apply-2", seqName: "T_APPLY_B", projPath: PROJ };
+	const seqB = sim.addSequence({ name: B.seqName, id: B.seqId, ft: F, tracks: 6 });
+	const h = await boot(sim, preset, castSession(preset, [[1, "C1", 100, 160, "A 하나"]]));
+	h.fs.files.set(P.session(PROJ, B.seqId), JSON.stringify(castSession(preset, [[1, "C1", 100, 160, "B 하나"], [2, "C1", 300, 360, "B 둘"]], { mi: { salt: "zz99" } })));
+	// 호스트 호출은 차례대로 (CEP evalScript) · 폴러 호출 하나를 붙잡는다
+	let release = null;
+	let armed = false;
+	const seqInfo = h.host.handlers.getActiveSequenceInfo;
+	h.host.handlers.getActiveSequenceInfo = (...a) => {
+		if (!armed) return seqInfo(...a);
+		armed = false;
+		return new Promise((resolve) => { release = () => resolve(seqInfo(...a)); });
+	};
+	let chain = Promise.resolve();
+	Object.keys(h.host.handlers).forEach((k) => {
+		const fn = h.host.handlers[k];
+		h.host.handlers[k] = (...a) => {
+			const p = chain.then(() => fn(...a));
+			chain = p.then(() => {}, () => {});
+			return p;
+		};
+	});
+	// Premiere에서 B로 바꿨다. 폴러가 그것을 묻는 호출을 보냈는데 아직 돌아오지 않았다
+	h.host.seq = B;
+	sim.setActive(seqB);
+	armed = true;
+	await h.advance(150);
+	assert.ok(release, "폴러가 물었다");
+	h.$("btnApply").click();
+	await h.flush();
+	release();
+	await done(h);
+	assert.match(h.status().text, /활성 시퀀스가 패널의 시퀀스와 다릅니다/);
+	assert.deepEqual([sim.all(seq), sim.all(seqB), calls(h, "MI_placeChunk").length], [0, 0, 0], "어느 시퀀스에도 놓지 않았다");
+	// 적용이 끝난 뒤 폴러는 B로 따라간다
+	await h.advance(300);
+	assert.equal(h.snapshot().subtitles.length, 2);
+	noErrors(h);
+});
+
+test("시퀀스를 바꾸면 트랙 수(_miNumTracks)를 잊는다: 화자 표의 '(새)'가 다른 시퀀스의 트랙 수로 나오지 않는다", async () => {
+	const { sim, preset } = makeSim({ tracks: 3 });
+	const h = await boot(sim, preset, castSession(preset, [[1, "C1", 100, 160, "A 하나"]]));
+	await applyAll(h);
+	assert.equal(h.$("castTrackSummary").textContent, "C1→V3 · C2→V4 (새)", "A는 트랙 3개");
+	const B = { seqId: "seq-apply-2", seqName: "T_APPLY_B", projPath: PROJ };
+	h.fs.files.set(P.session(PROJ, B.seqId), JSON.stringify(castSession(preset, [[1, "C1", 100, 160, "B 하나"], [2, "C2", 300, 360, "B 둘"]], { mi: { salt: "zz99" } })));
+	h.host.seq = B;
+	await h.advance(300);
+	assert.equal(h.snapshot().subtitles[0].text, "B 하나");
+	assert.equal(h.$("castTrackSummary").textContent, "C1→V3 · C2→V4", "B의 트랙 수는 아직 모른다");
+	noErrors(h);
+});
