@@ -4,6 +4,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { bootPanel, cachePaths: P } = require("../lib/panelHarness");
 const { build } = require("../fixtures/presets_synth");
+const { loadRegions } = require("../lib/loadRegions");
+
+const core = loadRegions(["src/mi/core.ts"]);
 
 const PROJ = "C:/work/rebase.prproj";
 const A = { seqId: "rbse-0001", seqName: "T_RB", projPath: PROJ };
@@ -198,5 +201,148 @@ test("프리셋 저장은 배치에서 배운 필드(mogrtItemName 등)를 MOGRT
 	saved = h.snapshot().presets.preset_3;
 	assert.equal(saved.mogrtPath, other.path);
 	assert.deepEqual([saved.mogrtItemName, saved.mogrtDurSec, saved.mogrtLs, saved.mogrtBaseComps], [undefined, undefined, undefined, undefined], "다른 MOGRT면 버린다");
+	noErrors(h);
+});
+
+// ── 리뷰 반영 (S1-9, S1-10) ──
+
+// 옛 8속성 preset_1 줄 (캡션 = text), extra로 rs를 덧붙인다
+function staleRowOf(STALE_1, text, extra) {
+	const all = clone(STALE_1);
+	setText(all[0], text);
+	return Object.assign({ presetId: "preset_1", params: all.filter((p) => p.type === "text"), _allParams: all, open: false, checked: false }, extra || {});
+}
+async function settle(h) {
+	for (let i = 0; i < 4; i++) await h.flush();
+}
+// ▶ → 확인창 [안전하게 적용]
+async function safeApply(h) {
+	h.$("btnApply").click();
+	await h.flush();
+	assert.equal(confirmOpen(h), true, "▶ 확인창");
+	h.$("confirmYes").click();
+	await settle(h);
+}
+// 옛 구조 클립(8속성)에 v27 index로 가면 틀린 속성에 들어가는 페이로드인가: 이름으로 쓸 수 있는 텍스트가 index로 간다
+const indexTexts = (params) => params.filter((p) => p.type === "text" && p.index !== -1).map((p) => [p.index, p.displayName]);
+
+test("리뷰: ap가 있는 옛 구조 줄을 맞춘 뒤 안전하게 적용해도 다음 ▶는 확인창을 띄우고 이름으로 쓴다 (클립은 여전히 옛 구조)", async () => {
+	const { presets, STALE_1 } = build();
+	const p1 = presets.preset_1;
+	const sess = { subtitles: [sub(1, 1, "옛 캡션")], rowStates: { 1: staleRowOf(STALE_1, "옛 캡션") }, trashBin: [], nextId: 2 };
+	const h = await boot({ preset_1: p1 }, sess);
+	h.host.handlers.updateClipAtTime = () => "SUCCESS: 클립 업데이트 완료";
+	await safeApply(h);
+	const oldSig = h.snapshot().rowStates[1].ap.ps;
+	assert.equal(oldSig, core.paramSig(STALE_1), "옛 구조 클립에 옛 구조로 썼다");
+	h.$("btnRebaseStale").click();
+	h.$("confirmYes").click();
+	await h.flush();
+	let rs = h.snapshot().rowStates[1];
+	assert.equal(rs._allParams.length, p1.params.length);
+	assert.equal(rs.psOld, oldSig, "ap가 있어도 psOld (= ap.ps)");
+	await safeApply(h);
+	rs = h.snapshot().rowStates[1];
+	assert.equal(rs.ap.ps, core.paramSig(p1.params), "제자리 갱신 뒤 ap.ps는 줄의 지금 서명");
+	assert.equal(rs.psOld, oldSig, "psOld는 남는다");
+	// 다음 ▶: 여전히 위험 → 확인창, [지금 방식으로 전체 적용]도 이름으로
+	h.host.calls.length = 0;
+	h.$("btnApply").click();
+	await h.flush();
+	assert.equal(confirmOpen(h), true, "다음 ▶도 확인창 (v27 index 페이로드를 바로 보내지 않는다)");
+	assert.match(h.$("confirmMessage").textContent, /^구조가 바뀐 줄 1개가 있습니다\./);
+	h.$("confirmAlt").click();
+	await settle(h);
+	const payload = h.host.calls.filter((c) => c.fn === "applyToTimeline").map((c) => JSON.parse(c.args[0]))[0];
+	assert.deepEqual(indexTexts(payload.subtitles[0].params), [], "텍스트는 모두 이름으로 (index 4 = 옛 클립의 '서브 포인트 텍스트'로 가지 않는다)");
+	noErrors(h);
+});
+
+test("리뷰: ↑ → 맞추기 → ↑ 뒤에도 ▶는 확인창, 프리셋 저장·다시 채우기로 구조가 바뀐 ap 줄도 psOld", async () => {
+	const { presets, STALE_1 } = build();
+	const p1 = presets.preset_1;
+	const oldSig = core.paramSig(STALE_1);
+	const ap = { s: 4, e: 5, cap: "셋째", ps: oldSig, t: 2 };
+	const sess = {
+		subtitles: [sub(1, 1, "옛 캡션"), sub(2, 2, "저장 줄"), sub(3, 4, "셋째")],
+		rowStates: {
+			1: staleRowOf(STALE_1, "옛 캡션"),
+			2: staleRowOf(STALE_1, "저장 줄", { ap: Object.assign({}, ap, { s: 2, e: 3, cap: "저장 줄" }) }),
+			// 노출 속성이 없는 옛 구조 줄 → renderAll이 프리셋에서 다시 채운다 (_ensureRowParams)
+			3: staleRowOf(STALE_1, "셋째", { params: [], ap })
+		},
+		trashBin: [],
+		nextId: 4
+	};
+	const h = await boot({ preset_1: p1 }, sess);
+	let s = h.snapshot();
+	assert.equal(s.rowStates[3]._allParams.length, p1.params.length, "다시 채움");
+	assert.equal(s.rowStates[3].psOld, oldSig, "다시 채우기: ap가 있어도 psOld");
+	h.host.handlers.updateClipAtTime = () => "SUCCESS: 클립 업데이트 완료";
+	const up = async (id) => {
+		h.$("row-" + id).querySelector(".btn-update").click();
+		await settle(h);
+	};
+	await up(1);
+	assert.equal(h.snapshot().rowStates[1].ap.ps, oldSig);
+	h.$("row-1").querySelector(".sub-struct").click();
+	h.$("confirmYes").click();
+	await h.flush();
+	await up(1);
+	s = h.snapshot();
+	assert.equal(s.rowStates[1].psOld, oldSig);
+	const sent = h.host.calls.filter((c) => c.fn === "updateClipAtTime").map((c) => JSON.parse(c.args[0]));
+	assert.deepEqual(indexTexts(sent[sent.length - 1].params), [], "맞춘 뒤 ↑도 이름으로");
+	// 프리셋 저장 (구조 맞춤): ap가 있는 줄 2
+	await openEdit(h);
+	h.$("btnSaveDefault").click();
+	h.$("confirmYes").click();
+	await h.flush();
+	s = h.snapshot();
+	assert.equal(s.rowStates[2]._allParams.length, p1.params.length);
+	assert.equal(s.rowStates[2].psOld, oldSig, "프리셋 저장: ap가 있어도 psOld");
+	await up(2);
+	assert.equal(h.snapshot().rowStates[2].psOld, oldSig);
+	h.$("btnApply").click();
+	await h.flush();
+	assert.equal(confirmOpen(h), true);
+	assert.match(h.$("confirmMessage").textContent, /^구조가 바뀐 줄 3개가 있습니다\./);
+	h.$("confirmNo").click();
+	noErrors(h);
+});
+
+test("리뷰: 'T'를 다른 필드로 옮겨 저장하면 옛 캡션 필드는 프리셋 값 (캡션 문장이 클립에 두 번 들어가지 않는다)", async () => {
+	const { presets } = build();
+	const p3 = presets.preset_3;
+	const sess = { subtitles: [sub(1, 1, "밴드 캡션")], rowStates: { 1: rowOf(p3, "밴드 캡션", setText, (all) => setText(pick(all, 2), "포인트 후반")) }, trashBin: [], nextId: 2 };
+	const h = await boot({ preset_3: p3 }, sess);
+	await openEdit(h);
+	const tBtns = h.$("defaultModalBody").querySelectorAll(".modal-text-target-btn");
+	assert.equal(tBtns.length, 2, "텍스트 필드마다 'T'");
+	tBtns[1].click(); // T2('포인트 텍스트')로
+	h.$("btnSaveDefault").click();
+	assert.match(h.$("confirmMessage").textContent, /자리를 찾지 못한 텍스트 1개/);
+	h.$("confirmYes").click();
+	await h.flush();
+	const s = h.snapshot();
+	assert.equal(s.presets.preset_3.textParamIndex, 2);
+	const all = s.rowStates[1]._allParams;
+	assert.equal(pick(all, 2).value, "밴드 캡션", "새 캡션 필드");
+	assert.equal(pick(all, 1).value, pick(p3.params, 1).value, "옛 캡션 필드는 프리셋 값 (v27처럼)");
+	assert.deepEqual(s.rowStates[1].orphanFields, [{ displayName: "포인트 텍스트", value: "포인트 후반" }]);
+	noErrors(h);
+});
+
+test("리뷰: 같은 경로의 MOGRT가 다른 구조로 바뀌어 저장하면 배운 필드(mogrtLs 등)를 버린다", async () => {
+	const { presets, STALE_1 } = build();
+	// 옛 8속성으로 저장된 프리셋 (배운 필드는 옛 버전의 것) → 같은 경로를 다시 읽으면 15속성
+	const p1 = Object.assign(clone(presets.preset_1), { params: clone(STALE_1), exposedIndices: [0, 2, 4], textParamIndex: 0, mogrtItemName: "옛 항목", mogrtDurSec: 5.005, mogrtLs: "0badc0de", mogrtBaseComps: 3 });
+	const h = await boot({ preset_1: p1 }, { subtitles: [], rowStates: {}, trashBin: [], nextId: 1 }, { params: { [p1.mogrtPath]: clone(presets.preset_1.params) } });
+	await openEdit(h);
+	h.$("btnSaveDefault").click();
+	const saved = h.snapshot().presets.preset_1;
+	assert.equal(saved.mogrtPath, p1.mogrtPath);
+	assert.equal(saved.params.length, presets.preset_1.params.length, "새 구조");
+	assert.deepEqual([saved.mogrtItemName, saved.mogrtDurSec, saved.mogrtLs, saved.mogrtBaseComps], [undefined, undefined, undefined, undefined], "구조가 바뀌면 다음 새 배치에서 다시 배운다");
 	noErrors(h);
 });

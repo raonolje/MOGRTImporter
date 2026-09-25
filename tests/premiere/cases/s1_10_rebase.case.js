@@ -7,7 +7,9 @@
  *   (2) 옛 구조 세션(옛 8속성 _allParams를 가진 줄, 작업 파일로 넣음)을 '옛 구조 줄 1개 맞추기'로 맞추면
  *       15속성·T1 캡션·T2·T3가 옮겨지고 psOld가 남으며 호스트 적용은 부르지 않는다 → 옛 구조 클립
  *       (tests/fixtures/mogrt/make_old_mogrt.js 사본을 importMGT)에 ▶ [안전하게 적용 (1)]
- *       → 캡션이 옛 클립의 '전체 텍스트'(idx 0)에, '서브 포인트 텍스트'(idx 4)에는 T3 값이 들어간다 (이름 쓰기)
+ *       → 캡션이 옛 클립의 '전체 텍스트'(idx 0)에, '서브 포인트 텍스트'(idx 4)에는 T3 값이 들어간다 (이름 쓰기).
+ *       텍스트가 아닌 속성('박스 색상' 등)은 이름으로 쓴 줄 값이어야 한다: 새 구조 클립(참조)을 따로 놓고 같은 줄 값을
+ *       v27 index로 써서(새 구조에서는 index가 맞다) 같은 이름의 값과 비교하고, 줄이 보내지 않은 속성은 그대로인지 본다
  *   (3) v1.1.7 배포는 선택이라 여기서 하지 않는다 (운영 설치·캐시는 건드리지 않는다)
  * 실행: npm run hard -- s1_10
  */
@@ -172,6 +174,33 @@ module.exports = {
 			s = await panel(SNAP);
 			assert.ok(s.rowStates[9101].psOld, "psOld는 남는다 (클립은 여전히 옛 구조)");
 			log("(2) 옛 구조 클립: " + after[0].props.filter((p) => /^T:/.test(p[1])).map((p) => p[0] + "=" + p[1].slice(2)).join(" · "));
+			// 텍스트가 아닌 속성: 참조 = 새 구조 클립을 10초에 놓고 같은 줄 값을 v27 updateClipAtTime으로 index 쓰기
+			// (패널과 같은 decodeURIComponent 감싸기). 이름 쓰기는 같은 이름의 속성에 같은 값을 남겨야 한다
+			const rowAll = s.rowStates[9101]._allParams;
+			assert.equal(await host(H.jsxPlaceMogrt(fx.newPath, TRACK, 10, 12)), "ok", "참조 클립 (새 구조)");
+			const refPayload = { videoTrackIndex: TRACK, startSec: 10, endSec: 12, mogrtPath: "", params: rowAll };
+			assert.equal(await host("updateClipAtTime(decodeURIComponent(" + JSON.stringify(encodeURIComponent(JSON.stringify(refPayload))) + "))"), "SUCCESS: 클립 업데이트 완료", "참조 클립에 index로");
+			const both = JSON.parse(await host(H.jsxTrackProps(TRACK)));
+			assert.equal(both.length, 2);
+			const oldClip = both.find((x) => x.nodeId === before[0].nodeId);
+			const ref = both.find((x) => x.nodeId !== before[0].nodeId);
+			assert.ok(oldClip && ref, "옛 클립과 참조 클립");
+			assert.deepEqual(oldClip.props, after[0].props, "참조를 놓아도 옛 클립은 그대로");
+			assert.equal(H.propValue(ref, CAP), "T:S110 옛 구조 캡션", "참조는 새 구조 (index 쓰기가 캡션 자리에 맞다)");
+			// 안전하게 적용이 이름으로 보낸 속성 (core namedParams: 이름이 줄에서 하나뿐이고 이름으로 쓰는 종류)
+			const NAMED = { text: 1, color: 1, number: 1, angle: 1, point: 1, dropdown: 1, boolean: 1 };
+			const nameCount = {};
+			rowAll.forEach((p) => { nameCount[p.displayName] = (nameCount[p.displayName] || 0) + 1; });
+			const sent = (name) => rowAll.some((p) => p.displayName === name && nameCount[name] === 1 && NAMED[p.type]);
+			const changed = [];
+			before[0].props.forEach((p, k) => {
+				if (/^T:/.test(p[1])) return; // 텍스트는 위에서 봤다
+				const got = after[0].props[k][1];
+				if (sent(p[0])) assert.equal(got, H.propValue(ref, p[0]), "'" + p[0] + "' = 줄 값 (이름으로, 새 구조 참조와 같은 값)");
+				else assert.equal(got, p[1], "'" + p[0] + "' 그대로 (보내지 않았다)");
+				if (got !== p[1]) changed.push(p[0] + " " + p[1] + " → " + got);
+			});
+			log("(2) 텍스트가 아닌 속성: " + (changed.length ? "줄 값으로 바뀜 " + changed.join(" · ") : "모두 그대로 (줄 값 = 옛 클립 값)"));
 		});
 	}
 };

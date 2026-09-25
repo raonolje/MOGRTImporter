@@ -93,18 +93,37 @@ test("legacySafeParams: 문장 줄은 캡션 하나(이름이 유일하면 index
 	assert.equal(core.legacySafeParams(rowOf(p8, ""), p8, true).params.length, p8.params.length, "캡션 없는 프리셋의 위험한 줄은 이름으로 전부");
 });
 
-test("legacyNeighbors·nearOtherRow: 같은 트랙에서 ap·mmPrev·지금 시간 ±0.5초, 휴지통 항목도 본다", () => {
+test("legacyNeighbors·nearOtherRow: ap·mmPrev·지금 시간 ±(0.5초 + 반 프레임), 휴지통 항목도 본다, 트랙은 ap.t로만 가른다", () => {
 	const subs = [sub(1, 10, 11, "a"), sub(2, 10.3, 11, "b"), sub(3, 20, 21, "c"), Object.assign(sub(4, 30, 31, "d"), { spk: "C1" })];
 	const rsOf = { 1: {}, 2: {}, 3: { ap: { s: 20, e: 21, t: 5 } }, 4: {} };
 	const trash = [{ sub: sub(9, 25.2, 26, "지운 줄"), state: { mmPrev: { s: 25.2, e: 26 } } }];
-	const nb = core.legacyNeighbors(subs, rsOf, trash, 2);
-	assert.deepEqual(plain(nb.map((o) => [o.id, o.track, o.at])), [[1, 2, [10]], [2, 2, [10.3]], [3, 5, [20, 20]], [9, 2, [25.2, 25.2]]], "화자 줄은 빼고 휴지통은 넣는다");
+	const nb = core.legacyNeighbors(subs, rsOf, trash);
+	assert.deepEqual(plain(nb.map((o) => [o.id, o.track, o.at])), [[1, null, [10]], [2, null, [10.3]], [3, 5, [20, 20]], [9, null, [25.2, 25.2]]], "화자 줄은 빼고 휴지통은 넣는다, ap가 없으면 트랙을 모른다");
 	assert.equal(core.nearOtherRow(1, 2, 10, nb), true, "0.3초 옆 줄");
 	assert.equal(core.nearOtherRow(3, 5, 20, nb), false, "자기 자신은 빼고");
 	assert.equal(core.nearOtherRow(7, 2, 20.2, nb), false, "다른 트랙(ap.t = 5)");
 	assert.equal(core.nearOtherRow(7, 5, 20.2, nb), true);
 	assert.equal(core.nearOtherRow(7, 2, 25, nb), true, "휴지통 항목의 클립도 남아 있다");
-	assert.equal(core.nearOtherRow(7, 2, 10.8, nb), false, "0.5초는 넘지 않는다 (10.3 → 0.5)");
+	assert.equal(core.nearOtherRow(7, 3, 10.2, nb), true, "트랙을 모르는 줄(ap 없음)은 어느 트랙에나 있을 수 있다");
+	assert.equal(core.nearOtherRow(7, 2, 10.83, nb), true, "0.5초를 조금 넘어도 반 프레임 안이면 가깝다 (10.3 → 0.53)");
+	assert.equal(core.nearOtherRow(7, 2, 10.86, nb), false, "10.3 → 0.56");
+});
+
+test("근처 줄 (리뷰): 23.976fps에서 SRT 0.51초 떨어진 줄의 클립은 프레임에 맞춰 0.49초 안에 놓인다 → 건너뛴다", () => {
+	const { presets } = build();
+	const p1 = presets.preset_1;
+	// A: v27이 놓은 줄 (ap 없음), 9.490초 → 클립은 228프레임 = 9.5095초. B: 10.000초, 문장이 바뀜
+	const subs = [sub(1, 9.49, 9.9, "가"), sub(2, 10, 12, "나 고침")];
+	const rsA = rowOf(p1, "가");
+	const rsB = Object.assign(rowOf(p1, "나 고침"), { mm: "text", mmPrev: { s: 10, e: 12, cap: "나" } });
+	assert.ok(Math.abs(core.frameOf(9.49, 10594584000) * 10594584000 / 254016000000 - 10) < 0.5, "합성 전제: A의 클립은 B에서 0.5초 안");
+	const plan = core.legacySafePlan([{ sub: subs[1], rs: rsB, preset: p1, track: 2 }], core.legacyNeighbors(subs, { 1: rsA, 2: rsB }, []));
+	assert.deepEqual(plain(plan.map((p) => [p.op, p.why])), [["skip", "near"]]);
+	// 트랙: B가 ap.t = 3(예전 적용), 지금 트랙 선택은 V3(2). v27이 V4(3)에 함께 놓은 A(ap 없음, 0.3초 앞)도 본다
+	const rsB2 = Object.assign(rowOf(p1, "나 고침"), { mm: "text", ap: { s: 1, e: 2, cap: "나", ps: core.paramSig(rsB._allParams), t: 3 } });
+	const subs2 = [sub(1, 0.7, 0.95, "가"), sub(2, 1, 2, "나 고침")];
+	const plan2 = core.legacySafePlan([{ sub: subs2[1], rs: rsB2, preset: p1, track: 3 }], core.legacyNeighbors(subs2, { 1: rowOf(p1, "가"), 2: rsB2 }, []));
+	assert.deepEqual(plain(plan2.map((p) => [p.op, p.why, p.track])), [["skip", "near", 3]]);
 });
 
 test("legacySafePlan: 문장 줄은 갱신(병합 전 자리), 새 줄·시간 변경·근처 줄은 건너뛴다", () => {

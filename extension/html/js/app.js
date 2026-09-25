@@ -2296,25 +2296,29 @@
 		if (pos < 0) return { skip: "no-caption" };
 		return { params: [named[pos]] };
 	}
+	// '근처 줄' 검사의 거리: updateClipAtTime은 프레임에 맞춰 놓인 클립 시작과 비교하므로 줄의 SRT 시간과
+	// 최대 반 프레임 다를 수 있다 → 0.5초에 반 프레임 여유(10fps 이상이면 0.05초 안)를 더한다
+	const LEGACY_NEAR_SEC = V27_NEAR_SEC + 0.05;
 	// 다른 줄의 클립이 있을 수 있는 자리 (안전 적용의 '근처 줄' 검사용).
 	// 살아 있는 줄과 휴지통 항목 모두 (목록에서 지워도 타임라인 클립은 남는다), 자리는 ap·mmPrev·지금 시간 전부.
-	// 트랙은 ap.t, 없으면 trackDefault → [{id, track, at: [초…]}]
-	function legacyNeighbors(subtitles, rowStates, trashBin, trackDefault) {
+	// 트랙은 ap.t. 없으면 null = 어느 트랙인지 모른다 (v27이 그때의 트랙 선택에 놓았다) → [{id, track, at: [초…]}]
+	function legacyNeighbors(subtitles, rowStates, trashBin) {
 		const one = (sub, rs) => {
 			const at = [];
 			[rs && rs.ap, rs && rs.mmPrev].forEach((x) => { if (x && typeof x.s === "number") at.push(x.s); });
 			if (typeof sub.startSec === "number") at.push(sub.startSec);
-			return { id: sub.id, track: rs && rs.ap && typeof rs.ap.t === "number" ? rs.ap.t : trackDefault, at };
+			return { id: sub.id, track: rs && rs.ap && typeof rs.ap.t === "number" ? rs.ap.t : null, at };
 		};
 		const out = [];
 		(subtitles || []).forEach((s) => { if (s && !s.spk) out.push(one(s, rowStates ? rowStates[s.id] : null)); });
 		(trashBin || []).forEach((t) => { if (t && t.sub && !t.sub.spk) out.push(one(t.sub, t.state)); });
 		return out;
 	}
-	// 같은 트랙에서 다른 줄의 자리가 sec ±0.5초 안에 있는가 (updateClipAtTime이 그 클립을 잡을 수 있다)
+	// 그 트랙에서 다른 줄의 자리가 sec ±LEGACY_NEAR_SEC 안에 있는가 (updateClipAtTime이 트랙 순서로 먼저 그 클립을 잡을 수 있다).
+	// 트랙을 모르는 줄(track null)은 어느 트랙에나 있을 수 있다고 본다 (ap.t로만 다른 트랙이라고 뺀다)
 	function nearOtherRow(id, track, sec, neighbors) {
-		return (neighbors || []).some((o) => o && o.id !== id && o.track === track &&
-			(o.at || []).some((t) => typeof t === "number" && Math.abs(t - sec) < V27_NEAR_SEC));
+		return (neighbors || []).some((o) => o && o.id !== id && (o.track === null || o.track === undefined || o.track === track) &&
+			(o.at || []).some((t) => typeof t === "number" && Math.abs(t - sec) < LEGACY_NEAR_SEC));
 	}
 	// 레거시 안전 적용 계획. rows: [{sub, rs, preset, track}] (목록 순서), neighbors: legacyNeighbors 결과
 	// → [{id, op: "update"|"skip", why, startSec, endSec, track, params}]
@@ -2365,7 +2369,7 @@
 	}
 	// 값으로 옮기지 않는 종류 (구조·설명)
 	const REBASE_SKIP_TYPES = { group: true, comment: true, textsetting: true };
-	// 배치에서 배우는 프리셋 선택 필드 (계획서 §2.3). 프리셋을 다시 저장해도 MOGRT가 같으면 가져간다
+	// 배치에서 배우는 프리셋 선택 필드 (계획서 §2.3). 프리셋을 다시 저장해도 MOGRT(경로·속성 구조)가 같으면 가져간다
 	const PRESET_LEARNED_FIELDS = ["mogrtItemName", "mogrtDurSec", "mogrtLs", "mogrtBaseComps"];
 	// 줄 속성 목록 rowAll → 프리셋의 지금 구조 (순수). → {params: 새 _allParams, orphanFields: [{displayName, value}]}
 	//   텍스트 필드: 프리셋의 T-ID마다 줄에서 같은 ID를 찾아(resolveFields: 서수+이름, 이름, 네이티브는 서수;
@@ -2373,7 +2377,10 @@
 	//     (프리셋에서 글꼴을 바꾸면 줄에도 간다). 줄에서 글꼴을 바꿀 수 있던 필드(노출 + 프리셋 exposedFontFields)는
 	//     줄의 rawValue를 그대로 쓴다.
 	//     캡션 필드(프리셋 'T')에는 opts.caption(지금 캡션 문장)이 있으면 그것을 쓴다 ('T'를 옮겼거나 이름이 바뀌어도).
-	//   텍스트가 아닌 노출 속성: 줄에서 고칠 수 있었던(opts.rowExposed, 없으면 모두) 같은 종류·같은 이름의 유일한 속성 값
+	//     'T'를 다른 필드로 옮겼으면(opts.oldCaptionFid: 저장 전 프리셋의 캡션 ID) 옛 캡션 필드의 캡션 문장은 그 자리에
+	//     남기지 않고 프리셋 값으로 둔다 (v27처럼. 캡션 문장은 'T' 필드에만 들어간다 — 결정 3)
+	//   텍스트가 아닌 노출 속성: 줄에서 고칠 수 있었던(opts.rowExposed, 없으면 모두) 같은 종류·같은 이름의 속성 값.
+	//     구조가 그대로면 같은 index의 것(이름이 겹쳐도), 아니면 그 이름이 줄에서 하나뿐일 때만 (겹치면 프리셋 값)
 	//   노출하지 않은 속성: 프리셋 값 (프리셋에서 바꾼 값이 줄에도 간다)
 	//   자리를 찾지 못한 줄 텍스트(비어 있지 않고, opts.oldParams의 같은 자리 기본값과 다른 것) → orphanFields
 	function rebaseRowParams(rowAll, preset, opts) {
@@ -2387,6 +2394,9 @@
 		const canEdit = (p) => !rowExp || rowExp.some((x) => x && x.index === p.index && x.type === p.type && (x.displayName || "") === (p.displayName || ""));
 		const caption = typeof o.caption === "string" ? o.caption : null;
 		const capFid = captionFid(preset);
+		// 'T'를 옮긴 저장: 줄에서 해석한 저장 전 캡션 필드 (저장 전 프리셋 구조 opts.oldParams로)
+		const oldCapFid = typeof o.oldCaptionFid === "string" ? o.oldCaptionFid : null;
+		const oldCap = caption !== null && oldCapFid && oldCapFid !== capFid ? resolveFid(row, oldCapFid, Array.isArray(o.oldParams) ? o.oldParams : pp) : null;
 		const used = {};
 		let res = resolveFields(row, pp);
 		const preT = textFields(pp);
@@ -2397,6 +2407,11 @@
 			const rp = r && r.param ? r.param : null;
 			const isCap = t.fid === capFid && caption !== null;
 			if (!rp && !isCap) return;
+			// 옛 캡션 필드가 캡션 문장을 가졌으면 옮긴 것으로 치고 프리셋 값으로 둔다 (문장은 새 'T' 필드로 갔다)
+			if (!isCap && oldCap && rp === oldCap.param && String(rp.value == null ? "" : rp.value) === caption) {
+				used[row.indexOf(rp)] = true;
+				return;
+			}
 			const text = isCap ? caption : String(rp.value == null ? "" : rp.value);
 			if (rp && (!isCap || String(rp.value == null ? "" : rp.value) === caption)) used[row.indexOf(rp)] = true;
 			if (rp && canEdit(rp) && Array.isArray(fontFields[t.index]) && fontFields[t.index].length > 0 && typeof rp.rawValue === "string") target.rawValue = rp.rawValue;
@@ -2407,11 +2422,16 @@
 			const k = row.findIndex((p, i) => p && p.type === "text" && !used[i] && String(p.value == null ? "" : p.value) === caption);
 			if (k !== -1) used[k] = true;
 		}
+		const sameLayout = !layoutMismatch(row, pp);
 		out.forEach((q) => {
 			if (!q || q.type === "text" || REBASE_SKIP_TYPES[q.type] || !q.displayName || exposed.indexOf(q.index) === -1) return;
-			const cands = row.filter((p) => p && p.type !== "text" && _paramKind(p) === _paramKind(q) && (p.displayName || "") === q.displayName);
-			if (cands.length !== 1 || !canEdit(cands[0])) return;
-			const rp = cands[0];
+			const like = (p) => p && p.type !== "text" && _paramKind(p) === _paramKind(q) && (p.displayName || "") === q.displayName;
+			let rp = sameLayout ? row.find((p) => like(p) && p.index === q.index) || null : null;
+			if (!rp) {
+				const cands = row.filter(like);
+				rp = cands.length === 1 ? cands[0] : null;
+			}
+			if (!rp || !canEdit(rp)) return;
 			q.value = rp.value;
 			if (rp.rawValue !== undefined) q.rawValue = rp.rawValue;
 			if (rp.colorHex !== undefined) q.colorHex = rp.colorHex;
@@ -2439,15 +2459,24 @@
 		});
 		return { list, added };
 	}
+	// 줄의 속성 구조가 oldSig → newSig로 바뀔 때(구조 맞춤·프리셋에서 다시 채우기) 그 줄의 클립은 옛 구조일 수 있다 → psOld.
+	// 이미 있으면 가장 오래된 것을 둔다. 적용 기록(ap)이 있으면 그 서명(ap.ps)을, 없으면 oldSig를 남긴다.
+	// ap가 있어도 남긴다: 제자리 갱신(안전하게 적용·↑·v27 ▶가 찾은 클립)은 클립 구조를 바꾸지 않는데
+	// markApplied는 ap.ps를 줄의 지금 서명으로 적는다. ap.ps 불일치만 믿으면 맞춘 뒤 한 번 적용하고 나서
+	// 위험 표시가 사라져 다음 ▶가 옛 구조 클립에 v27 index로 쓴다 (리뷰 S1-9·S1-10)
+	function keepPsOld(rs, oldSig, newSig) {
+		if (!rs || rs.psOld || oldSig === newSig) return;
+		rs.psOld = rs.ap && rs.ap.ps && rs.ap.ps !== newSig ? rs.ap.ps : oldSig;
+	}
 	// 줄을 구조 맞춤 결과로 바꾼다 (제자리). exposedIndices로 노출 목록을 다시 고르고(같은 객체), 못 옮긴 텍스트를 더한다.
-	// 적용 기록(ap)이 없고 서명이 바뀌면 이전 서명을 psOld로 남긴다 (이미 있으면 가장 오래된 것을 둔다) → 새로 더한 못 옮긴 텍스트 수
+	// 서명이 바뀌면 psOld를 남긴다 (keepPsOld) → 새로 더한 못 옮긴 텍스트 수
 	function applyRebase(rs, preset, result) {
 		const oldSig = paramSig(rs._allParams || []);
 		const newSig = paramSig(result.params);
 		const exposed = preset && Array.isArray(preset.exposedIndices) ? preset.exposedIndices : [];
 		rs._allParams = result.params;
 		rs.params = result.params.filter((p) => exposed.indexOf(p.index) !== -1);
-		if (!rs.ap && !rs.psOld && oldSig !== newSig) rs.psOld = oldSig;
+		keepPsOld(rs, oldSig, newSig);
 		const m = mergeOrphanFields(rs.orphanFields, result.orphanFields);
 		if (m.list.length) rs.orphanFields = m.list;
 		return m.added;
@@ -5635,8 +5664,12 @@ var modalState = {
 					exposedFontFields: JSON.parse(JSON.stringify(modalState.exposedFontFields)),
 					thumbnailData: _lastPreviewSrc || (state.presets[presetId]?.thumbnailData ?? null)
 				};
-				// 배치에서 배운 필드는 MOGRT가 그대로일 때만 가져간다 (v27은 이 필드를 모른다)
-				if (oldPreset && oldPreset.mogrtPath === mogrtPath) PRESET_LEARNED_FIELDS.forEach((k) => { if (oldPreset[k] !== undefined) next[k] = oldPreset[k]; });
+				// 배치에서 배운 필드는 MOGRT가 그대로일 때만 가져간다 (v27은 이 필드를 모른다).
+				// 경로가 같아도 속성 구조가 바뀌었으면(같은 파일을 다시 만든 MOGRT, 계획서 §0.5) 옛 버전의 값이라 버린다
+				// → 다음 새 배치에서 다시 배운다 (mogrtLs가 옛 버전을 가리키면 S2의 oldVersion 판정이 뒤집힌다)
+				if (oldPreset && oldPreset.mogrtPath === mogrtPath && paramSig(oldPreset.params) === paramSig(next.params)) {
+					PRESET_LEARNED_FIELDS.forEach((k) => { if (oldPreset[k] !== undefined) next[k] = oldPreset[k]; });
+				}
 				return next;
 			};
 			const rowsOf = () => usedBy.map((subId) => state.subtitles.find((s) => s.id === subId)).filter(Boolean);
@@ -5719,7 +5752,7 @@ var modalState = {
 	// _allParams가 프리셋 기본값으로 돌아가 후반 작업 값이 사라졌다.
 	// 예외: 노출 속성(params)이 빈 줄의 _allParams 구조가 프리셋과 다르면(그 사이 프리셋을 다른 구조의
 	// MOGRT로 다시 저장했다) v27처럼 프리셋에서 다시 채운다. 속성창이 없는 줄이라 잃을 패널 편집도 없다.
-	// 다만 그 줄의 클립은 옛 구조일 수 있으므로 다시 채우기 전 서명을 psOld로 남긴다(적용 기록 ap가 없을 때).
+	// 다만 그 줄의 클립은 옛 구조일 수 있으므로 psOld를 남긴다(keepPsOld: ap가 있으면 ap.ps, 없으면 다시 채우기 전 서명).
 	// psOld가 있는 줄은 v27에 위험한 줄(isV27Unsafe)이 되어 ▶·↑가 이름으로 쓴다 (S1-9)
 	function _ensureRowParams(sub, rs) {
 		if (!rs) return;
@@ -5729,7 +5762,7 @@ var modalState = {
 		const preset = rs.presetId ? state.presets[rs.presetId] : null;
 		const stale = !!(preset && hasAll && noExposed && layoutMismatch(rs._allParams, preset.params));
 		if (rs.presetId && noExposed && (!hasAll || stale)) {
-			if (stale && !rs.ap && !rs.psOld) rs.psOld = paramSig(rs._allParams);
+			if (stale) keepPsOld(rs, paramSig(rs._allParams), paramSig(preset.params));
 			loadParamsFromPreset(sub.id, rs.presetId, sub.text, rs.open !== false);
 			if (stale) _refreshRowMarks(sub); // makeRow가 단 '구조' 표시를 뗀다
 			if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
@@ -5962,13 +5995,13 @@ var modalState = {
 	// 사용자가 누를 때만 하고, 적용(▶·↑)은 부르지 않는다. 맞춘 줄의 클립은 옛 구조일 수 있어 psOld가 남고
 	// ▶·↑는 그 줄을 이름으로 쓴다 (S1-9).
 
-	// 줄 하나를 preset 구조로 맞춘다. oldPreset은 저장 전 프리셋(캡션 찾기·기본값 거르기, 없으면 preset).
+	// 줄 하나를 preset 구조로 맞춘다. oldPreset은 저장 전 프리셋(캡션 찾기·'T'를 옮겼는지·기본값 거르기, 없으면 preset).
 	// _allParams가 없는 줄은 맞출 것이 없다 → null (호출부가 v27처럼 프리셋에서 채운다).
 	// dry면 바꾸지 않고 {added: 새로 생길 못 옮긴 텍스트 수}만 → 아니면 {added}
 	function _rebaseRowTo(sub, rs, preset, oldPreset, dry) {
 		if (!rs || !preset || !rs._allParams || !rs._allParams.length) return null;
 		const cap = rowCaptionValue(rs, oldPreset || preset);
-		const result = rebaseRowParams(rs._allParams, preset, { rowExposed: rs.params || [], caption: cap !== null ? cap : sub.text, oldParams: oldPreset ? oldPreset.params : null });
+		const result = rebaseRowParams(rs._allParams, preset, { rowExposed: rs.params || [], caption: cap !== null ? cap : sub.text, oldParams: oldPreset ? oldPreset.params : null, oldCaptionFid: captionFid(oldPreset || preset) });
 		if (dry) return { added: mergeOrphanFields(rs.orphanFields, result.orphanFields).added };
 		const added = applyRebase(rs, preset, result);
 		if (!rs.params.length) rs.open = false;
@@ -7547,7 +7580,7 @@ var modalState = {
 	}
 	// ▶ 확인창: 바뀐 줄·구조가 바뀐 줄이 있을 때 (flagged = _legacyFlagged(targetSubs))
 	function _legacyApplyChoice(targetSubs, flagged) {
-		const neighbors = legacyNeighbors(state.subtitles, state.rowStates, state.trashBin, _trackValueNum());
+		const neighbors = legacyNeighbors(state.subtitles, state.rowStates, state.trashBin);
 		const plan = legacySafePlan(flagged, neighbors);
 		const count = (why) => plan.filter((p) => p.why === why).length;
 		const changed = flagged.filter((t) => t.rs.mm);
@@ -7590,7 +7623,7 @@ var modalState = {
 		const want = {};
 		(ids || []).forEach((id) => { want[id] = true; });
 		const targets = _legacyTargets(state.subtitles.filter((s) => want[s.id] && !s.spk));
-		const plan = legacySafePlan(targets, legacyNeighbors(state.subtitles, state.rowStates, state.trashBin, _trackValueNum()));
+		const plan = legacySafePlan(targets, legacyNeighbors(state.subtitles, state.rowStates, state.trashBin));
 		const byId = {};
 		targets.forEach((t) => { byId[t.sub.id] = t; });
 		const report = { updated: 0, missing: 0, failed: 0, skipped: {}, stopped: false, aborted: false };
