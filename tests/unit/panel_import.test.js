@@ -122,12 +122,29 @@ test("UTF-16 LE BOM·UTF-8 BOM: BOM 파일은 첫 자막을 잃지 않고, UTF-1
 	noErrors(h);
 });
 
-test("화자 줄이 없으면 ▶는 v27 그대로, 부팅 게이트 전에는 열지 않는다", async () => {
+test("부팅 게이트: 시퀀스 키가 정해지기 전에는 SRT를 열지 않는다", async () => {
 	const h = await bootPanel({ seq: null });
 	await h.advance(500);
 	await h.dropSrt("x.srt", GOLDEN);
 	assert.equal(h.snapshot().subtitles.length, 0);
 	assert.match(h.status().text, /시퀀스를 열면/);
+	noErrors(h);
+});
+
+test("플래그 켜짐이어도 화자 줄이 없는 목록의 ▶는 v27 그대로 (applyToTimeline 페이로드)", async () => {
+	const h = await boot();
+	h.win._mogrtDebug.setMiCast(true);
+	await h.dropSrt("golden_crlf.srt", GOLDEN);
+	assert.ok(snap(h).subtitles.every((x) => !x.spk));
+	setSel(h, h.$("trackSel"), "3");
+	const n = h.host.calls.length;
+	h.$("btnApply").click();
+	await h.flush();
+	const calls = h.host.calls.slice(n).filter((c) => c.fn === "applyToTimeline");
+	assert.equal(calls.length, 1, "v27 applyToTimeline 한 번");
+	const want = plain(core.parseSRT(GOLDEN)).map((c) => ({ mogrtPath: "", startSec: c.startSec, endSec: c.endSec, text: c.text, params: [] }));
+	assert.deepEqual(JSON.parse(calls[0].args[0]), { videoTrackIndex: 3, subtitles: want });
+	assert.notEqual(h.status().text, "화자별 배치는 개발 중입니다");
 	noErrors(h);
 });
 

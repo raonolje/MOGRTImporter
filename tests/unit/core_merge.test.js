@@ -123,6 +123,62 @@ test("matchCues: 전체가 +2초 밀리면(촘촘한 대화) 옆 문장이 아�
 	assert.equal(plain(core.matchCues(old, cuesOf(list))).shift, 0);
 });
 
+// 촘촘한 대화 10줄 (1.5초, 0.5초 간격), preset_3 + T2
+const DENSE = ["첫째 줄 인사말입니다", "둘째 줄은 날씨 이야기", "셋째 줄에서 질문을 하죠", "넷째 줄 대답입니다", "다섯째 줄 계속",
+	"여섯째 줄 이어서", "일곱째 줄 마무리", "여덟째 줄 박수", "아홉째 줄 감사", "열째 줄 끝"].map((t, i) => [i * 2, i * 2 + 1.5, t]);
+function denseData() {
+	const d = emptyData();
+	importNew(d, "C1", DENSE, "preset_3");
+	rowsOf(d, "C1").forEach((s, i) => withPreset(d.rowStates[s.id], P().preset_3, s.text, "T2값" + i));
+	return d;
+}
+
+test("matchCues: 중간 삽입으로 뒤쪽만 밀리면(전체 이동 60% 이상) 앞쪽의 고친 줄은 실제 시간으로 짝짓는다 (휴지통·새 줄이 되지 않는다)", () => {
+	const d = denseData();
+	const ids = rowsOf(d, "C1").map((s) => s.id);
+	// 둘째 줄 문장 고침, 다섯째 줄부터 +2초 (8초에 2초 끼워 넣음)
+	const edit = DENSE.map((x, i) => (i === 1 ? [x[0], x[1], "둘째 줄 하늘 얘기로 고침"] : i >= 4 ? [x[0] + 2, x[1] + 2, x[2]] : x));
+	const rep = merge(d, "C1", edit);
+	assert.equal(rep.shift, 2, "안내 줄의 전체 이동");
+	assert.deepEqual(rep.stats, { same: 3, text: 1, time: 6, both: 0, check: 0, new: 0, removed: 0, conflict: 0, point: 0, trashKept: 0, restored: 0 });
+	const r2 = d.subtitles.find((s) => s.id === ids[1]);
+	assert.equal(r2.text, "둘째 줄 하늘 얘기로 고침", "고친 줄은 id를 지킨다");
+	assert.equal(t2Of(d, ids[1]), "T2값1", "후반 작업 그대로");
+	assert.equal(d.rowStates[ids[1]].mm, "text");
+	assert.deepEqual(d.trashBin, []);
+	assert.deepEqual(rowsOf(d, "C1").map((s) => s.id), ids);
+});
+
+test("matchCues: 뒤쪽 일부(60% 미만)만 밀리고 그 자리에 새 문장이 들어와도, 밀린 줄은 옆 문장이 아니라 같은 문장과 짝짓는다", () => {
+	const list = Array.from({ length: 20 }, (_, i) => [i * 2, i * 2 + 1.9, "문장 " + "가나다라마바사아자차카타파하"[i % 14] + " 번호 " + i]);
+	const d = emptyData();
+	importNew(d, "C1", list, "preset_3");
+	rowsOf(d, "C1").forEach((s, i) => withPreset(d.rowStates[s.id], P().preset_3, s.text, "T2값" + i));
+	const ids = rowsOf(d, "C1").map((s) => s.id);
+	// 28초에 새 문장을 끼워 넣어 14번부터 +2초, 16번은 문장도 고침
+	const edit = list.slice(0, 14).concat([[28, 29.9, "끼워 넣은 새 문장입니다"]])
+		.concat(list.slice(14).map((x, k) => [x[0] + 2, x[1] + 2, k === 2 ? x[2] + " 고침" : x[2]]));
+	const old = list.map((x, i) => ({ s: x[0], e: x[1], text: x[2], srtNo: i + 1 }));
+	const m = plain(core.matchCues(old, cuesOf(edit)));
+	assert.equal(m.shift, 0, "전체 이동은 아니다 (안내 줄 없음)");
+	assert.deepEqual(m.oldPair, list.map((_, i) => (i < 14 ? i : i + 1)), "밀린 줄도 같은 문장끼리");
+	const rep = merge(d, "C1", edit);
+	assert.deepEqual([rep.stats.same, rep.stats.time, rep.stats.both, rep.stats.new, rep.stats.removed], [14, 5, 1, 1, 0]);
+	assert.equal(t2Of(d, ids[16]), "T2값16", "고친 밀린 줄도 후반 작업 그대로");
+	assert.equal(d.subtitles.find((s) => s.id === ids[16]).text, list[16][2] + " 고침");
+	assert.equal(d.rowStates[byText(d, "끼워 넣은 새 문장입니다").id].mm, "new");
+});
+
+test("matchCues: 겹치지 않는 같은 문장(짧은 추임새)보다 같은 시간에 겹치는 짝이 먼저", () => {
+	const old = [{ s: 5, e: 8, text: "앞 문장입니다", srtNo: 1 }, { s: 10, e: 10.8, text: "네", srtNo: 2 }, { s: 14, e: 16, text: "뒤 문장입니다", srtNo: 3 }];
+	const nw = cuesOf([[5, 8, "앞 문장입니다"], [10, 10.8, "네에"], [11.0, 11.5, "네"], [14, 16, "뒤 문장입니다"]]);
+	const m = plain(core.matchCues(old, nw));
+	assert.deepEqual(m.oldPair, [0, 1, 3], "'네'(10초)는 같은 시간의 '네에'와");
+	const plan = plain(core.buildMergePlan("C1", old.map((o, i) => ({ id: i + 1, s: o.s, e: o.e, text: o.text, srtNo: o.srtNo, cap: null, others: [] })), [], nw, {}));
+	assert.deepEqual(plan.rows.map((r) => [r.id, r.cue, r.cls]), [[1, 0, "same"], [2, 1, "text"], [3, 3, "same"]]);
+	assert.deepEqual(plan.added, [2]);
+});
+
 // ── 병합 표 ──
 
 test("병합 표: 같음·문장·시간·둘 다·나눔(check, 첫 조각이 id·T2를 가진다)·새 줄·빠짐, 포인트 경고, 통계", () => {
@@ -179,7 +235,9 @@ test("병합 표: 같음·문장·시간·둘 다·나눔(check, 첫 조각이 i
 	const c1 = rowsOf(d, "C1");
 	assert.deepEqual(c1.map((s) => s.index), [1, 2, 3, 4, 5, 6, 7, 8]);
 	for (let i = 1; i < c1.length; i++) assert.ok(c1[i - 1].startSec <= c1[i].startSec);
-	assert.ok(c1.every((s, i) => s.srtNo === i + 1 || s.text === "안녕하세요 첫 번째 질문입니다" || s.text === "마지막 인사입니다" || true));
+	// srtNo: 짝지은 줄(같음 포함)과 새 줄 모두 새 파일의 번호 (새 파일 8개가 시간순이라 1..8)
+	assert.deepEqual(c1.map((s) => s.srtNo), [1, 2, 3, 4, 5, 6, 7, 8]);
+	assert.equal(d.subtitles.find((s) => s.id === ids[4]).srtNo, 4, "나눔 첫 조각: 옛 5번 → 새 4번");
 });
 
 test("같은 파일을 다시 병합하면 아무것도 바뀌지 않는다 (merge(merge(x)) == merge(x))", () => {
@@ -464,6 +522,33 @@ test("분배: 확인 필요 줄을 휴지통으로 고르면 휴지통(why merge
 	assert.equal(x.d.trashBin.filter((t) => t.why === "replace").length, 61);
 	assert.deepEqual(rep2.files.map((f) => f.action), ["new"]);
 	assert.equal(rowsOf(x.d, "C1").length, 31);
+});
+
+test("분배: 가져올 파일의 키가 아닌 oneKey·확인 필요 선택은 기본값으로 (화자 표에 없는 spk를 만들지 않는다), 확인 필요 줄의 to", () => {
+	const noOrphan = (d) => d.subtitles.concat(d.trashBin.map((t) => t.sub)).every((s) => !s.spk || !!d.mi.cast[s.spk]);
+	// '모두 한 화자로' + 가져오지 않는 C7 → 첫 파일(C1)
+	let x = legacyMix(false);
+	let rep = plain(core.importIntoData(x.d, { files: [{ key: "C1", action: "new", cues: cuesOf(x.f1) }], legacy: { mode: "one", oneKey: "C7" } }, { now: 5, presets: P() }));
+	assert.deepEqual(Object.keys(rep.legacy.counts), ["C1"]);
+	assert.ok(noOrphan(x.d), "C7 줄이 없다");
+	// 확인 필요 줄에 가져오지 않는 C2를 골랐다 (창에서 C2 파일의 키를 C3으로 바꾼 뒤 남은 값) → 최고 화자
+	x = legacyMix(false);
+	const laugh = x.d.subtitles.find((s) => s.text === "(웃음)").id;
+	rep = plain(core.importIntoData(x.d, { files: [{ key: "C1", action: "new", cues: cuesOf(x.f1) }, { key: "C3", action: "new", cues: cuesOf(x.f2) }], legacy: { mode: "split", assign: { [laugh]: "C2" } } }, { now: 5, presets: P() }));
+	assert.equal(rep.legacy.ambiguous.length, 1);
+	assert.equal(rep.legacy.ambiguous[0].to, rep.legacy.ambiguous[0].key, "기본값 = 최고 화자");
+	assert.ok(noOrphan(x.d), "C2 줄이 없다");
+	assert.deepEqual(x.d.mi.castOrder, ["C1", "C3"]);
+	// 고른 값이 가져올 키면 그대로, ""는 휴지통
+	x = legacyMix(false);
+	rep = plain(core.importIntoData(x.d, { files: [{ key: "C1", action: "new", cues: cuesOf(x.f1) }, { key: "C2", action: "new", cues: cuesOf(x.f2) }], legacy: { mode: "split", assign: { [laugh]: "C2" } } }, { now: 5, presets: P() }));
+	assert.equal(rep.legacy.ambiguous[0].to, "C2");
+	assert.equal(x.d.subtitles.find((s) => s.id === laugh).spk, "C2");
+	// 모르는 mode는 split
+	x = legacyMix(false);
+	rep = plain(core.importIntoData(x.d, { files: [{ key: "C1", action: "new", cues: cuesOf(x.f1) }, { key: "C2", action: "new", cues: cuesOf(x.f2) }], legacy: { mode: "bogus" } }, { now: 5, presets: P() }));
+	assert.equal(rep.legacy.mode, "split");
+	assert.ok(noOrphan(x.d));
 });
 
 // ── 속성 기반 (고정 씨앗 1000개) ──

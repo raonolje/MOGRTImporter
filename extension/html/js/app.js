@@ -1452,11 +1452,14 @@
 	const MATCH_SIM_ALLOW = 0.9;
 	// 문장이 바뀐 짝의 유사도가 이 밑이면 나누기·합치기로 의심 (check)
 	const MERGE_CHECK_SIM = 0.5;
-	// 짝 고르기(DP) 가중치. 점수(채택·분류)는 그대로 두고 고르는 순서만 정한다:
-	//   고정 짝은 사실상 반드시, 정규화 문장이 똑같은 짝은 시간이 밀렸어도 옆 자막과 겹치는 짝보다 먼저
-	//   (촘촘한 대화에서 몇 초 밀리면 겹침 점수가 옆 문장과 짝지어 후반 작업이 다른 문장에 붙는다)
+	// 짝 고르기(DP) 가중치. 점수(채택·분류)는 그대로 두고 고르는 순서만 정한다: 고정 짝은 사실상 반드시.
+	// 이동 가설로만 고정되는 짝은 실제 시간 고정보다 조금 뒤 (같은 문장이 둘일 때 실제 시간 쪽)
 	const MATCH_ANCHOR_W = 10000;
-	const MATCH_SAME_TEXT_W = 1;
+	const MATCH_SHIFT_ANCHOR_LESS = 0.01;
+	// 시간 이동 가설: 문장이 같은 짝 3개 이상이 같은 값(±1프레임)만큼 밀렸으면 그 값. 많이 모인 순서로 최대 3개
+	// (중간에 끼워 넣은 편집으로 뒤쪽만 밀린 경우. 촘촘한 대화에서 밀린 줄이 옆 문장과 짝지어 후반 작업이 다른 문장에 붙지 않게)
+	const MATCH_SHIFT_MIN = 3;
+	const MATCH_SHIFTS_MAX = 3;
 	// 전체 시간 이동 판정의 1프레임 (23.976 기준, 초)
 	const SHIFT_FRAME_SEC = 1001 / 24000;
 	// 분배(distributeLegacy): 배정 점수, 2위와의 차이, '확인 필요' 하한
@@ -1528,9 +1531,8 @@
 		if (lo > 0 && Math.abs(sorted[lo - 1] - v) <= Math.abs(sorted[lo] - v)) return lo - 1;
 		return lo;
 	}
-	// 전체 시간 이동: 문장이 같은 새 자막(시작이 가장 가까운 것)과의 시작 차이 중 60% 이상이 같은 값(±1프레임)이고
-	// 그 값이 2프레임 이상이면 그 값(초), 아니면 0. 문장이 같은 짝이 3개 미만이거나 옛 줄의 30% 미만이면 0
-	function _matchShift(A, B, byText, bi) {
+	// 문장이 같은 새 자막(시작이 가장 가까운 것)과의 시작 차이 (옛 줄마다 하나, 오름차순)
+	function _matchDeltas(A, B, byText, bi) {
 		const d = [];
 		A.forEach((a) => {
 			const list = byText[a.t];
@@ -1542,28 +1544,51 @@
 			});
 			d.push(best);
 		});
-		if (d.length < 3 || d.length < 0.3 * A.length) return 0;
-		d.sort((x, y) => x - y);
-		let bestN = 0;
-		let bestLo = 0;
+		return d.sort((x, y) => x - y);
+	}
+	// 오름차순 d에서 ±1프레임 안에 가장 많이 모인 구간 → {lo, n, mid: 가운데 값}
+	function _deltaCluster(d) {
+		let n = 0;
+		let lo = 0;
 		let j = 0;
 		for (let i = 0; i < d.length; i++) {
 			while (d[i] - d[j] > 2 * SHIFT_FRAME_SEC + 1e-9) j++;
-			if (i - j + 1 > bestN) {
-				bestN = i - j + 1;
-				bestLo = j;
+			if (i - j + 1 > n) {
+				n = i - j + 1;
+				lo = j;
 			}
 		}
-		if (bestN < 0.6 * d.length) return 0;
-		const mid = d[bestLo + (bestN >> 1)];
-		return Math.abs(mid) >= 2 * SHIFT_FRAME_SEC ? Math.round(mid * 1000) / 1000 : 0;
+		return { lo, n, mid: n ? d[lo + (n >> 1)] : 0 };
+	}
+	// 전체 시간 이동 (안내 줄): 시작 차이 d 중 60% 이상이 같은 값(±1프레임)이고 그 값이 2프레임 이상이면 그 값(초), 아니면 0.
+	// 문장이 같은 짝이 3개 미만이거나 옛 줄(nOld)의 30% 미만이면 0
+	function _matchShift(d, nOld) {
+		if (d.length < 3 || d.length < 0.3 * nOld) return 0;
+		const c = _deltaCluster(d);
+		if (c.n < 0.6 * d.length) return 0;
+		return Math.abs(c.mid) >= 2 * SHIFT_FRAME_SEC ? Math.round(c.mid * 1000) / 1000 : 0;
+	}
+	// 시간 이동 가설 (일부만 밀린 것 포함): 시작 차이 d에서 MATCH_SHIFT_MIN개 이상 모인 값(±1프레임, 2프레임 이상)을
+	// 많이 모인 순서로 최대 MATCH_SHIFTS_MAX개 (0 근처 무리는 세지 않고 건너뛴다)
+	function _matchShifts(d) {
+		const out = [];
+		const rest = d.slice();
+		while (out.length < MATCH_SHIFTS_MAX && rest.length >= MATCH_SHIFT_MIN) {
+			const c = _deltaCluster(rest);
+			if (c.n < MATCH_SHIFT_MIN) break;
+			if (Math.abs(c.mid) >= 2 * SHIFT_FRAME_SEC) out.push(Math.round(c.mid * 1000) / 1000);
+			rest.splice(c.lo, c.n);
+		}
+		return out;
 	}
 	// 옛 줄과 새 자막의 짝 (순서 보존, 한 줄에 하나).
-	//   1) 고정(anchor): 정규화 문장이 같고 시작·끝 차이가 각각 0.05초 이하
-	//   2) 나머지: 순서를 지키는 DP (간격 비용 0). 후보는 시간상 가장 가까운 새 자막 ±40개,
+	//   시간 가설: 실제 시간, 그리고 문장이 같은 짝들이 같은 값만큼 밀린 이동(_matchShifts, 중간 삽입으로 뒤쪽만 밀린 것 포함)
+	//   1) 고정(anchor): 정규화 문장이 같고, 실제 시간이나 이동 가설 하나로 시작·끝 차이가 각각 0.05초 이하
+	//   2) 나머지: 순서를 지키는 DP (간격 비용 0). 후보는 가설마다 시간상 가장 가까운 새 자막 ±40개,
 	//      점수 = 0.6 × 겹침/짧은 쪽 길이 + 0.4 × 자모 유사도, 겹치거나 유사도 ≥ 0.9일 때만, 점수 ≥ 0.35만 받는다.
-	//      동률은 원래 번호(srtNo)가 가까운 쪽으로 가른다. 짝은 서로 엇갈리지 않는다.
-	//   전체 시간 이동(_matchShift)이 보이면 옛 시간을 그만큼 옮겨 겹침·고정을 계산한다 (분류는 실제 시간으로).
+	//      겹침은 가설 중 가장 큰 값이다 (실제 시간 겹침은 이동 가설이 있어도 그대로 센다: 일부만 밀렸을 때 앞쪽 줄).
+	//      동률은 원래 번호(srtNo)가 가까운 쪽으로 가른다. 짝은 서로 엇갈리지 않는다 (엇갈리는 고정은 DP가 많은 쪽을 고른다).
+	//   분류는 실제 시간으로 한다. shift는 전체 시간 이동(_matchShift, 안내 줄)
 	// → {pairs: [{o, n, score, sim, ov, anchor}] (입력 자리, 시간순), oldPair: [n|-1], newPair: [o|-1], shift: 초}
 	function matchCues(oldRows, newCues, opts) {
 		const A = (oldRows || []).map(_matchItem);
@@ -1578,45 +1603,36 @@
 		const bStart = bi.map((j) => B[j].s);
 		const byText = {};
 		bi.forEach((j, q) => { (byText[B[j].t] = byText[B[j].t] || []).push(q); });
-		const shift = opts && opts.noShift ? 0 : _matchShift(A, B, byText, bi);
+		const noShift = !!(opts && opts.noShift);
+		const deltas = noShift ? [] : _matchDeltas(A, B, byText, bi);
+		const shift = noShift ? 0 : _matchShift(deltas, A.length);
+		const shifts = noShift ? [] : _matchShifts(deltas);
+		if (shift && shifts.indexOf(shift) === -1) shifts.unshift(shift);
 		res.shift = shift;
-		// 1) 고정
-		const anchorQ = {};
-		const usedQ = {};
-		ai.forEach((i, p) => {
-			const a = A[i];
-			const list = byText[a.t];
-			if (!list) return;
-			let best = -1;
-			let bd = Infinity;
-			list.forEach((q) => {
-				if (usedQ[q]) return;
-				const b = B[bi[q]];
-				const ds = Math.abs(b.s - (a.s + shift));
-				const de = Math.abs(b.e - (a.e + shift));
-				if (ds <= MERGE_TIME_EPS && de <= MERGE_TIME_EPS && ds + de < bd) {
-					bd = ds + de;
-					best = q;
-				}
-			});
-			if (best >= 0) {
-				usedQ[best] = true;
-				anchorQ[p] = best;
-			}
-		});
-		// 2) 후보 (옛 줄 시간순 p, 새 자막 시간순 q)
+		const offs = [0].concat(shifts);
+		const near = (a, b, off) => Math.abs(b.s - (a.s + off)) <= MERGE_TIME_EPS && Math.abs(b.e - (a.e + off)) <= MERGE_TIME_EPS;
+		// 후보 (옛 줄 시간순 p, 새 자막 시간순 q). mark: 이 p에서 이미 본 q
 		const cand = [];
+		const mark = new Int32Array(bi.length).fill(-1);
 		ai.forEach((i, p) => {
 			const a = A[i];
-			const as = a.s + shift;
-			const ae = a.e + shift;
-			const add = (q) => {
+			// 1) 고정 후보: 실제 시간이면 MATCH_ANCHOR_W, 이동 가설로만 맞으면 조금 적게
+			const anchorW = {};
+			(byText[a.t] || []).forEach((q) => {
 				const b = B[bi[q]];
-				const anchor = anchorQ[p] === q;
-				const ov = _overlapFrac(as, ae, b.s, b.e);
-				const same = a.t === b.t;
+				if (near(a, b, 0)) anchorW[q] = MATCH_ANCHOR_W;
+				else if (shifts.some((off) => near(a, b, off))) anchorW[q] = MATCH_ANCHOR_W - MATCH_SHIFT_ANCHOR_LESS;
+			});
+			const add = (q) => {
+				if (mark[q] === p) return;
+				mark[q] = p;
+				const b = B[bi[q]];
+				const aw = anchorW[q] || 0;
+				const anchor = aw > 0;
+				let ov = 0;
+				offs.forEach((off) => { ov = Math.max(ov, _overlapFrac(a.s + off, a.e + off, b.s, b.e)); });
 				let sim;
-				if (same) sim = 1;
+				if (a.t === b.t) sim = 1;
 				else if (ov > 0) {
 					const n = Math.max(a.k.length, b.k.length);
 					sim = n ? 1 - levenshtein(a.k, b.k) / n : 1;
@@ -1629,15 +1645,17 @@
 				}
 				const score = 0.6 * ov + 0.4 * sim;
 				if (!anchor && score < MATCH_ACCEPT) return;
-				let w = score + (anchor ? MATCH_ANCHOR_W : 0) + (same ? MATCH_SAME_TEXT_W : 0);
+				let w = score + aw;
 				if (a.no !== null && b.no !== null) w += 1e-6 / (1 + Math.abs(a.no - b.no));
 				cand.push({ p, q, w, score, sim, ov, anchor });
 			};
-			const q0 = _nearestIndex(bStart, as);
-			const lo = Math.max(0, q0 - MATCH_BAND);
-			const hi = Math.min(bi.length - 1, q0 + MATCH_BAND);
-			for (let q = lo; q <= hi; q++) add(q);
-			if (anchorQ[p] !== undefined && (anchorQ[p] < lo || anchorQ[p] > hi)) add(anchorQ[p]);
+			// 2) 가설마다 가까운 새 자막 ±40개, 그 밖의 고정 후보
+			offs.forEach((off) => {
+				const q0 = _nearestIndex(bStart, a.s + off);
+				const hi = Math.min(bi.length - 1, q0 + MATCH_BAND);
+				for (let q = Math.max(0, q0 - MATCH_BAND); q <= hi; q++) add(q);
+			});
+			Object.keys(anchorW).forEach((q) => add(Number(q)));
 		});
 		// 3) 가중치 합이 가장 큰 엇갈리지 않는 짝 모음 (p·q 모두 증가). q에 대한 접두 최댓값 펜윅 트리
 		const m = bi.length;
@@ -1990,12 +2008,15 @@
 	//          휴지통 항목(사용자가 지운 줄)은 배정된 화자의 것이 된다 (그 화자의 사용자 삭제로 남는다)
 	//   one    화자 없는 줄·휴지통 항목을 모두 oneKey로
 	//   trash  화자 없는 줄을 모두 휴지통으로 (why "replace")
-	// mi.legacyTrack = ctx.trackValue (v27 클립이 있는 트랙). → {total, mode, counts: {K: n}, ambiguous: [{id, s, text, key, scores}], unmatched, trashAssigned}
+	// 화자는 가져올 파일(files)의 키만 받는다: oneKey·assign 값이 그 밖이면(창에서 파일 키를 바꾼 뒤 남은 값 등) 기본값
+	// (one은 첫 파일, 확인 필요 줄은 최고 화자). 모르는 mode는 split. 화자 표에 없는 spk가 생기지 않게 한다.
+	// mi.legacyTrack = ctx.trackValue (v27 클립이 있는 트랙).
+	// → {total, mode, counts: {K: n (확인 필요 줄 포함)}, ambiguous: [{id, s, text, key: 최고 화자, to: 넣은 화자|null, scores}], unmatched, trashAssigned}
 	function applyLegacySplit(data, legacy, files, ctx) {
 		const c = ctx || {};
 		const now = typeof c.now === "number" ? c.now : 0;
 		const live = data.subtitles.filter((s) => s && !s.spk);
-		const mode = (legacy && legacy.mode) || "split";
+		const mode = ["split", "one", "trash"].indexOf(legacy && legacy.mode) !== -1 ? legacy.mode : "split";
 		const info = { total: live.length, mode, counts: {}, ambiguous: [], unmatched: 0, trashAssigned: 0 };
 		if (!live.length) return info;
 		if (typeof c.trackValue === "number" && isFinite(c.trackValue)) data.mi.legacyTrack = c.trackValue;
@@ -2004,10 +2025,11 @@
 			return info;
 		}
 		const fl = (files || []).filter((f) => f && f.key);
+		const isKey = (k) => typeof k === "string" && fl.some((f) => f.key === k);
 		const assign = {};
 		const legacyTrash = data.trashBin.filter((t) => t && t.sub && !t.sub.spk);
 		if (mode === "one") {
-			const K = (legacy && legacy.oneKey) || (fl[0] && fl[0].key) || null;
+			const K = isKey(legacy && legacy.oneKey) ? legacy.oneKey : (fl[0] && fl[0].key) || null;
 			live.forEach((s) => { assign[s.id] = K; });
 			legacyTrash.forEach((t) => { assign[t.sub.id] = K; });
 		} else {
@@ -2018,11 +2040,15 @@
 			dist.items.forEach((d) => {
 				let K = d.status === "unmatched" ? null : d.key;
 				if (d.status === "ambiguous") {
+					if (Object.prototype.hasOwnProperty.call(over, d.id)) {
+						const v = over[d.id];
+						if (v === "" || v === null || v === undefined) K = null;
+						else if (isKey(v)) K = v;
+					}
 					if (!d.trash) {
 						const s = live.find((x) => x.id === d.id);
-						info.ambiguous.push({ id: d.id, s: s.startSec, text: s.text, key: d.key, scores: d.scores });
+						info.ambiguous.push({ id: d.id, s: s.startSec, text: s.text, key: d.key, to: K, scores: d.scores });
 					}
-					if (Object.prototype.hasOwnProperty.call(over, d.id)) K = over[d.id] || null;
 				}
 				assign[d.id] = K;
 			});
@@ -2516,9 +2542,10 @@
 		msgEl.textContent = message;
 		btnYes.textContent = (opts && opts.yes) || "확인";
 		btnNo.textContent = (opts && opts.no) || "취소";
-		// 세 번째 버튼(#confirmAlt)은 showChoice만 쓴다
+		// 세 번째 버튼(#confirmAlt)은 showChoice만 쓴다 (창을 넘겨받으면 closeChoice가 이 확인창을 닫지 않게)
 		const btnAlt = document.getElementById("confirmAlt");
 		if (btnAlt) { btnAlt.style.display = "none"; btnAlt.onclick = null; }
+		_choiceClose = null;
 		overlay.classList.add("open");
 		const cleanup = () => {
 			overlay.classList.remove("open");
@@ -2540,6 +2567,8 @@
 	//   첫째 → #confirmYes (주 버튼), (셋이면) 둘째 → #confirmAlt, 마지막 → #confirmNo (취소 자리)
 	// 예: showChoice("이미 후반 작업(프리셋)이 있는 자막 목록입니다.", [{label: "병합 (후반 작업 유지)", run: a}, {label: "교체 (지금까지 방식)", run: b}, {label: "취소", run: c}])
 	// 창이 없으면(테스트 DOM 등) 브라우저 confirm으로 첫째/마지막만 고른다.
+	// 열려 있는 동안 _choiceClose가 버튼을 누르지 않고 닫는 함수다 (closeChoice)
+	var _choiceClose = null;
 	function showChoice(message, buttons) {
 		const list = (buttons || []).filter(Boolean).slice(0, 3);
 		const run = (b) => { if (b && typeof b.run === "function") b.run(); };
@@ -2562,17 +2591,30 @@
 		btnAlt.textContent = mid ? mid.label : "";
 		btnAlt.style.display = mid ? "" : "none";
 		overlay.classList.add("open");
-		const done = (b) => () => {
+		const close = () => {
+			_choiceClose = null;
 			overlay.classList.remove("open");
 			btnYes.textContent = "확인";
 			btnNo.textContent = "취소";
 			btnAlt.style.display = "none";
 			btnAlt.onclick = null;
+			btnYes.onclick = null;
+			btnNo.onclick = null;
+		};
+		const done = (b) => () => {
+			close();
 			run(b);
 		};
+		_choiceClose = close;
 		btnYes.onclick = done(first);
 		btnNo.onclick = done(last);
 		btnAlt.onclick = mid ? done(mid) : null;
+	}
+	// 열려 있는 showChoice를 아무 버튼도 누르지 않고 닫는다 → 닫았으면 true
+	function closeChoice() {
+		if (!_choiceClose) return false;
+		_choiceClose();
+		return true;
 	}
 	function showAlert(message, onOk) {
 		const overlay = document.getElementById("alertModal");
@@ -6082,10 +6124,34 @@ var modalState = {
 			route,
 			files: ans.map((a) => ({ name: a.file.name, key: a.capKey.key, ambiguous: a.capKey.ambiguous, encoding: a.dec.encoding, replaced: a.dec.replaced, cues: a.cues.length }))
 		};
-		if (route === "legacy") _legacyImport(ans[0]);
-		else if (route === "choice") _legacyChoice(ans[0]);
-		else _openImportModal(ans, route === "distribute");
+		const seq = _importSeqToken();
+		if (route === "legacy") _legacyImport(ans[0], seq);
+		else if (route === "choice") _legacyChoice(ans[0], seq);
+		else _openImportModal(ans, route === "distribute", seq);
 		return summary;
+	}
+	// 확인창·가져오기 창은 누를 때까지 기다린다. 그 사이 Premiere에서 시퀀스를 바꾸면 폴러가 목록·휴지통·화자 표를
+	// 그 시퀀스 것으로 바꾸므로, 창을 연 시퀀스를 기억해 두고 누를 때 다르면 아무것도 하지 않는다
+	// (폴러는 전환할 때 창을 닫는다: _closeImportUi)
+	const IMPORT_SEQ_CHANGED_MSG = "시퀀스가 바뀌어 SRT 가져오기를 취소했습니다";
+	function _importSeqToken() {
+		return state.currentProjectKey + "\n" + state.currentSequenceKey;
+	}
+	// 창을 연 뒤 시퀀스가 바뀌었으면 상태 줄에 알리고 true
+	function _importSeqChanged(seq) {
+		if (seq === undefined || seq === _importSeqToken()) return false;
+		setStatus(IMPORT_SEQ_CHANGED_MSG, "err");
+		return true;
+	}
+	// 시퀀스 전환 때 폴러가 부른다: 열려 있는 가져오기 창·가져오기 확인창을 닫는다 → 닫은 것이 있으면 true
+	function _closeImportUi() {
+		let closed = false;
+		if (_imp) {
+			_closeImportModal();
+			closed = true;
+		}
+		if (closeChoice()) closed = true;
+		return closed;
 	}
 	// 지금 목록에 대한 경로 (core srtImportRoute)
 	function _srtRouteOf(ans) {
@@ -6119,9 +6185,11 @@ var modalState = {
 		lines.push("", "첫 자막: " + (first ? first.startTime + "  " + _cuePreview(first.text) : "(자막 없음)"), "", "이대로 가져올까요? (지금 목록은 바뀝니다)");
 		return lines.join("\n");
 	}
-	// 레거시 가져오기: UTF-8이 아니거나 깨진 글자가 있으면 목록을 바꾸기 전에 묻는다
-	function _legacyImport(an) {
-		const go = () => _legacyReplace(an.file.name, an.text);
+	// 레거시 가져오기: UTF-8이 아니거나 깨진 글자가 있으면 목록을 바꾸기 전에 묻는다 (seq: 연 시퀀스, _importSeqToken)
+	function _legacyImport(an, seq) {
+		const go = () => {
+			if (!_importSeqChanged(seq)) _legacyReplace(an.file.name, an.text);
+		};
 		if (!needsEncodingConfirm(an.dec)) {
 			go();
 			return;
@@ -6132,12 +6200,15 @@ var modalState = {
 		]);
 	}
 	// 프리셋(후반 작업)이 걸린 레거시 목록 + C번호 없는 파일 하나: 병합 / 교체 / 취소 (인코딩이 이상하면 그것부터 묻는다)
-	function _legacyChoice(an) {
+	function _legacyChoice(an, seq) {
+		const guard = (fn) => () => {
+			if (!_importSeqChanged(seq)) fn();
+		};
 		const ask = () => showChoice("이미 후반 작업(프리셋)이 있는 자막 목록입니다.\n\n" +
 			"병합: 줄마다 시간·문장만 새 파일에 맞추고 프리셋과 후반 작업은 그대로 둡니다. 바뀐 줄에는 점이 붙고, 빠진 줄은 휴지통으로 갑니다.\n" +
 			"교체: 지금까지처럼 목록을 새 파일로 바꿉니다 (지금 목록은 안전 지점에 남습니다).", [
-			{ label: "병합 (후반 작업 유지)", run: () => _applyMerge(an) },
-			{ label: "교체 (지금까지 방식)", run: () => _legacyReplace(an.file.name, an.text) },
+			{ label: "병합 (후반 작업 유지)", run: guard(() => _applyMerge(an)) },
+			{ label: "교체 (지금까지 방식)", run: guard(() => _legacyReplace(an.file.name, an.text)) },
 			{ label: "취소", run: () => setStatus("SRT 가져오기 취소: " + an.file.name, "") }
 		]);
 		if (!needsEncodingConfirm(an.dec)) {
@@ -6145,7 +6216,7 @@ var modalState = {
 			return;
 		}
 		showChoice(_encodingMessage(an), [
-			{ label: "가져오기", run: ask },
+			{ label: "가져오기", run: guard(ask) },
 			{ label: "취소", run: () => setStatus("SRT 가져오기 취소: " + an.file.name, "") }
 		]);
 	}
@@ -6196,12 +6267,13 @@ var modalState = {
 	//   keepEdits  #impKeepPanelEdits (충돌 시 패널에서 고친 문장 유지)
 	//   suspectAck 의심 파일이 있을 때 [가져오기]를 한 번 눌렀다 (다음 누름은 '그래도 가져오기')
 	//   report   마지막 미리 계산 (importIntoData를 사본에)
+	//   seq      창을 연 시퀀스 (_importSeqToken). [가져오기] 때 다르면 취소한다
 	var _imp = null;
 	// 캡션 트랙 선택지는 적어도 C1..C12 (화자 표·파일 이름에 더 큰 번호가 있으면 거기까지)
 	const IMP_KEYS_MIN = 12;
 	const IMP_ACTION_LABEL = { new: "새 화자", merge: "병합", replace: "교체", skip: "건너뜀" };
 	const IMP_LEGACY_MODES = [["split", "파일에 맞춰 나누기 (후반 작업 유지)"], ["one", "모두 한 화자로"], ["trash", "휴지통으로 보내고 새로 시작"]];
-	function _openImportModal(ans, distribute) {
+	function _openImportModal(ans, distribute, seq) {
 		const modal = document.getElementById("importModal");
 		if (!modal) {
 			setStatus("가져오기 창이 없습니다", "err");
@@ -6216,7 +6288,8 @@ var modalState = {
 			legacy: distribute ? { mode: "split", oneKey: "", assign: {} } : null,
 			keepEdits: false,
 			suspectAck: false,
-			report: null
+			report: null,
+			seq: seq === undefined ? _importSeqToken() : seq
 		};
 		const keep = document.getElementById("impKeepPanelEdits");
 		if (keep) keep.checked = false;
@@ -6270,6 +6343,13 @@ var modalState = {
 			legacy = { mode: _imp.legacy.mode, oneKey: _impOneKey(), assign: Object.assign({}, _imp.legacy.assign) };
 		}
 		return { files, keepPanelEdits: _imp.keepEdits, legacy };
+	}
+	// 파일 키가 바뀌면 가져올 키가 아닌 '확인 필요' 선택을 지운다 (그 줄은 기본값 = 최고 화자로 돌아간다)
+	function _impPruneLegacy() {
+		if (!_imp || !_imp.legacy) return;
+		const keys = _imp.entries.filter((en) => en.an.cues.length && en.key).map((en) => en.key);
+		const as = _imp.legacy.assign;
+		Object.keys(as).forEach((id) => { if (as[id] && keys.indexOf(as[id]) === -1) delete as[id]; });
 	}
 	// '모두 한 화자로'의 화자: 고른 값이 가져올 키 중에 있으면 그것, 아니면 첫 키
 	function _impOneKey() {
@@ -6352,9 +6432,16 @@ var modalState = {
 		if (lg.mode === "trash") tail = "모두 휴지통";
 		else if (lg.mode === "one") tail = "모두 " + (_impOneKey() || "?");
 		else if (rep) {
-			const parts = sortCastKeys(Object.keys(rep.counts)).map((k) => k + " " + rep.counts[k]);
-			if (rep.ambiguous.length) parts.push("확인 필요 " + rep.ambiguous.length);
-			if (rep.unmatched) parts.push("짝 없음 " + rep.unmatched);
+			// 줄을 한 번씩만 센다: 확인 필요 줄은 화자별 수·짝 없음(휴지통을 고른 줄)에서 빼고 '확인 필요'로
+			const amb = rep.ambiguous;
+			const parts = [];
+			sortCastKeys(Object.keys(rep.counts)).forEach((k) => {
+				const n = rep.counts[k] - amb.filter((a) => a.to === k).length;
+				if (n > 0) parts.push(k + " " + n);
+			});
+			if (amb.length) parts.push("확인 필요 " + amb.length);
+			const unmatched = rep.unmatched - amb.filter((a) => !a.to).length;
+			if (unmatched > 0) parts.push("짝 없음 " + unmatched);
 			tail = parts.join(" · ") || "짝 없음 " + total;
 		} else tail = "캡션 트랙을 고르면 나눕니다";
 		const info = document.getElementById("impLegacyInfo");
@@ -6462,6 +6549,7 @@ var modalState = {
 			selK.addEventListener("change", () => {
 				en.key = selK.value;
 				_impDefaults(en);
+				_impPruneLegacy();
 				_imp.suspectAck = false;
 				_renderImportModal();
 			});
@@ -6549,6 +6637,12 @@ var modalState = {
 	}
 	function _onImportOk() {
 		if (!_imp) return;
+		// 창을 연 뒤 시퀀스가 바뀌었다: 미리 계산·분배 선택은 이전 시퀀스의 줄 것이다
+		if (_imp.seq !== _importSeqToken()) {
+			_closeImportModal();
+			setStatus(IMPORT_SEQ_CHANGED_MSG, "err");
+			return;
+		}
 		const v = _validateImport();
 		if (!v.ok) {
 			_renderImportModal();
@@ -6595,10 +6689,17 @@ var modalState = {
 	function _sessionClone() {
 		return JSON.parse(JSON.stringify({ subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi }));
 	}
-	// 바뀌었는가를 가르는 서명 (salt만 새로 만든 것은 바뀐 것이 아니다)
+	// 바뀌었는가를 가르는 서명. salt만 새로 만든 것, 화자의 파일 정보(file·path·size·mtime)만 바뀐 것은 바뀐 것이 아니다:
+	// 내용이 같은 파일을 다시 내보냈거나(mtime) 명령으로 넣은 것(path 없음)도 '변경 없음' (그때 파일 정보도 그대로 둔다)
 	function _sessionDataSig(d) {
 		const mi = d.mi || {};
-		return stableJson({ s: d.subtitles, r: d.rowStates, t: d.trashBin, c: mi.cast, o: mi.castOrder, l: mi.legacyTrack });
+		const cast = {};
+		Object.keys(mi.cast || {}).forEach((k) => {
+			const c = Object.assign({}, mi.cast[k]);
+			["file", "path", "size", "mtime"].forEach((f) => { delete c[f]; });
+			cast[k] = c;
+		});
+		return stableJson({ s: d.subtitles, r: d.rowStates, t: d.trashBin, c: cast, o: mi.castOrder, l: mi.legacyTrack });
 	}
 	// 사본을 상태에 넣고 그리고 저장한다 (session.json + cast.json)
 	function _commitSessionData(data, reason) {
@@ -6863,8 +6964,29 @@ var modalState = {
 			files.push({ key, name: typeof a.speaker === "string" ? a.speaker : "", presetId, action, file: an.file, cues: an.cues, idx: i });
 		}
 		if (!files.length) return { error: "가져올 자막이 없다" };
-		const legacy = legacyLive > 0 && files.some((f) => f.key) ? Object.assign({ mode: "split", oneKey: "", assign: {} }, args.legacy && typeof args.legacy === "object" ? args.legacy : {}) : null;
+		let legacy = null;
+		if (legacyLive > 0 && files.some((f) => f.key)) {
+			const lg = _cmdLegacyArgs(args.legacy, files.filter((f) => f.key).map((f) => f.key));
+			if (lg.error) return { error: lg.error };
+			legacy = lg.legacy;
+		}
 		return { job: { files, keepPanelEdits: args.keepPanelEdits === true, legacy } };
+	}
+	// args.legacy {mode?: split|one|trash, oneKey?: 가져올 키 | "", assign?: {줄 id: 가져올 키 | ""(휴지통)}} → {legacy} | {error}
+	// 가져올 파일의 키가 아닌 화자는 받지 않는다 (화자 표에 없는 spk가 생기지 않게)
+	function _cmdLegacyArgs(v, keys) {
+		if (v === undefined || v === null) return { legacy: { mode: "split", oneKey: "", assign: {} } };
+		if (typeof v !== "object" || Array.isArray(v)) return { error: "legacy는 {mode, oneKey, assign}" };
+		const mode = v.mode === undefined ? "split" : v.mode;
+		if (["split", "one", "trash"].indexOf(mode) === -1) return { error: "legacy.mode는 split|one|trash" };
+		const oneKey = v.oneKey === undefined || v.oneKey === null ? "" : v.oneKey;
+		if (oneKey !== "" && keys.indexOf(oneKey) === -1) return { error: "legacy.oneKey는 가져올 파일의 키(" + keys.join(", ") + ") 중 하나: " + String(oneKey) };
+		const assign = v.assign === undefined || v.assign === null ? {} : v.assign;
+		if (typeof assign !== "object" || Array.isArray(assign)) return { error: "legacy.assign은 {줄 id: 키 | \"\"}" };
+		for (const id of Object.keys(assign)) {
+			if (assign[id] !== "" && keys.indexOf(assign[id]) === -1) return { error: "legacy.assign 값은 가져올 파일의 키(" + keys.join(", ") + ")나 \"\"(휴지통): " + id + " → " + String(assign[id]) };
+		}
+		return { legacy: { mode, oneKey, assign: Object.assign({}, assign) } };
 	}
 	function _cmdImportSummary(job, rep, changed) {
 		return {
@@ -7137,6 +7259,8 @@ var modalState = {
 				_setSeqLabel(info);
 				if (newSeqKey === state.currentSequenceKey) return;
 				const isSameProject = newProjKey === state.currentProjectKey;
+				// 이전 시퀀스의 목록으로 연 SRT 가져오기 창·확인창은 닫는다 (바뀐 시퀀스에 넣지 않게)
+				const importClosed = _closeImportUi();
 				saveSessionToStorage();
 				state.currentProjectKey = newProjKey;
 				state.currentSequenceKey = newSeqKey;
@@ -7155,7 +7279,7 @@ var modalState = {
 				// 시쿼스 전환 후 트랙 복원
 				_loadTrackFromStorage();
 				// 세션 파일을 읽지 못했으면 그 오류 문구를 덮지 않는다
-				if (!_sessionReadFailed) setStatus((isSameProject ? "시쿼스 전환: " : "프로젝트 변경: ") + (info.seqName || newSeqId), "ok");
+				if (!_sessionReadFailed) setStatus((isSameProject ? "시쿼스 전환: " : "프로젝트 변경: ") + (info.seqName || newSeqId) + (importClosed ? " — SRT 가져오기를 취소했습니다" : ""), "ok");
 			} catch (_) {}
 	}, 100);
 }

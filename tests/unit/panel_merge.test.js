@@ -148,6 +148,37 @@ test("같은 파일을 두 번 가져오면 '변경 없음' — 상태·히스�
 	noErrors(h);
 });
 
+test("같은 내용을 수정 시각만 다르게 다시 가져와도 '변경 없음' (파일 정보만 다른 것은 바뀐 것이 아니다), 창으로 가져온 뒤 mergeCommit도", async () => {
+	const h = await bootCast();
+	await h.dropSrts([{ name: "C1.srt", content: bytesOf("cap_C1.srt"), path: "D:\\srt\\C1.srt", lastModified: 1000 }]);
+	h.$("impOk").click();
+	await h.flush();
+	const s0 = snap(h);
+	assert.deepEqual([s0.mi.cast.C1.path, s0.mi.cast.C1.mtime], ["D:/srt/C1.srt", 1000]);
+	const nAuto = autoList(h).length;
+	const nSafe = safetyList(h).length;
+	// 같은 내용을 다시 내보냈다 (수정 시각만 다르다)
+	await h.dropSrts([{ name: "C1.srt", content: bytesOf("cap_C1.srt"), path: "D:\\srt\\C1.srt", lastModified: 2000 }]);
+	assert.equal(h.$("impBody").querySelector(".imp-stats").textContent, "변경 없음 (같음 7)");
+	h.$("impOk").click();
+	await h.flush();
+	assert.match(h.status().text, /^변경 없음: C1 C1\.srt$/);
+	assert.deepEqual(snap(h), s0, "상태 그대로 (파일 정보도)");
+	assert.equal(autoList(h).length, nAuto, "자동 항목 없음");
+	assert.equal(safetyList(h).length, nSafe, "안전 지점 없음");
+	// 명령으로 넣은 같은 파일 (path·mtime 없음)
+	const b64 = bytesOf("cap_C1.srt").toString("base64");
+	const pv = await cmd(h, "mergePreview", { files: [{ name: "C1.srt", b64 }] });
+	assert.equal(pv.data.changed, false);
+	const cm = await cmd(h, "mergeCommit", { files: [{ name: "C1.srt", b64 }] });
+	assert.deepEqual([cm.ok, cm.data.changed], [true, false]);
+	assert.match(h.status().text, /^변경 없음/);
+	assert.deepEqual(snap(h), s0);
+	assert.equal(autoList(h).length, nAuto);
+	assert.equal(safetyList(h).length, nSafe);
+	noErrors(h);
+});
+
 test("충돌: 패널에서 고친 캡션 + 바뀐 SRT → 기본은 SRT 문장, '패널 문장 유지'면 패널 문장 (둘 다 mm conflict)", async () => {
 	for (const keep of [false, true]) {
 		const h = await bootCast();
@@ -316,6 +347,107 @@ test("분배: '모두 한 화자로'와 '휴지통으로 보내고 새로 시작
 	assert.ok(s.trashBin.every((t) => t.why === "replace" && !t.sub.spk));
 	assert.equal(s.subtitles.filter((x) => x.spk === "C1").length, 7);
 	noErrors(h);
+	noErrors(h2);
+});
+
+test("분배 창: 머리 줄은 줄을 한 번씩만 세고, 확인 필요 줄에 고른 화자의 파일 키를 바꾸면 그 선택을 지운다 (화자 표에 없는 화자가 생기지 않는다)", async () => {
+	const h = await bootCast();
+	const laugh = [30, 31, "(웃음)"];
+	await h.dropSrt("mixed.srt", CAP.srt(CAP.C1.concat(CAP.C2).concat([laugh]).sort((a, b) => a[0] - b[0])));
+	await h.dropSrts([{ name: "C1.srt", content: CAP.srt(CAP.C1.concat([laugh])) }, { name: "C2.srt", content: CAP.srt(CAP.C2.concat([laugh])) }]);
+	const info = () => h.$("impLegacyInfo").textContent;
+	const amb = () => h.$("impAmbList").querySelectorAll("select.imp-amb-key");
+	assert.equal(info(), "기존 목록 (화자 없음, 14줄) → C1 7 · C2 6 · 확인 필요 1", "7 + 6 + 1 = 14");
+	assert.equal(amb().length, 1);
+	setSel(h, amb()[0], "");
+	assert.equal(info(), "기존 목록 (화자 없음, 14줄) → C1 7 · C2 6 · 확인 필요 1", "휴지통을 골라도 '짝 없음'으로 두 번 세지 않는다");
+	setSel(h, amb()[0], "C2");
+	assert.equal(info(), "기존 목록 (화자 없음, 14줄) → C1 7 · C2 6 · 확인 필요 1");
+	// C2 파일의 키를 C3으로 → 'C2' 선택은 지우고 기본값(최고 화자)
+	setSel(h, impRows(h)[1].querySelector(".imp-key"), "C3");
+	assert.equal(info(), "기존 목록 (화자 없음, 14줄) → C1 7 · C3 6 · 확인 필요 1");
+	assert.deepEqual(amb()[0].options.map((o) => o.value), ["C1", "C3", ""]);
+	assert.notEqual(amb()[0].value, "C2");
+	h.$("impOk").click();
+	await h.flush();
+	const s = snap(h);
+	assert.deepEqual(s.mi.castOrder, ["C1", "C3"]);
+	assert.deepEqual(s.subtitles.concat(s.trashBin.map((t) => t.sub)).filter((x) => x.spk && !s.mi.cast[x.spk]), [], "화자 표에 없는 spk");
+	noErrors(h);
+});
+
+test("mergePreview·mergeCommit: legacy 인자는 가져올 파일의 키만 받는다 (mode·oneKey·assign 검사, bad-args면 아무것도 바꾸지 않는다)", async () => {
+	const h = await bootCast();
+	await h.dropSrt("old.srt", bytesOf("cap_C1.srt"));
+	const s0 = snap(h);
+	assert.ok(s0.subtitles.length === 7 && s0.subtitles.every((x) => !x.spk), "화자 없는 기존 목록");
+	const files = [{ name: "C1.srt", b64: bytesOf("cap_C1.srt").toString("base64") }];
+	const id0 = s0.subtitles[0].id;
+	for (const legacy of [{ mode: "one", oneKey: "C9" }, { mode: "bogus" }, { assign: { [id0]: "C5" } }, { assign: [] }, "split"]) {
+		for (const op of ["mergePreview", "mergeCommit"]) {
+			const r = await cmd(h, op, { files, legacy });
+			assert.deepEqual([r.ok, r.error], [false, "bad-args"], op + " " + JSON.stringify(legacy));
+		}
+	}
+	assert.deepEqual(snap(h), s0);
+	const ok = await cmd(h, "mergeCommit", { files, legacy: { mode: "one", oneKey: "C1" } });
+	assert.equal(ok.ok, true, JSON.stringify(ok));
+	const s = snap(h);
+	assert.deepEqual(s.subtitles.map((x) => x.id), s0.subtitles.map((x) => x.id), "기존 줄이 C1으로 병합 (새 줄로 두 번 들어가지 않는다)");
+	assert.ok(s.subtitles.every((x) => x.spk === "C1"));
+	assert.deepEqual(s.mi.castOrder, ["C1"]);
+	noErrors(h);
+});
+
+// 두 시퀀스: A(화자 없는 한 줄), B(두 줄)
+const B = { seqId: "merg-0002", seqName: "T_MRG_B", projPath: PROJ };
+function legacySession(texts) {
+	const subtitles = texts.map((t, i) => ({ index: i + 1, startTime: "00:00:0" + (i * 2 + 1) + ".000", endTime: "00:00:0" + (i * 2 + 2) + ".000", startSec: i * 2 + 1, endSec: i * 2 + 2, text: t, id: i + 1 }));
+	const rowStates = {};
+	subtitles.forEach((s) => { rowStates[s.id] = { presetId: "", params: [], _allParams: [], open: false, checked: false }; });
+	return { subtitles, rowStates, trashBin: [], nextId: subtitles.length + 1 };
+}
+function twoSeqFiles() {
+	const { presets } = build();
+	return {
+		[P.presets(PROJ)]: { presets: { preset_3: presets.preset_3 }, presetTrash: [], nextPresetId: 9 },
+		[P.session(PROJ, A.seqId)]: legacySession(["A 줄"]),
+		[P.session(PROJ, B.seqId)]: legacySession(["B 줄 하나", "B 줄 둘"])
+	};
+}
+
+test("시퀀스 전환: 열어 둔 인코딩 확인창·가져오기 창은 닫히고, 이전 시퀀스에서 고른 파일이 바뀐 시퀀스 목록에 들어가지 않는다", async () => {
+	// 플래그 꺼짐(운영): CP949 확인창을 열어 둔 채 B로 전환
+	const h = await boot({ files: twoSeqFiles() });
+	assert.deepEqual(snap(h).subtitles.map((x) => x.text), ["A 줄"]);
+	await h.dropSrt("enc_cp949.srt", bytesOf("enc_cp949.srt"));
+	assert.equal(confirmOpen(h), true);
+	h.host.seq = B;
+	await h.advance(300);
+	assert.deepEqual(snap(h).subtitles.map((x) => x.text), ["B 줄 하나", "B 줄 둘"], "B로 전환");
+	assert.equal(confirmOpen(h), false, "전환하면 확인창을 닫는다");
+	assert.equal(h.status().text, "시쿼스 전환: T_MRG_B — SRT 가져오기를 취소했습니다");
+	h.$("confirmYes").click();
+	await h.flush();
+	assert.deepEqual(snap(h).subtitles.map((x) => x.text), ["B 줄 하나", "B 줄 둘"]);
+	assert.deepEqual(h.fs.readJson(P.session(PROJ, B.seqId)).subtitles.map((x) => x.text), ["B 줄 하나", "B 줄 둘"]);
+	assert.deepEqual(h.fs.readJson(P.session(PROJ, A.seqId)).subtitles.map((x) => x.text), ["A 줄"]);
+	assert.deepEqual(h.fs.readJson(P.historySafety(PROJ, B.seqId)) || [], []);
+	noErrors(h);
+	// 플래그 켜짐: 가져오기 창(분배 모드)을 열어 둔 채 B로 전환
+	const h2 = await boot({ files: twoSeqFiles() });
+	h2.win._mogrtDebug.setMiCast(true);
+	await h2.dropSrts([{ name: "C1.srt", content: bytesOf("cap_C1.srt") }]);
+	assert.equal(importOpen(h2), true);
+	h2.host.seq = B;
+	await h2.advance(300);
+	assert.equal(importOpen(h2), false, "전환하면 가져오기 창을 닫는다");
+	h2.$("impOk").click();
+	await h2.flush();
+	const s = snap(h2);
+	assert.deepEqual(s.subtitles.map((x) => [x.text, x.spk]), [["B 줄 하나", undefined], ["B 줄 둘", undefined]]);
+	assert.deepEqual(s.mi.cast, {});
+	assert.deepEqual(h2.fs.readJson(P.session(PROJ, A.seqId)).subtitles.map((x) => x.text), ["A 줄"]);
 	noErrors(h2);
 });
 
