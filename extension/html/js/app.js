@@ -511,6 +511,21 @@
 		return res;
 	}
 
+	// 호스트 호출 뒤 활성 시퀀스가 바뀌었으면 before(getActiveSequenceInfo 결과)의 시퀀스로 되돌린다.
+	// 프리뷰 시퀀스가 활성이던 경우와 정보를 못 읽은 경우는 건드리지 않는다. 실패해도 조용히 넘어간다.
+	async function _restoreActiveSequence(before) {
+		if (!before || !before.seqId || before.seqName === "__MOGRT_PREVIEW__") return;
+		try {
+			const now = await host.getActiveSequenceInfo();
+			if (now && now.seqId === before.seqId) return;
+			const script = `(function(id){ var p = app.project; for (var i = 0; i < p.sequences.numSequences; i++) { var s = p.sequences[i]; if (String(s.sequenceID) === id) { app.project.activeSequence = s; return "RESTORED"; } } return "NOTFOUND"; })(${_encodeArg(before.seqId)})`;
+			const r = await _invoke("restoreActiveSequence", script);
+			console.warn("[MOGRT] 활성 시퀀스 되돌림:", (now && now.seqName) || "?", "→", before.seqName, r);
+		} catch (e) {
+			console.warn("[MOGRT] 활성 시퀀스 되돌리기 실패:", (e && e.message) || e);
+		}
+	}
+
 	function _callNoArgs(funcName) {
 		return _invoke(funcName, `${funcName}()`);
 	}
@@ -560,7 +575,16 @@
 		// ── 문자열 프로토콜 반환. "SUCCESS:..." / "ERROR:..." / "CANCEL" 해석은 호출부 몫 ──
 		applyToTimeline: (payload) => _callWithPayload("applyToTimeline", payload),
 		updateClipAtTime: (payload) => _callWithPayload("updateClipAtTime", payload),
-		setupPreviewSequence: (payload) => _callWithPayload("setupPreviewSequence", payload),
+		// 프리뷰 시퀀스를 새로 만들 때 v27 호스트가 작업 시퀀스 대신 프로젝트의 첫 시퀀스를 활성으로 되돌린다
+		// (qe.newSequence 뒤에 저장해 둔 activeSequence가 프리뷰를 가리키게 되기 때문. 2026-09-25 실측).
+		// 호스트는 바꾸지 않고, 부르기 전 시퀀스 ID를 기억했다가 달라졌으면 되돌린다.
+		setupPreviewSequence: async (payload) => {
+			let before = null;
+			try { before = await host.getActiveSequenceInfo(); } catch (_) {}
+			const r = await _callWithPayload("setupPreviewSequence", payload);
+			await _restoreActiveSequence(before);
+			return r;
+		},
 		applyPreviewParams: (payload) => _callWithPayload("applyPreviewParams", payload),
 		capturePreviewFrame: (payload) => _callWithPayload("capturePreviewFrame", payload),
 		seekToClip: (payload) => _callWithPayload("seekToClip", payload),
