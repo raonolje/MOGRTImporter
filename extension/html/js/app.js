@@ -41,6 +41,10 @@
 	//   _rowRes     줄마다 마지막 적용 결과 문구 {줄 id: "타임라인에 클립 없음" …} (.sub-res). 메모리에만, renderAll이 비운다
 	//   _legacyRun  실행 중인 '안전하게 적용' {stop}. [중지]가 stop을 켜면 줄 사이에서 멈춘다
 	var _rowRes = null, _legacyRun = null;
+	// 화자 표 (src/ui/cast.ts, S2-3). renderAll·renderCastBar가 부팅 중에 읽으므로 여기 둔다.
+	//   _speakerFilter  화자 칩에서 고른 화자 키 (비면 모두 보인다). 키가 바뀌면(시퀀스 전환) 비운다
+	//   _miNumTracks    마지막으로 호스트에서 읽은 비디오 트랙 수 (모르면 null: 화자 표의 '새로 만듦' 표시)
+	var _speakerFilter = new Set(), _miNumTracks = null;
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -166,6 +170,36 @@
 		const root = _getCacheRoot();
 		if (!root) return null;
 		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/settings.json";
+	}
+	// cast_defaults.json (프로젝트 단위, S2-3): C번호별 이름·기본 프리셋·색·위치의 기본값 {v, C1: {name, presetId, color, pos}, …}
+	function _getCastDefaultsPath() {
+		const root = _getCacheRoot();
+		if (!root) return null;
+		return root + "/" + state.currentProjectKey + "/cast_defaults.json";
+	}
+	// 지금 프로젝트의 cast_defaults (core castDefaultsOf로 거른 {C1: {...}}). 프로젝트 키마다 한 번 읽는다
+	var _castDefaultsMemo = null; // {pk, data}
+	function _loadCastDefaults() {
+		const pk = state.currentProjectKey;
+		if (_castDefaultsMemo && _castDefaultsMemo.pk === pk) return _castDefaultsMemo.data;
+		const path = _getCastDefaultsPath();
+		const data = castDefaultsOf(path ? _fsRead(path) : null);
+		_castDefaultsMemo = { pk, data };
+		return data;
+	}
+	// 화자 keys의 지금 이름·기본 프리셋·색·위치를 cast_defaults.json에 적는다 (내용이 바뀌었을 때만). 키가 정해지기 전에는 쓰지 않는다
+	function _saveCastDefaults(keys) {
+		try {
+			if (!_keysResolved || !keys || !keys.length) return false;
+			const path = _getCastDefaultsPath();
+			if (!path) return false;
+			const cur = _loadCastDefaults();
+			const next = castDefaultsMerge(cur, (state.mi && state.mi.cast) || {}, keys);
+			if (stableJson(next) === stableJson(cur)) return true;
+			if (!_fsWrite(path, Object.assign({ v: 1 }, next))) return false;
+			_castDefaultsMemo = { pk: state.currentProjectKey, data: next };
+			return true;
+		} catch (_) { return false; }
 	}
 	// ── localStorage → 파일 마이그레이션 (최초 1회) ──
 	// 파일이 '있는가'는 _fsExists로 본다. _fsRead는 있는데 읽지 못한 파일에도 null을 돌려주므로
@@ -398,6 +432,8 @@
 		// nextId를 내리고 mi 없이 저장한 경우). 줄·휴지통은 위에서 거른 배열로 본다 (파일의 타입이 틀려도 던지지 않게)
 		state.mi = _miForLoadedSession(r.data || null);
 		state.nextId = r.exists ? safeNextId({ nextId: sdata.nextId, subtitles: state.subtitles, trashBin: state.trashBin }, state.mi.hwm) : 1;
+		// 화자 칩 필터는 시퀀스마다 새로 (다른 시퀀스에서 고른 화자로 줄이 숨지 않게)
+		_speakerFilter.clear();
 	}
 	function loadSessionFromStorage() {
 		try {
@@ -419,6 +455,15 @@
 				// 끊은 id도 새 프리셋에 다시 주지 않는다 (작업 파일·다른 시퀀스가 아직 그 id를 가리킬 수 있다)
 				_notePresetRef(presetNum(rs.presetId));
 				rs.presetId = "";
+			}
+		});
+		// 화자 표의 기본 프리셋도 같다 (S2-3): 없는 프리셋이면 비운다
+		const cast = (state.mi && state.mi.cast) || {};
+		Object.keys(cast).forEach((K) => {
+			const c = cast[K];
+			if (c && c.presetId && !state.presets[c.presetId]) {
+				_notePresetRef(presetNum(c.presetId));
+				c.presetId = "";
 			}
 		});
 		// 유효한 presetId만 색상 맵에 등록
@@ -492,7 +537,7 @@
 			console.warn("[MOGRT] 프리셋 참조 훑기 실패:", err);
 		}
 	}
-	// 새 id가 피해야 할 참조: 행·자막 휴지통·화자 표가 가리키는 id + 메모리 밖에서 본 가장 큰 번호
+	// 새 id가 피해야 할 참조: 행·자막 휴지통·화자 표·프로젝트 cast_defaults가 가리키는 id + 메모리 밖에서 본 가장 큰 번호
 	function _presetRefs() {
 		_scanDiskPresetRefs();
 		const refs = [];
@@ -500,13 +545,14 @@
 		(state.trashBin || []).forEach((t) => { if (t && t.state && t.state.presetId) refs.push(t.state.presetId); });
 		const cast = (state.mi && state.mi.cast) || {};
 		Object.keys(cast).forEach((k) => { if (cast[k] && cast[k].presetId) refs.push(cast[k].presetId); });
+		const dflt = _loadCastDefaults();
+		Object.keys(dflt).forEach((k) => { if (dflt[k] && dflt[k].presetId) refs.push(dflt[k].presetId); });
 		const outside = _presetRefEntry().max;
 		if (outside > 0) refs.push("preset_" + outside);
 		return refs;
 	}
 	// 새 프리셋 id (단조 증가, 빈 번호를 다시 쓰지 않는다). state.nextPresetId를 함께 올린다.
-	// 참조: 살아 있는 프리셋, 프리셋 휴지통, 행과 자막 휴지통·화자 표(mi.cast)가 가리키는 id, 메모리 밖 참조(_presetRefs).
-	// (S2-3에서 cast_defaults가 참조에 더해진다)
+	// 참조: 살아 있는 프리셋, 프리셋 휴지통, 행과 자막 휴지통·화자 표(mi.cast)·cast_defaults가 가리키는 id, 메모리 밖 참조(_presetRefs).
 	// 호출한 쪽이 savePresetsToStorage()로 저장한다.
 	function _allocPresetId() {
 		const r = nextFreePresetId(state.presets, state.presetTrash, _presetRefs(), state.nextPresetId);
@@ -1487,6 +1533,135 @@
 		for (let c = 0; c < CAST_COLORS; c++) if (!used[c]) return c;
 		return keys.length % CAST_COLORS;
 	}
+	// cast_defaults.json(프로젝트 단위) → {C1: {name, presetId, color, pos}} (형식이 틀린 항목은 뺀다. v 등 C번호가 아닌 키도 뺀다)
+	function castDefaultsOf(file) {
+		const out = {};
+		if (!file || typeof file !== "object" || Array.isArray(file)) return out;
+		Object.keys(file).forEach((K) => {
+			const d = file[K];
+			if (!castKeyNum(K) || !d || typeof d !== "object" || Array.isArray(d)) return;
+			out[K] = {
+				name: typeof d.name === "string" ? d.name : "",
+				presetId: typeof d.presetId === "string" ? d.presetId : "",
+				color: typeof d.color === "number" && isFinite(d.color) ? d.color : null,
+				pos: d.pos && typeof d.pos === "object" && typeof d.pos.x === "number" && typeof d.pos.y === "number" ? { x: d.pos.x, y: d.pos.y } : null
+			};
+		});
+		return out;
+	}
+	// 화자 표(cast)의 keys 화자를 기본값에 적는다 → 새 기본값 (입력은 바꾸지 않는다). 이름이 키 그대로면(이름을 정하지 않았다) 이름은 두지 않는다
+	function castDefaultsMerge(defaults, cast, keys) {
+		const out = JSON.parse(JSON.stringify(defaults || {}));
+		(keys || []).forEach((K) => {
+			const c = cast && cast[K];
+			if (!castKeyNum(K) || !c) return;
+			const prev = out[K] || { name: "", presetId: "", color: null, pos: null };
+			const nm = String(c.name == null ? "" : c.name).trim();
+			out[K] = {
+				name: nm && nm !== K ? nm : prev.name,
+				presetId: typeof c.presetId === "string" ? c.presetId : prev.presetId,
+				color: typeof c.color === "number" ? c.color : prev.color,
+				pos: c.pos && typeof c.pos === "object" ? { x: c.pos.x, y: c.pos.y } : null
+			};
+		});
+		return out;
+	}
+	// 화자 → 비디오 트랙 (계획서 §6.2, spec placement 2). 순수.
+	//   castOrder, cast (mi.cast), base = 기본 트랙 (#trackSel, 0부터)
+	//   o.spans     {K: [[시작, 끝], …]} 화자 줄의 구간 (프레임이든 초든 한 단위로)
+	//   o.scan      호스트 트랙 스캔 (getTracks 결과나 그 tracks 배열). 없으면 트랙의 클립을 모른다 (화자 표 미리보기)
+	//   o.salt, o.rowSpk {줄 id: 화자 키}  우리 태그 클립이 어느 화자의 것인가 (그 화자의 트랙 고르기를 막지 않는다)
+	//   o.affinity  {K: 트랙} 다른 salt 태그 클립이 문장까지 맞는 트랙 (복제한 시퀀스) — 기억한 트랙이 없는 자동 화자가 먼저 쓴다
+	//   o.numTracks 지금 비디오 트랙 수 (없으면 스캔의 numVideoTracks, 그것도 없으면 모른다)
+	// 규칙:
+	//   고정(cast[K].track) 화자 둘이 한 트랙이면 줄 구간이 겹칠 때 막는다 → blocked
+	//   자동 화자는 castOrder 순서로: 첫 자동 화자는 정확히 기본 트랙(다른 화자가 고정했으면 아래로).
+	//   그다음은 기억한 autoTrack(다른 화자가 쓰지 않으면), affinity, 그것도 없으면 기본 트랙보다 위에서 아무도 쓰지 않고
+	//   잠기지 않았고 남의 클립이 그 화자의 [처음, 끝] 구간과 겹치지 않는 가장 낮은 트랙. 트랙 수 이상이면 새로 만든다.
+	// → {tracks: {K: {track, auto, create, locked}}, blocked: [{keys: [K1, K2], track}], minCount: 필요한 트랙 수 (늘릴 필요가 없으면 0)}
+	function resolveTracks(castOrder, cast, base, o) {
+		const opt = o || {};
+		const order = (castOrder || []).filter((K) => cast && cast[K]);
+		const spans = opt.spans || {};
+		const scanTracks = opt.scan ? (Array.isArray(opt.scan) ? opt.scan : Array.isArray(opt.scan.tracks) ? opt.scan.tracks : []) : null;
+		let numTracks = typeof opt.numTracks === "number" ? opt.numTracks : null;
+		if (numTracks === null && opt.scan && typeof opt.scan.numVideoTracks === "number") numTracks = opt.scan.numVideoTracks;
+		const byTrack = {};
+		(scanTracks || []).forEach((t) => { if (t && typeof t.i === "number") byTrack[t.i] = t; });
+		const rowSpk = opt.rowSpk || {};
+		const salt = String(opt.salt || "");
+		const b = typeof base === "number" && base >= 0 ? base : 0;
+		const out = { tracks: {}, blocked: [], minCount: 0 };
+		const claim = {};
+		const put = (K, t, auto) => {
+			(claim[t] = claim[t] || []).push(K);
+			const tr = byTrack[t];
+			out.tracks[K] = { track: t, auto, create: numTracks !== null && t >= numTracks, locked: !!(tr && tr.locked) };
+		};
+		const sorted = (K) => (spans[K] || []).filter((x) => x && x[1] > x[0]).slice().sort((x, y) => x[0] - y[0]);
+		const overlaps = (A, B) => {
+			const a = sorted(A);
+			const c = sorted(B);
+			let i = 0;
+			let j = 0;
+			while (i < a.length && j < c.length) {
+				if (a[i][0] < c[j][1] && c[j][0] < a[i][1]) return true;
+				if (a[i][1] <= c[j][1]) i++;
+				else j++;
+			}
+			return false;
+		};
+		const range = (K) => {
+			let lo = Infinity;
+			let hi = -Infinity;
+			sorted(K).forEach((x) => { if (x[0] < lo) lo = x[0]; if (x[1] > hi) hi = x[1]; });
+			return lo < hi ? [lo, hi] : null;
+		};
+		// 트랙 t의 클립이 화자 K를 막는가 (스캔을 모르면 막지 않는다)
+		const blocks = (t, K) => {
+			const tr = byTrack[t];
+			if (!tr) return false;
+			if (tr.locked) return true;
+			const r = range(K);
+			if (!r) return false;
+			return (tr.clips || []).some((c) => {
+				if (!c || !(c.sf < r[1] && c.ef > r[0])) return false;
+				const tag = parseClipTag(c.name);
+				if (tag && salt && tag.salt === salt) return rowSpk[tag.id] !== K;
+				return true;
+			});
+		};
+		order.forEach((K) => {
+			const t = cast[K].track;
+			if (typeof t === "number" && t >= 0) put(K, t, false);
+		});
+		Object.keys(claim).forEach((t) => {
+			const ks = claim[t];
+			for (let i = 0; i < ks.length; i++) {
+				for (let j = i + 1; j < ks.length; j++) if (overlaps(ks[i], ks[j])) out.blocked.push({ keys: [ks[i], ks[j]], track: Number(t) });
+			}
+		});
+		let first = true;
+		order.forEach((K) => {
+			if (out.tracks[K]) return;
+			let t = null;
+			if (first && !claim[b]) t = b;
+			first = false;
+			if (t === null) {
+				const a = cast[K].autoTrack;
+				if (typeof a === "number" && a >= 0 && !claim[a]) t = a;
+			}
+			if (t === null && opt.affinity && typeof opt.affinity[K] === "number" && opt.affinity[K] >= 0 && !claim[opt.affinity[K]]) t = opt.affinity[K];
+			if (t === null) {
+				for (let i = b + 1; t === null; i++) if (!claim[i] && !blocks(i, K)) t = i;
+			}
+			put(K, t, true);
+		});
+		let need = 0;
+		Object.keys(out.tracks).forEach((K) => { if (out.tracks[K].track + 1 > need) need = out.tracks[K].track + 1; });
+		if (numTracks !== null && need > numTracks) out.minCount = need;
+		return out;
+	}
 	// SRT 열기 경로 (계획서 §3.4)
 	//   o.castEnabled  여러 파일 가져오기 플래그
 	//   o.files        [{key, ambiguous}] (parseCaptionKey 결과)
@@ -2226,8 +2401,9 @@
 	//          keepPanelEdits, legacy: null | {mode, oneKey, assign} (화자 없는 기존 줄을 나눈다)}
 	//         cues = parseSRT(text, {keepNo, stripTags}). 자막이 0개인 파일은 건너뛴다.
 	//         key가 null인 파일은 화자 없는 레거시 목록에 병합한다 (C번호 없는 한 파일 + 프리셋이 있는 목록)
-	//   ctx   {now, salt: mi.salt가 비었을 때 쓸 값, presets: 살아 있는 프리셋, trackValue: 분배 때 mi.legacyTrack}
-	// 화자 만들기: 이름 = 입력 > 키, 트랙 자동(null), 색 = 비어 있는 첫 색, castOrder는 C번호 순.
+	//   ctx   {now, salt: mi.salt가 비었을 때 쓸 값, presets: 살아 있는 프리셋, trackValue: 분배 때 mi.legacyTrack,
+	//          castDefaults: 프로젝트 cast_defaults (castDefaultsOf, 없어도 된다)}
+	// 화자 만들기: 이름 = 입력 > cast_defaults > 키, 트랙 자동(null), 색 = cast_defaults(겹치지 않으면) > 비어 있는 첫 색, castOrder는 C번호 순.
 	// 화자 K에 살아 있는 줄이나 휴지통 항목이 있으면(분배로 넘어온 기존 줄 포함) 병합, 없으면 새 줄로 넣는다.
 	// "replace"는 K의 살아 있는 줄을 휴지통(why "replace")으로 보내고 새로 넣는다.
 	// → {files: [{idx, key, action, count, name, stats?, shift?, suspect?}], legacy: 분배 결과 | null}
@@ -2260,7 +2436,13 @@
 				const info = f.file || {};
 				cast = mi.cast[K];
 				if (!cast) {
-					cast = { name: nm || K, track: null, autoTrack: null, presetId: presetOk(f.presetId) ? f.presetId : "", color: castColorFree(mi.cast),
+					// 새 화자: 이름 = 입력 > 프로젝트 기본값(cast_defaults) > 키. 프리셋은 고른 값, 고르지 않았으면(undefined) 기본값.
+					// 색은 기본값이 다른 화자와 겹치지 않으면 그것, 아니면 비어 있는 첫 색
+					const dflt = c.castDefaults && c.castDefaults[K] ? c.castDefaults[K] : null;
+					const dColor = dflt && typeof dflt.color === "number" && dflt.color >= 0 && dflt.color < CAST_COLORS &&
+						!Object.keys(mi.cast).some((k) => mi.cast[k] && mi.cast[k].color === dflt.color) ? dflt.color : null;
+					const pid = presetOk(f.presetId) ? f.presetId : f.presetId === undefined && dflt && presetOk(dflt.presetId) ? dflt.presetId : "";
+					cast = { name: nm || (dflt && dflt.name) || K, track: null, autoTrack: null, presetId: pid, color: dColor !== null ? dColor : castColorFree(mi.cast),
 						file: info.name || "", path: info.path || null, size: typeof info.size === "number" ? info.size : null, mtime: typeof info.mtime === "number" ? info.mtime : null, pos: null };
 					mi.cast[K] = cast;
 				} else {
@@ -4193,13 +4375,32 @@
 	}
 	function restoreSubtitle(trashIdx) {
 		const item = state.trashBin.splice(trashIdx, 1)[0];
-		const pos = Math.min(item.position, state.subtitles.length);
-		state.subtitles.splice(pos, 0, item.sub);
-		state.rowStates[item.sub.id] = item.state;
+		_restoreTrashItem(item);
 		renderAll();
 		renderTrash();
 		saveSessionToStorage();
-		_setStatus$3("자막 " + item.sub.index + "번 복구됨", "ok");
+		_setStatus$3("자막 " + (item.sub.spk && _castMode() ? rowLabel(item.sub, true) : item.sub.index) + "번 복구됨", "ok");
+	}
+	// 휴지통 항목 하나를 목록에 되넣는다.
+	//   화자 줄: (시작 시각, 화자 순서) 자리에 넣고 그 화자의 번호를 다시 매긴다. 화자 표에 없는 화자면 다시 만든다 (S2-3)
+	//   화자 없는 줄: v27 그대로 지웠던 자리(position, 목록 길이를 넘으면 끝)에
+	function _restoreTrashItem(item) {
+		const sub = item.sub;
+		if (sub && sub.spk) {
+			_ensureCastEntry(sub.spk);
+			const order = state.mi.castOrder;
+			const rank = (s) => (s && s.spk ? order.indexOf(s.spk) : -1);
+			const t = sub.startSec || 0;
+			let pos = state.subtitles.findIndex((s) => (s.startSec || 0) > t || ((s.startSec || 0) === t && rank(s) > rank(sub)));
+			if (pos === -1) pos = state.subtitles.length;
+			state.subtitles.splice(pos, 0, sub);
+			state.rowStates[sub.id] = item.state;
+			renumberRows(state.subtitles, sub.spk);
+			return;
+		}
+		const pos = Math.min(item.position, state.subtitles.length);
+		state.subtitles.splice(pos, 0, sub);
+		state.rowStates[sub.id] = item.state;
 	}
 	function renderPresetTrash() {
 		const presetTrashWrap = document.getElementById("presetTrashWrap");
@@ -4260,11 +4461,9 @@
 			if (count === 0) return;
 			const sorted = [...state.trashBin].sort((a, b) => a.position - b.position);
 			state.trashBin = [];
-			sorted.forEach((item) => {
-				const pos = Math.min(item.position, state.subtitles.length);
-				state.subtitles.splice(pos, 0, item.sub);
-				state.rowStates[item.sub.id] = item.state;
-			});
+			// 화자 없는 줄은 v27처럼 자리 순서로 먼저, 화자 줄은 그다음 (시작 시각, 화자 순서) 자리에 (_restoreTrashItem)
+			sorted.filter((item) => !(item.sub && item.sub.spk)).forEach(_restoreTrashItem);
+			sorted.filter((item) => item.sub && item.sub.spk).forEach(_restoreTrashItem);
 			renderAll();
 			renderTrash();
 			saveSessionToStorage();
@@ -4434,9 +4633,13 @@
 	}
 	function deletePreset(pid) {
 		if (!state.presets[pid]) return;
-		const usedBy = state.subtitles.filter((sub) => state.rowStates[sub.id]?.presetId === pid).map((sub) => sub.index);
+		const users = state.subtitles.filter((sub) => state.rowStates[sub.id]?.presetId === pid);
 		let msg = "\"" + state.presets[pid].name + "\" 프리셋을 삭제하시겠습니까?";
-		if (usedBy.length > 0) msg += "\n\n⚠ 이 프리셋은 자막 " + usedBy.join(", ") + "번에 적용되어 있습니다.\n삭제하면 해당 자막의 프리셋 설정이 초기화됩니다.";
+		// 다화자 목록은 줄 주소 "C2·12" (S2-3), 단일 화자는 v27 문구 그대로
+		if (users.length > 0 && _castMode()) msg += "\n\n⚠ 이 프리셋은 자막 " + users.map((sub) => rowLabel(sub, true)).join(", ") + "에 적용되어 있습니다.\n삭제하면 해당 자막의 프리셋 설정이 초기화됩니다.";
+		else if (users.length > 0) msg += "\n\n⚠ 이 프리셋은 자막 " + users.map((sub) => sub.index).join(", ") + "번에 적용되어 있습니다.\n삭제하면 해당 자막의 프리셋 설정이 초기화됩니다.";
+		const castUsers = _castKeys().filter((K) => state.mi.cast[K].presetId === pid);
+		if (castUsers.length > 0) msg += "\n⚠ 화자 기본 프리셋: " + castUsers.map((K) => K + " " + _castName(K)).join(", ") + " — 삭제하면 비워집니다.";
 		showConfirm(msg, () => doDeletePreset(pid));
 	}
 	function doDeletePreset(pid) {
@@ -4455,7 +4658,8 @@
 				rs.params = [];
 				rs._allParams = [];
 				const row = document.getElementById("row-" + sub.id);
-				if (row) row.className = "sub-row no-mogrt";
+				// v27은 "sub-row no-mogrt"로 덮어 체크 표시·필터 클래스가 빠졌다 → _buildRowClass + 아래에서 필터를 다시 건다 (S2-3)
+				if (row) row.className = _buildRowClass(sub.id, rs, sub);
 				const sel = document.getElementById("sel-" + sub.id);
 				if (sel) {
 					sel.innerHTML = "";
@@ -4471,6 +4675,10 @@
 				}
 			}
 		});
+		// 화자 표의 기본 프리셋이 이 프리셋이면 비운다 (프리셋 휴지통에서 되살려도 다시 이어지지 않는다)
+		const cast = (state.mi && state.mi.cast) || {};
+		Object.keys(cast).forEach((K) => { if (cast[K] && cast[K].presetId === pid) cast[K].presetId = ""; });
+		_reapplyFilters();
 		savePresetsToStorage();
 		saveSessionToStorage();
 		renderPresetList();
@@ -6349,6 +6557,458 @@ var modalState = {
 		});
 	}
 	//#endregion
+	//#region src/ui/cast.ts
+	// ─────────────────────────────────────────────────────────────
+	// 화자 표 (#castBar), 화자 칩 (#speakerChips), 필터 다시 걸기 (S2-3)
+	//
+	// 화자 표는 state.mi.cast / castOrder (session.json의 mi, cast.json 사본). 화자가 있을 때만 보인다 → 단일 화자 화면은 v27 그대로.
+	//   한 줄에 한 화자: 색 점(누르면 8색 순환) · 키(누르면 그 화자만 보기) · 이름 · 트랙("자동 (V4)" 또는 고정) · 기본 프리셋 · 줄 수 · ⋯
+	//   ⋯ 메뉴: 이 화자 줄에 기본 프리셋 적용 (안전 지점 '기본 프리셋 일괄 적용 전: C2', 다른 프리셋이 걸린 줄이 있으면 묻는다),
+	//          이 화자 줄 선택, 화자 삭제 (줄은 휴지통으로)
+	//   고치면 session.json·cast.json(saveSessionToStorage)과 프로젝트의 cast_defaults.json을 쓰고 히스토리에 자동 항목을 남긴다.
+	//   색 점은 자주 누르는 표시라 히스토리에는 남기지 않는다 (저장은 한다).
+	//   트랙 표시는 core resolveTracks를 스캔 없이 돌린 미리보기다 (_castTrackPreview). 실제 배치는 타임라인 스캔으로 다시 정한다.
+	// 화자 칩: 화자가 둘 이상일 때 "전체 · C1 철수 · C2 영희" (여럿 고를 수 있다). 고르지 않은 화자의 줄은 .speaker-filter-hidden.
+	//   숨긴 줄은 체크를 푼다 (프리셋 필터와 같다 → '선택 삭제'가 숨은 줄을 지우지 않는다).
+	// 필터 다시 걸기 (_reapplyFilters): 줄의 className을 새로 쓰면 검색·프리셋·화자 필터 클래스가 빠진다 → 새로 쓴 뒤마다 부른다.
+	//   부팅 중에는 renderAll이 main.ts의 필터 선언보다 먼저 돈다 → _filtersReady가 거짓이면 바로 돌아간다 (TDZ)
+	// ─────────────────────────────────────────────────────────────
+	const CAST_COLOR_HEX = ["#42a5f5", "#ef5350", "#66bb6a", "#ffa726", "#ab47bc", "#26c6da", "#d4e157", "#ec407a"];
+	// 트랙 선택지 V2..V10 (#trackSel과 같다)
+	const CAST_TRACK_LAST = 9;
+	// 화자 표 접기 상태 (localStorage, 창마다)
+	const CAST_FOLD_KEY = "mogrt_castFold";
+	function _castKeys() {
+		const mi = state.mi || miDefault();
+		return (mi.castOrder || []).filter((K) => mi.cast && mi.cast[K]);
+	}
+	function _castColorHex(K) {
+		const c = state.mi && state.mi.cast ? state.mi.cast[K] : null;
+		const n = c && typeof c.color === "number" && isFinite(c.color) ? c.color : 0;
+		return CAST_COLOR_HEX[((n % CAST_COLORS) + CAST_COLORS) % CAST_COLORS];
+	}
+	function _castName(K) {
+		const c = state.mi && state.mi.cast ? state.mi.cast[K] : null;
+		return (c && String(c.name || "").trim()) || K;
+	}
+	function _trackName(i) {
+		return "V" + (i + 1);
+	}
+	// 줄의 화자 줄무늬 (다화자 목록의 화자 줄만. 단일 화자 줄에는 style을 쓰지 않는다 → v27 DOM 그대로)
+	function _applyRowStripe(row, sub) {
+		if (!row || !sub || !sub.spk || !_castMode()) return;
+		row.style.borderLeft = "3px solid " + _castColorHex(sub.spk);
+	}
+	function _refreshCastStripes() {
+		state.subtitles.forEach((sub) => _applyRowStripe(document.getElementById("row-" + sub.id), sub));
+	}
+	// 화자마다 줄 구간 [[시작 초, 끝 초]] (트랙 미리보기의 고정 트랙 겹침 확인용)
+	function _castSpansSec() {
+		const spans = {};
+		state.subtitles.forEach((s) => {
+			if (s && s.spk) (spans[s.spk] = spans[s.spk] || []).push([s.startSec, s.endSec]);
+		});
+		return spans;
+	}
+	// 트랙 미리보기 (core resolveTracks, 스캔 없이): 기본 트랙은 #trackSel
+	function _castTrackPreview() {
+		const base = _trackValueNum();
+		return resolveTracks(state.mi.castOrder, state.mi.cast, base === null ? 2 : base, { spans: _castSpansSec(), numTracks: _miNumTracks });
+	}
+	function _castFolded() {
+		try {
+			return localStorage.getItem(CAST_FOLD_KEY) === "1";
+		} catch (_) {
+			return false;
+		}
+	}
+	function renderCastBar() {
+		const bar = document.getElementById("castBar");
+		const box = document.getElementById("castRows");
+		if (!bar || !box) return;
+		const order = _castKeys();
+		_closeCastMenu();
+		box.innerHTML = "";
+		if (!order.length) {
+			bar.style.display = "none";
+			return;
+		}
+		bar.style.display = "";
+		const folded = _castFolded();
+		bar.classList.toggle("folded", folded);
+		const title = document.getElementById("castTitle");
+		if (title) title.textContent = "화자 " + order.length + "명";
+		const fold = document.getElementById("btnCastFold");
+		if (fold) fold.textContent = folded ? "펼치기" : "접기";
+		const pv = _castTrackPreview();
+		const counts = _castCounts();
+		const choices = _impPresetChoices();
+		order.forEach((K) => box.appendChild(_castRowEl(K, pv, counts[K] || 0, choices)));
+	}
+	function _castCounts() {
+		const counts = {};
+		state.subtitles.forEach((s) => { if (s && s.spk) counts[s.spk] = (counts[s.spk] || 0) + 1; });
+		return counts;
+	}
+	// 줄 수만 다시 쓴다 (줄을 지우거나 되살린 뒤, updateMultiSelect에서. 입력 중인 이름 칸을 다시 만들지 않는다)
+	function _updateCastCounts() {
+		const box = document.getElementById("castRows");
+		if (!box) return;
+		const counts = _castCounts();
+		box.querySelectorAll(".cast-row").forEach((row) => {
+			const el = row.querySelector(".cast-count");
+			if (el) el.textContent = (counts[row.dataset.key] || 0) + "줄";
+		});
+	}
+	function _castRowEl(K, pv, count, choices) {
+		const c = state.mi.cast[K];
+		const row = document.createElement("div");
+		row.className = "cast-row";
+		row.dataset.key = K;
+		row.style.borderLeftColor = _castColorHex(K);
+		const dot = document.createElement("span");
+		dot.className = "cast-dot";
+		dot.style.background = _castColorHex(K);
+		dot.title = "화자 색 (누르면 바뀝니다)";
+		dot.addEventListener("click", (e) => {
+			e.stopPropagation();
+			c.color = ((typeof c.color === "number" ? c.color : 0) + 1) % CAST_COLORS;
+			_castCommit(K, null);
+			_refreshCastStripes();
+		});
+		const key = document.createElement("span");
+		key.className = "cast-key" + (_speakerFilter.has(K) ? " filtered" : "");
+		key.textContent = K;
+		key.title = "누르면 이 화자 줄만 보기 (다시 누르면 풀림)";
+		key.addEventListener("click", (e) => {
+			e.stopPropagation();
+			_toggleSpeakerFilter(K);
+		});
+		const name = document.createElement("input");
+		name.type = "text";
+		name.className = "cast-name";
+		name.value = String(c.name || "");
+		name.placeholder = K;
+		name.title = "화자 이름 (클립 이름에 들어갑니다)";
+		name.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") name.blur();
+		});
+		name.addEventListener("change", () => {
+			const v = String(name.value || "").trim() || K;
+			if (v === c.name) return;
+			c.name = v;
+			_castCommit(K, "화자 이름: " + K + " " + v);
+		});
+		const track = document.createElement("select");
+		track.className = "cast-track";
+		track.title = "이 화자의 비디오 트랙 (자동: 첫 화자는 기본 트랙, 다음 화자는 그 위의 빈 트랙)";
+		_fillCastTrackOptions(track, K, pv);
+		track.addEventListener("change", () => {
+			const v = track.value === "" ? null : parseInt(track.value, 10);
+			c.track = v === null || !isFinite(v) ? null : v;
+			_castCommit(K, "화자 트랙: " + K + " " + (c.track === null ? "자동" : _trackName(c.track)));
+		});
+		const preset = document.createElement("select");
+		preset.className = "cast-preset";
+		preset.title = "기본 프리셋 (새 줄과 '이 화자 줄에 기본 프리셋 적용'에 쓴다)";
+		const none = document.createElement("option");
+		none.value = "";
+		none.textContent = "-- 기본 프리셋 --";
+		preset.appendChild(none);
+		const list = choices.slice();
+		if (c.presetId && state.presets[c.presetId] && !list.some((x) => x[0] === c.presetId)) list.push([c.presetId, state.presets[c.presetId].name || c.presetId]);
+		list.forEach(([id, nm]) => {
+			const o = document.createElement("option");
+			o.value = id;
+			o.textContent = nm;
+			preset.appendChild(o);
+		});
+		preset.value = c.presetId && state.presets[c.presetId] ? c.presetId : "";
+		preset.addEventListener("change", () => {
+			c.presetId = preset.value;
+			_castCommit(K, "화자 기본 프리셋: " + K + " " + (c.presetId ? state.presets[c.presetId].name || c.presetId : "없음"));
+		});
+		const cnt = document.createElement("span");
+		cnt.className = "cast-count";
+		cnt.textContent = count + "줄";
+		const more = document.createElement("button");
+		more.className = "cast-more";
+		more.textContent = "⋯";
+		more.title = "이 화자";
+		more.addEventListener("click", (e) => {
+			e.stopPropagation();
+			_openCastMenu(row, K);
+		});
+		[dot, key, name, track, preset, cnt, more].forEach((el) => row.appendChild(el));
+		return row;
+	}
+	// 트랙 선택지: "자동 (V4)" + V2..V10 (다른 화자가 쓰는 트랙은 "(철수)", 아직 없는 트랙은 "(새로 만듦)")
+	function _fillCastTrackOptions(sel, K, pv) {
+		const c = state.mi.cast[K];
+		const mine = pv.tracks[K] || null;
+		const pinned = typeof c.track === "number" && c.track >= 0;
+		const users = {};
+		Object.keys(pv.tracks).forEach((k) => {
+			if (k !== K) (users[pv.tracks[k].track] = users[pv.tracks[k].track] || []).push(_castName(k));
+		});
+		const isNew = (i) => _miNumTracks !== null && i >= _miNumTracks;
+		const auto = document.createElement("option");
+		auto.value = "";
+		auto.textContent = !pinned && mine ? "자동 (" + _trackName(mine.track) + (isNew(mine.track) ? ", 새로 만듦" : "") + ")" : "자동";
+		sel.appendChild(auto);
+		let last = CAST_TRACK_LAST;
+		if (mine && mine.track > last) last = mine.track;
+		if (pinned && c.track > last) last = c.track;
+		for (let i = 1; i <= last; i++) {
+			const o = document.createElement("option");
+			o.value = String(i);
+			o.textContent = _trackName(i) + (users[i] ? " (" + users[i].join(", ") + ")" : "") + (isNew(i) ? " (새로 만듦)" : "");
+			sel.appendChild(o);
+		}
+		sel.value = pinned ? String(c.track) : "";
+	}
+	// 화자 표를 고친 뒤: 저장(session.json·cast.json) → cast_defaults.json → 히스토리 자동 항목(label이 있을 때) → 다시 그리기
+	function _castCommit(K, label) {
+		saveSessionToStorage();
+		_saveCastDefaults([K]);
+		if (label) _saveHistoryOnAction(label);
+		renderCastBar();
+		renderSpeakerChips();
+	}
+	// ⋯ 메뉴 (열려 있는 것은 하나)
+	var _castMenuEl = null;
+	function _closeCastMenu() {
+		if (_castMenuEl && _castMenuEl.parentNode) _castMenuEl.parentNode.removeChild(_castMenuEl);
+		_castMenuEl = null;
+	}
+	function _openCastMenu(row, K) {
+		const wasOpen = !!_castMenuEl && _castMenuEl.dataset.key === K;
+		_closeCastMenu();
+		if (wasOpen) return;
+		const menu = document.createElement("div");
+		menu.className = "cast-menu open";
+		menu.dataset.key = K;
+		const item = (label, act, cls) => {
+			const b = document.createElement("button");
+			b.textContent = label;
+			b.dataset.act = act;
+			if (cls) b.className = cls;
+			b.addEventListener("click", (e) => {
+				e.stopPropagation();
+				_closeCastMenu();
+				if (act === "preset") _castApplyDefaultPreset(K);
+				else if (act === "select") _castSelectRows(K);
+				else if (act === "delete") _castDelete(K);
+			});
+			menu.appendChild(b);
+		};
+		item("이 화자 줄에 기본 프리셋 적용", "preset");
+		item("이 화자 줄 선택", "select");
+		item("화자 삭제 (줄은 휴지통으로)", "delete", "danger");
+		row.appendChild(menu);
+		_castMenuEl = menu;
+	}
+	document.addEventListener("click", (e) => {
+		if (_castMenuEl && !(e.target && typeof e.target.closest === "function" && e.target.closest(".cast-menu"))) _closeCastMenu();
+	});
+	document.getElementById("btnCastFold")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		const next = !_castFolded();
+		try { localStorage.setItem(CAST_FOLD_KEY, next ? "1" : "0"); } catch (_) {}
+		renderCastBar();
+	});
+	// 이 화자 줄에 기본 프리셋 적용: 안전 지점을 먼저 남기고, 다른 프리셋이 걸린 줄이 있으면 [모두 적용] [빈 줄만] [취소]로 묻는다.
+	// 이미 그 프리셋인 줄은 건드리지 않는다 (후반 작업 값이 그대로). 줄 값은 프리셋에서 새로 채운다 (v27 프리셋 선택과 같다)
+	function _castApplyDefaultPreset(K) {
+		const c = state.mi.cast[K];
+		const pid = c && c.presetId;
+		if (!pid || !state.presets[pid]) {
+			setStatus(K + " " + _castName(K) + ": 기본 프리셋을 먼저 고르세요", "err");
+			return;
+		}
+		const subs = state.subtitles.filter((s) => s.spk === K);
+		const pidOf = (s) => (state.rowStates[s.id] && state.rowStates[s.id].presetId) || "";
+		const empty = subs.filter((s) => !pidOf(s));
+		const other = subs.filter((s) => pidOf(s) && pidOf(s) !== pid);
+		const pname = state.presets[pid].name || pid;
+		const seq = _importSeqToken();
+		const run = (list) => {
+			if (seq !== _importSeqToken()) {
+				setStatus("시퀀스가 바뀌어 기본 프리셋 적용을 취소했습니다", "err");
+				return;
+			}
+			if (!list.length) {
+				setStatus(K + " " + _castName(K) + ": 바꿀 줄이 없습니다 (모두 '" + pname + "')", "ok");
+				return;
+			}
+			_saveSafety("기본 프리셋 일괄 적용 전: " + K);
+			const want = _idSet(list.map((s) => s.id));
+			state.subtitles.forEach((sub) => {
+				if (!want[sub.id]) return;
+				let rs = state.rowStates[sub.id];
+				if (!rs) rs = state.rowStates[sub.id] = { presetId: "", params: [], _allParams: [], open: false, checked: false };
+				rs.presetId = pid;
+				loadParamsFromPreset(sub.id, pid, sub.text, false);
+				const row = document.getElementById("row-" + sub.id);
+				if (row) row.className = _buildRowClass(sub.id, rs, sub);
+				const sel = document.getElementById("sel-" + sub.id);
+				if (sel) sel.value = pid;
+			});
+			saveSessionToStorage();
+			_reapplyFilters();
+			updateMultiSelect();
+			_saveHistoryOnAction("기본 프리셋 일괄 적용: " + K + " (" + list.length + "줄)");
+			setStatus(K + " " + _castName(K) + ": 기본 프리셋 '" + pname + "' " + list.length + "줄에 적용 (바꾸기 전 상태는 안전 지점에 있습니다)", "ok");
+		};
+		if (!other.length) {
+			run(empty);
+			return;
+		}
+		showChoice(K + " " + _castName(K) + " 줄 " + subs.length + "개 중 " + other.length + "개에는 이미 다른 프리셋이 걸려 있습니다.\n\n" +
+			"모두 적용: 그 줄들도 기본 프리셋 '" + pname + "'으로 바꿉니다. 속성(후반 작업 값)은 새 프리셋 값으로 바뀝니다.\n" +
+			"빈 줄만: 프리셋이 없는 " + empty.length + "줄에만 겁니다.\n\n바꾸기 전 상태는 안전 지점 '기본 프리셋 일괄 적용 전: " + K + "'에 남습니다.", [
+			{ label: "모두 적용 (" + (empty.length + other.length) + ")", run: () => run(empty.concat(other)) },
+			{ label: "빈 줄만 (" + empty.length + ")", run: () => run(empty) },
+			{ label: "취소", run: () => setStatus("기본 프리셋 일괄 적용 취소", "") }
+		]);
+	}
+	// 줄이 필터로 숨었는가
+	function _rowHidden(row) {
+		return !!row && (row.classList.contains("search-hidden") || row.classList.contains("preset-filter-hidden") || row.classList.contains("speaker-filter-hidden"));
+	}
+	// 이 화자 줄 선택: 그 화자의 보이는 줄만 체크하고 나머지는 푼다 (화자 칩이 그 화자를 숨기고 있으면 그 화자만 보이게 바꾼다)
+	function _castSelectRows(K) {
+		if (_speakerFilter.size && !_speakerFilter.has(K)) {
+			_speakerFilter.clear();
+			_speakerFilter.add(K);
+			renderSpeakerChips();
+			renderCastBar();
+			_reapplyFilters();
+		}
+		let n = 0;
+		state.subtitles.forEach((sub) => {
+			const rs = state.rowStates[sub.id];
+			if (!rs) return;
+			const row = document.getElementById("row-" + sub.id);
+			rs.checked = sub.spk === K && !_rowHidden(row);
+			if (rs.checked) n++;
+			const chk = row && row.querySelector("input[type=checkbox]");
+			if (chk) chk.checked = rs.checked;
+			if (row) row.className = _buildRowClass(sub.id, rs, sub);
+		});
+		_reapplyFilters();
+		updateMultiSelect();
+		setStatus(K + " " + _castName(K) + " 줄 " + n + "개 선택", "ok");
+	}
+	// 화자 삭제: 그 화자의 줄은 휴지통으로 (사용자가 지운 것과 같다: 다시 가져오면 그 삭제를 존중한다), 화자 표에서 뺀다.
+	// 타임라인 클립은 지우지 않는다. 먼저 안전 지점을 남긴다
+	function _castDelete(K) {
+		const n = state.subtitles.filter((s) => s.spk === K).length;
+		const nm = _castName(K);
+		const seq = _importSeqToken();
+		showConfirm("화자 " + K + " " + nm + "을(를) 삭제합니다.\n\n이 화자의 줄 " + n + "개는 휴지통으로 갑니다 (후반 작업은 휴지통 항목에 남습니다).\n타임라인의 클립은 지우지 않습니다.", () => {
+			if (seq !== _importSeqToken()) {
+				setStatus("시퀀스가 바뀌어 화자 삭제를 취소했습니다", "err");
+				return;
+			}
+			_saveSafety("화자 삭제 전: " + K);
+			const data = { subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin };
+			moveKeyToTrash(data, K, undefined, Date.now());
+			delete state.mi.cast[K];
+			state.mi.castOrder = state.mi.castOrder.filter((k) => k !== K);
+			_speakerFilter.delete(K);
+			renderAll();
+			renderTrash();
+			updateMultiSelect();
+			saveSessionToStorage();
+			_saveHistoryOnAction("화자 삭제: " + K + " " + nm + " (" + n + "줄 → 휴지통)");
+			setStatus("화자 " + K + " " + nm + " 삭제 — 줄 " + n + "개는 휴지통에 있습니다", "ok");
+		}, null, { yes: "화자 삭제" });
+	}
+	// 휴지통에서 되살린 화자 줄의 화자가 화자 표에 없으면 다시 만든다 (이름·프리셋·색은 cast_defaults, 없으면 키)
+	function _ensureCastEntry(K) {
+		const mi = state.mi;
+		if (!K || mi.cast[K]) return;
+		const d = _loadCastDefaults()[K] || null;
+		const color = d && typeof d.color === "number" && !Object.keys(mi.cast).some((k) => mi.cast[k] && mi.cast[k].color === d.color) ? d.color : castColorFree(mi.cast);
+		mi.cast[K] = { name: (d && d.name) || K, track: null, autoTrack: null, presetId: d && d.presetId && state.presets[d.presetId] ? d.presetId : "", color, file: "", path: null, size: null, mtime: null, pos: null };
+		if (mi.castOrder.indexOf(K) === -1) mi.castOrder = sortCastKeys(mi.castOrder.concat([K]));
+	}
+
+	// ── 화자 칩과 필터 ──
+
+	function renderSpeakerChips() {
+		const box = document.getElementById("speakerChips");
+		if (!box) return;
+		const order = _castKeys();
+		// 화자 표에서 사라진 키는 필터에서 뺀다
+		Array.from(_speakerFilter).forEach((K) => { if (order.indexOf(K) === -1) _speakerFilter.delete(K); });
+		box.innerHTML = "";
+		if (order.length < 2) {
+			box.style.display = "none";
+			return;
+		}
+		box.style.display = "";
+		const chip = (label, active, title, onClick) => {
+			const b = document.createElement("button");
+			b.className = "spk-chip" + (active ? " active" : "");
+			b.textContent = label;
+			b.title = title;
+			b.addEventListener("click", (e) => {
+				e.stopPropagation();
+				onClick();
+			});
+			box.appendChild(b);
+			return b;
+		};
+		chip("전체", _speakerFilter.size === 0, "모든 화자의 줄 보기", () => {
+			_speakerFilter.clear();
+			_onSpeakerFilterChange();
+		});
+		order.forEach((K) => {
+			const b = chip(K + " " + _castName(K), _speakerFilter.has(K), "이 화자 줄 보기 (여럿 고를 수 있다)", () => _toggleSpeakerFilter(K));
+			b.dataset.key = K;
+			b.style.borderLeft = "3px solid " + _castColorHex(K);
+		});
+	}
+	function _toggleSpeakerFilter(K) {
+		if (_speakerFilter.has(K)) _speakerFilter.delete(K);
+		else _speakerFilter.add(K);
+		_onSpeakerFilterChange();
+	}
+	function _onSpeakerFilterChange() {
+		renderSpeakerChips();
+		renderCastBar();
+		_reapplyFilters();
+	}
+	// 화자 필터: 고른 화자가 있으면 그 화자의 줄만 보인다 (화자 없는 줄도 숨긴다). 숨긴 줄은 체크를 푼다
+	function _applySpeakerFilter() {
+		const active = _speakerFilter.size > 0 && _castMode();
+		state.subtitles.forEach((sub) => {
+			const row = document.getElementById("row-" + sub.id);
+			if (!row) return;
+			if (!active || (sub.spk && _speakerFilter.has(sub.spk))) {
+				row.classList.remove("speaker-filter-hidden");
+				return;
+			}
+			row.classList.add("speaker-filter-hidden");
+			const rs = state.rowStates[sub.id];
+			if (rs && rs.checked) {
+				rs.checked = false;
+				row.classList.remove("is-checked");
+				const chk = row.querySelector("input[type=checkbox]");
+				if (chk) chk.checked = false;
+			}
+		});
+	}
+	// 검색·화자·프리셋 필터를 다시 건다 (줄의 className을 새로 쓴 뒤, renderAll 뒤). 부팅 중(필터 선언 전)에는 하지 않는다
+	function _reapplyFilters() {
+		if (!_filtersReady) return;
+		_applySubSearch();
+		_applySpeakerFilter();
+		_applyPresetFilter(); // updateMultiSelect까지 부른다
+	}
+	//#endregion
 	//#region src/ui/subtitleList.ts
 	var _setStatus = () => {};
 	var _updateMultiSelect = () => {};
@@ -6364,12 +7024,18 @@ var modalState = {
 		}
 		return _presetColorMap[presetId];
 	}
-	function _buildRowClass(subId, rs) {
+	// 줄의 className. 다화자 목록의 화자 줄은 뒤에 " spk-C2" (단일 화자 줄은 v27 그대로).
+	// 필터 클래스(search-hidden 등)는 넣지 않는다 → 새로 쓴 뒤 _reapplyFilters()를 부른다 (src/ui/cast.ts)
+	function _buildRowClass(subId, rs, sub) {
 		const colorIdx = _getPresetColorIndex(rs.presetId);
 		let cls = "sub-row";
 		if (rs.presetId) cls += " has-mogrt preset-color-" + colorIdx;
 		else cls += " no-mogrt";
 		if (rs.checked) cls += " is-checked";
+		if (_castMode()) {
+			const s = sub || state.subtitles.find((x) => x.id === subId);
+			if (s && s.spk) cls += " spk-" + s.spk;
+		}
 		return cls;
 	}
 	function initSubtitleList(setStatus, updateMultiSelect, renderTrash) {
@@ -6389,6 +7055,10 @@ var modalState = {
 			// DOM 삽입 후 params 복원/렌더링
 			_ensureRowParams(sub, state.rowStates[sub.id]);
 		});
+		// 새로 그린 줄에 검색·화자·프리셋 필터를 다시 건다 (부팅 중에는 하지 않는다), 화자 표·칩도 목록에 맞춘다 (S2-3)
+		_reapplyFilters();
+		renderCastBar();
+		renderSpeakerChips();
 	}
 	// 줄의 속성 목록을 준비하고 속성창을 그린다 (renderAll에서 줄마다).
 	//   프리셋이 있고 _allParams·params가 모두 비었다 → 처음 건 줄: v27처럼 프리셋 값으로 채운다
@@ -6438,8 +7108,9 @@ var modalState = {
 			state.rowStates[sub.id] = rowState;
 		}
 		const row = document.createElement("div");
-		row.className = _buildRowClass(sub.id, rowState);
+		row.className = _buildRowClass(sub.id, rowState, sub);
 		row.id = "row-" + sub.id;
+		_applyRowStripe(row, sub);
 		const hdr = document.createElement("div");
 		hdr.className = "sub-header";
 		const chkWrap = document.createElement("div");
@@ -6450,7 +7121,8 @@ var modalState = {
 		chk.addEventListener("change", (e) => {
 			e.stopPropagation();
 			rowState.checked = chk.checked;
-			row.className = _buildRowClass(sub.id, rowState);
+			row.className = _buildRowClass(sub.id, rowState, sub);
+			_reapplyFilters();
 			_updateMultiSelect();
 		});
 		chkWrap.appendChild(chk);
@@ -6496,7 +7168,7 @@ var modalState = {
 					const tstate = state.rowStates[tid];
 					tstate.presetId = newPid;
 					const trow = document.getElementById("row-" + tid);
-					if (trow) trow.className = _buildRowClass(tid, tstate);
+					if (trow) trow.className = _buildRowClass(tid, tstate, tsub);
 					const tsel = document.getElementById("sel-" + tid);
 					if (tsel) tsel.value = newPid;
 				if (newPid) loadParamsFromPreset(tid, newPid, tsub.text, false);
@@ -6512,10 +7184,10 @@ var modalState = {
 			});
 				saveSessionToStorage();
 				_setStatus(checkedIds.length + "개 항목에 프리셋 일괄 적용", "ok");
-				_applyPresetFilter();
+				_reapplyFilters();
 			} else {
 				rowState.presetId = newPid;
-				row.className = _buildRowClass(sub.id, rowState);
+				row.className = _buildRowClass(sub.id, rowState, sub);
 				if (newPid) loadParamsFromPreset(sub.id, newPid, sub.text, true);
 				else {
 					rowState.params = [];
@@ -6526,7 +7198,7 @@ var modalState = {
 					if (toggleBtn) toggleBtn.style.display = "none"; // toggleBtn은 null이다 (v27 TypeError로 저장이 빠졌다)
 				}
 				saveSessionToStorage();
-				_applyPresetFilter();
+				_reapplyFilters();
 			}
 		});
 		// 속성 열기/닫기: 텍스트 클릭으로만 동작 (전용 버튼 제거)
@@ -6918,6 +7590,8 @@ var modalState = {
 				mogrtSel.appendChild(opt);
 			});
 		}
+		// 화자 표의 기본 프리셋 선택지도 프리셋 저장·삭제·복구·가져오기를 따라간다 (S2-3)
+		renderCastBar();
 	}
 	async function updateSingleClip(sub) {
 		const rs = state.rowStates[sub.id];
@@ -7007,6 +7681,8 @@ var modalState = {
 			staleBtn.textContent = "옛 구조 줄 " + n + "개 맞추기";
 			staleBtn.style.display = n > 0 ? "" : "none";
 		}
+		// 화자 표의 줄 수 (줄을 지우거나 되살린 뒤)
+		_updateCastCounts();
 	}
 	async function syncFromTimeline() {
 		const trackSel = document.getElementById("trackSel");
@@ -7367,11 +8043,14 @@ var modalState = {
 		if (modal) modal.classList.remove("open");
 		_imp = null;
 	}
-	// 키를 고를 때마다: 이미 있는 화자면 그 이름·기본 프리셋이 기본값이고 처리는 병합(후반 작업 유지)
+	// 키를 고를 때마다: 이미 있는 화자면 그 이름·기본 프리셋이 기본값이고 처리는 병합(후반 작업 유지).
+	// 새 화자는 프로젝트 cast_defaults.json의 그 C번호 이름·기본 프리셋 (S2-3)
 	function _impDefaults(en) {
 		const cast = en.key ? state.mi.cast[en.key] : null;
-		if (!en.nameTouched) en.name = cast ? String(cast.name || "") : "";
-		if (!en.presetTouched) en.presetId = cast ? String(cast.presetId || "") : "";
+		const dflt = !cast && en.key ? _loadCastDefaults()[en.key] || null : null;
+		const dPreset = dflt && dflt.presetId && state.presets[dflt.presetId] && captionFid(state.presets[dflt.presetId]) !== null ? dflt.presetId : "";
+		if (!en.nameTouched) en.name = cast ? String(cast.name || "") : dflt ? String(dflt.name || "") : "";
+		if (!en.presetTouched) en.presetId = cast ? String(cast.presetId || "") : dPreset;
 		en.action = !en.an.cues.length ? "skip" : !en.key ? "" : cast ? "merge" : "new";
 	}
 	// 기본 프리셋 선택지: 캡션 필드('T' 버튼)가 있는 프리셋만 → [[id, 이름]]
@@ -7431,7 +8110,7 @@ var modalState = {
 			return null;
 		}
 		try {
-			_imp.report = importIntoData(_sessionClone(), _impJob(), { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum() });
+			_imp.report = importIntoData(_sessionClone(), _impJob(), { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum(), castDefaults: _loadCastDefaults() });
 		} catch (e) {
 			console.error("[MOGRT] 가져오기 미리 계산 실패:", e);
 			_imp.report = null;
@@ -7816,7 +8495,7 @@ var modalState = {
 		const data = _sessionClone();
 		const before = _sessionDataSig(data);
 		const keyed = job.files.some((f) => f.key);
-		const report = importIntoData(data, job, { now: Date.now(), salt: keyed ? state.mi.salt || _saltForImport() : "", presets: state.presets, trackValue: _trackValueNum() });
+		const report = importIntoData(data, job, { now: Date.now(), salt: keyed ? state.mi.salt || _saltForImport() : "", presets: state.presets, trackValue: _trackValueNum(), castDefaults: _loadCastDefaults() });
 		const byKey = (a, b) => castKeyNum(a.key) - castKeyNum(b.key);
 		const fileOf = (f) => (f.key ? f.key + " " : "") + f.file.name;
 		const nameOf = (r) => {
@@ -7829,6 +8508,8 @@ var modalState = {
 		}
 		_saveSafety("SRT 가져오기 전: " + job.files.slice().sort(byKey).map(fileOf).join(" · "));
 		_commitSessionData(data, "SRT 가져오기");
+		// 가져온 화자의 이름·기본 프리셋·색을 프로젝트 기본값으로 (다음 시퀀스에서 같은 C번호를 가져올 때 쓴다)
+		_saveCastDefaults(report.files.map((r) => r.key).filter(Boolean));
 		const files = report.files.slice().sort(byKey);
 		const added = files.filter((r) => r.action === "new" || r.action === "replace");
 		const merged = files.filter((r) => r.action === "merge");
@@ -7994,7 +8675,7 @@ var modalState = {
 			if (r.error) return _cmdErr(r.code || "bad-args", r.error);
 			const data = _sessionClone();
 			const before = _sessionDataSig(data);
-			const rep = importIntoData(data, r.job, { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum() });
+			const rep = importIntoData(data, r.job, { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum(), castDefaults: _loadCastDefaults() });
 			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(data) !== before)));
 		},
 		// 병합(가져오기)을 넣는다: 가져오기 창의 [가져오기]와 같다 (안전 지점 하나 → 적용 → 자동 항목 하나, 변화가 없으면 아무것도 쓰지 않는다).
@@ -8032,7 +8713,8 @@ var modalState = {
 			const cast = key ? state.mi.cast[key] : null;
 			const action = a.action !== undefined ? String(a.action) : key && !cast ? "new" : "merge";
 			if (["new", "merge", "replace"].indexOf(action) === -1) return { error: "action은 new|merge|replace" };
-			const presetId = a.presetId !== undefined ? String(a.presetId || "") : cast ? undefined : "";
+			// 고르지 않았으면 undefined: 있는 화자는 그대로, 새 화자는 cast_defaults의 기본 프리셋 (없으면 없음)
+			const presetId = a.presetId !== undefined ? String(a.presetId || "") : undefined;
 			if (presetId && (!state.presets[presetId] || captionFid(state.presets[presetId]) === null)) return { error: "캡션 필드가 있는 프리셋이 아니다: " + presetId };
 			files.push({ key, name: typeof a.speaker === "string" ? a.speaker : "", presetId, action, file: an.file, cues: an.cues, idx: i });
 		}
@@ -9313,6 +9995,7 @@ var modalState = {
 		rowEl.className = _buildRowClass(rowId, rs);
 		const chk = rowEl.querySelector("input[type=checkbox]");
 		if (chk) chk.checked = _dragCheckValue;
+		_reapplyFilters();
 		updateMultiSelect();
 	}
 	document.addEventListener("mousedown", (e) => {
@@ -9373,8 +10056,10 @@ var modalState = {
 				const data = path ? _fsRead(path) : null;
 				if (data && data.trackValue !== undefined) trackSel.value = data.trackValue;
 			} catch(_) {}
+			renderCastBar(); // 화자 표의 트랙 미리보기는 기본 트랙(#trackSel)에서 시작한다
 		}
 		document.getElementById("trackSel")?.addEventListener("change", _saveTrackToStorage);
+		document.getElementById("trackSel")?.addEventListener("change", () => renderCastBar());
 		// 트랙 복원은 getActiveSequenceInfo 완료 후 호출되므로 여기서는 생략 (아래 수정 참조)
 
 	// ── 전체선택/선택해제 통합 버튼 ──
@@ -9391,31 +10076,34 @@ var modalState = {
 				if (rowEl) rowEl.className = _buildRowClass(sub.id, rs);
 			});
 		} else {
-			// 전체 선택
+			// 전체 선택: 보이는 줄만 (검색·프리셋·화자 필터로 숨은 줄은 고르지 않는다. 필터가 없으면 v27과 같다)
 			state.subtitles.forEach((sub) => {
 				const rs = state.rowStates[sub.id];
+				const rowEl = document.getElementById("row-" + sub.id);
+				if (_rowHidden(rowEl)) return;
 				rs.checked = true;
 				const chk = document.querySelector("#row-" + sub.id + " input[type=checkbox]");
 				if (chk) chk.checked = true;
-				const rowEl = document.getElementById("row-" + sub.id);
 				if (rowEl) rowEl.className = _buildRowClass(sub.id, rs); // 노란색 is-checked 적용
 			});
 		}
+		_reapplyFilters();
 		updateMultiSelect();
 	});
-	// ── 변경 줄 선택: 병합으로 mm이 붙은 줄만 체크한다 (나머지는 체크를 푼다) ──
+	// ── 변경 줄 선택: 병합으로 mm이 붙은 줄만 체크한다 (나머지는 체크를 푼다). 필터로 숨은 줄은 고르지 않는다 ──
 	document.getElementById("btnSelectChanged")?.addEventListener("click", () => {
 		let n = 0;
 		state.subtitles.forEach((sub) => {
 			const rs = state.rowStates[sub.id];
 			if (!rs) return;
-			rs.checked = !!rs.mm;
+			const rowEl = document.getElementById("row-" + sub.id);
+			rs.checked = !!rs.mm && !_rowHidden(rowEl);
 			if (rs.checked) n++;
 			const chk = document.querySelector("#row-" + sub.id + " input[type=checkbox]");
 			if (chk) chk.checked = rs.checked;
-			const rowEl = document.getElementById("row-" + sub.id);
 			if (rowEl) rowEl.className = _buildRowClass(sub.id, rs);
 		});
+		_reapplyFilters();
 		updateMultiSelect();
 		setStatus("변경 줄 " + n + "개 선택", "ok");
 	});

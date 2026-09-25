@@ -563,6 +563,7 @@ const cachePaths = {
  *   localStorage 초기 값
  *   previewExists, previewSetupOk, params, mogrts  호스트 흉내 설정
  *   node      {files: {경로: 바이트|{data, mtimeMs}}} — Node fs(메모리)·zlib·JSZip을 넣는다 (h.nodeFs)
+ *   appSrc    app.js 대신 돌릴 소스 (예: git tag v27의 app.js — 단일 화자 DOM이 v27과 같은지 비교할 때)
  */
 async function bootPanel(opts = {}) {
 	const doc = buildDocument();
@@ -641,7 +642,7 @@ async function bootPanel(opts = {}) {
 		vm.runInContext(fs.readFileSync(JSZIP_JS, "utf8"), ctx, { filename: "jszip.min.js" });
 	}
 
-	const src = fs.readFileSync(APP_JS, "utf8");
+	const src = typeof opts.appSrc === "string" ? opts.appSrc : fs.readFileSync(APP_JS, "utf8");
 	try {
 		vm.runInContext(src, ctx, { filename: "app.js" });
 	} catch (e) {
