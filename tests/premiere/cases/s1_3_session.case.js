@@ -78,7 +78,11 @@ module.exports = {
 			const bSessPath = path.join(cacheDir, snap.keys.proj, snap.keys.proj + "_seq_" + B.id.replace(/[^a-zA-Z0-9-]/g, "_"), "session.json");
 			const bBackup = fs.existsSync(bSessPath) ? fs.readFileSync(bSessPath) : null;
 			assert.equal(await panel(H.pageDropSrt("s1_3.srt", SRT)), "sent");
-			await H.waitFor(panel, "document.querySelectorAll('#listWrap .sub-row').length === 2", { what: "홈 시퀀스 행 2개" });
+			// 홈 목록에 프리셋 있는 줄이 남아 있으면(앞선 케이스) S1-9의 [병합][교체][취소]가 뜬다 → 교체
+			await H.waitFor(panel, "(() => { if (document.querySelectorAll('#listWrap .sub-row').length === 2) return true;" +
+				" const m = document.getElementById('confirmModal'); if (!m || !m.classList.contains('open')) return false;" +
+				" const b = ['confirmYes', 'confirmAlt', 'confirmNo'].map((id) => document.getElementById(id)).find((x) => x && x.style.display !== 'none' && /^교체/.test(x.textContent));" +
+				" if (b) b.click(); return false; })()", { what: "홈 시퀀스 행 2개" });
 			fs.mkdirSync(path.dirname(bSessPath), { recursive: true });
 			fs.writeFileSync(bSessPath, "{ S13 깨진 JSON");
 			try {
