@@ -1374,14 +1374,16 @@
 	//   o.files        [{key, ambiguous}] (parseCaptionKey 결과)
 	//   o.castEmpty    화자 표가 비었다
 	//   o.legacyLive   화자(spk) 없는 살아 있는 줄 수
+	//   o.legacyPreset 그중 프리셋이 걸린 줄 수 (후반 작업이 있는 목록)
 	// → "legacy"      첫 파일 하나를 v27 교체 본문으로
+	//   "choice"      C번호 없는 파일 하나 + 프리셋이 걸린 기존 목록 → [병합] [교체] [취소]
 	//   "modal"       'SRT 가져오기' 창
-	//   "distribute"  C번호 파일 + 화자 없는 기존 줄 (기존 목록 나누기)
+	//   "distribute"  C번호 파일 + 화자 없는 기존 줄 (기존 목록을 화자로 나누기)
 	function srtImportRoute(o) {
 		const files = (o && o.files) || [];
 		if (!o || !o.castEnabled || !files.length) return "legacy";
 		const f0 = files[0] || {};
-		if (files.length === 1 && !f0.key && !f0.ambiguous && o.castEmpty) return "legacy";
+		if (files.length === 1 && !f0.key && !f0.ambiguous && o.castEmpty) return o.legacyPreset > 0 ? "choice" : "legacy";
 		if (o.legacyLive > 0) return "distribute";
 		return "modal";
 	}
@@ -1436,51 +1438,732 @@
 		});
 		return ids;
 	}
+	// ── 다시 가져오기 병합 (계획서 §4) ──
+	//
+	// 화자 K(없으면 null = 화자 없는 레거시 목록)의 살아 있는 줄과 K의 휴지통 항목만 다룬다.
+	// 휴지통과 nextId는 초기화하지 않는다. 순수: buildMergePlan이 계획을 세우고 applyMergePlan이 사본에 적용한다.
+
+	// 시작·끝 차이가 이 안이면 같은 시간 (초)
+	const MERGE_TIME_EPS = 0.05;
+	// matchCues 후보: 시간상 가장 가까운 새 자막 기준 ±40개
+	const MATCH_BAND = 40;
+	// 짝으로 받는 점수(0.6 × 겹침 + 0.4 × 유사도), 겹치지 않는 짝이 되려면 필요한 유사도
+	const MATCH_ACCEPT = 0.35;
+	const MATCH_SIM_ALLOW = 0.9;
+	// 문장이 바뀐 짝의 유사도가 이 밑이면 나누기·합치기로 의심 (check)
+	const MERGE_CHECK_SIM = 0.5;
+	// 짝 고르기(DP) 가중치. 점수(채택·분류)는 그대로 두고 고르는 순서만 정한다:
+	//   고정 짝은 사실상 반드시, 정규화 문장이 똑같은 짝은 시간이 밀렸어도 옆 자막과 겹치는 짝보다 먼저
+	//   (촘촘한 대화에서 몇 초 밀리면 겹침 점수가 옆 문장과 짝지어 후반 작업이 다른 문장에 붙는다)
+	const MATCH_ANCHOR_W = 10000;
+	const MATCH_SAME_TEXT_W = 1;
+	// 전체 시간 이동 판정의 1프레임 (23.976 기준, 초)
+	const SHIFT_FRAME_SEC = 1001 / 24000;
+	// 분배(distributeLegacy): 배정 점수, 2위와의 차이, '확인 필요' 하한
+	const DIST_ASSIGN = 0.5;
+	const DIST_MARGIN = 0.15;
+	const DIST_AMBIG = 0.35;
+
+	// levenshteinWithin의 작업 버퍼 (호출마다 새로 만들지 않는다. 결과에는 영향이 없다)
+	var _levBufA = new Int32Array(64);
+	var _levBufB = new Int32Array(64);
+	// 편집 거리가 k 이하면 그 값, 넘으면 k + 1 (대각선 띠 ±k만 계산)
+	function levenshteinWithin(a, b, k) {
+		const la = a.length;
+		const lb = b.length;
+		if (Math.abs(la - lb) > k) return k + 1;
+		if (!la || !lb) return Math.max(la, lb);
+		const BIG = k + 1;
+		if (_levBufA.length < lb + 1) {
+			_levBufA = new Int32Array(lb + 64);
+			_levBufB = new Int32Array(lb + 64);
+		}
+		let prev = _levBufA;
+		let cur = _levBufB;
+		for (let j = 0; j <= lb; j++) prev[j] = j <= k ? j : BIG;
+		for (let i = 1; i <= la; i++) {
+			const lo = Math.max(1, i - k);
+			const hi = Math.min(lb, i + k);
+			cur[lo - 1] = lo === 1 ? Math.min(i, BIG) : BIG;
+			let rowMin = cur[lo - 1];
+			const ca = a.charCodeAt(i - 1);
+			for (let j = lo; j <= hi; j++) {
+				let v = prev[j - 1] + (ca === b.charCodeAt(j - 1) ? 0 : 1);
+				if (prev[j] + 1 < v) v = prev[j] + 1;
+				if (cur[j - 1] + 1 < v) v = cur[j - 1] + 1;
+				if (v > BIG) v = BIG;
+				cur[j] = v;
+				if (v < rowMin) rowMin = v;
+			}
+			if (hi < lb) cur[hi + 1] = BIG;
+			if (rowMin > k) return BIG;
+			const t = prev; prev = cur; cur = t;
+		}
+		return prev[lb] > k ? BIG : prev[lb];
+	}
+	// 짝 맞추기 입력 하나: {s, e, text, srtNo} 또는 parseSRT 자막 {startSec, endSec, text, srtNo}
+	function _matchItem(x) {
+		const s = Number(x && x.s !== undefined ? x.s : x && x.startSec) || 0;
+		const e0 = Number(x && x.e !== undefined ? x.e : x && x.endSec);
+		const no = x && x.srtNo !== undefined && x.srtNo !== null ? Number(x.srtNo) : NaN;
+		const t = normText(x && x.text);
+		return { s, e: isFinite(e0) ? e0 : s, t, k: jamo(t).replace(/\s+/g, ""), no: isFinite(no) ? no : null };
+	}
+	// 겹친 길이 / 짧은 쪽 길이 (0~1)
+	function _overlapFrac(as, ae, bs, be) {
+		const ov = Math.min(ae, be) - Math.max(as, bs);
+		if (!(ov > 0)) return 0;
+		const d = Math.min(ae - as, be - bs);
+		return d > 0 ? Math.min(1, ov / d) : 1;
+	}
+	// 오름차순 배열에서 v에 가장 가까운 값의 자리
+	function _nearestIndex(sorted, v) {
+		let lo = 0;
+		let hi = sorted.length - 1;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (sorted[mid] < v) lo = mid + 1;
+			else hi = mid;
+		}
+		if (lo > 0 && Math.abs(sorted[lo - 1] - v) <= Math.abs(sorted[lo] - v)) return lo - 1;
+		return lo;
+	}
+	// 전체 시간 이동: 문장이 같은 새 자막(시작이 가장 가까운 것)과의 시작 차이 중 60% 이상이 같은 값(±1프레임)이고
+	// 그 값이 2프레임 이상이면 그 값(초), 아니면 0. 문장이 같은 짝이 3개 미만이거나 옛 줄의 30% 미만이면 0
+	function _matchShift(A, B, byText, bi) {
+		const d = [];
+		A.forEach((a) => {
+			const list = byText[a.t];
+			if (!list) return;
+			let best = null;
+			list.forEach((q) => {
+				const x = B[bi[q]].s - a.s;
+				if (best === null || Math.abs(x) < Math.abs(best)) best = x;
+			});
+			d.push(best);
+		});
+		if (d.length < 3 || d.length < 0.3 * A.length) return 0;
+		d.sort((x, y) => x - y);
+		let bestN = 0;
+		let bestLo = 0;
+		let j = 0;
+		for (let i = 0; i < d.length; i++) {
+			while (d[i] - d[j] > 2 * SHIFT_FRAME_SEC + 1e-9) j++;
+			if (i - j + 1 > bestN) {
+				bestN = i - j + 1;
+				bestLo = j;
+			}
+		}
+		if (bestN < 0.6 * d.length) return 0;
+		const mid = d[bestLo + (bestN >> 1)];
+		return Math.abs(mid) >= 2 * SHIFT_FRAME_SEC ? Math.round(mid * 1000) / 1000 : 0;
+	}
+	// 옛 줄과 새 자막의 짝 (순서 보존, 한 줄에 하나).
+	//   1) 고정(anchor): 정규화 문장이 같고 시작·끝 차이가 각각 0.05초 이하
+	//   2) 나머지: 순서를 지키는 DP (간격 비용 0). 후보는 시간상 가장 가까운 새 자막 ±40개,
+	//      점수 = 0.6 × 겹침/짧은 쪽 길이 + 0.4 × 자모 유사도, 겹치거나 유사도 ≥ 0.9일 때만, 점수 ≥ 0.35만 받는다.
+	//      동률은 원래 번호(srtNo)가 가까운 쪽으로 가른다. 짝은 서로 엇갈리지 않는다.
+	//   전체 시간 이동(_matchShift)이 보이면 옛 시간을 그만큼 옮겨 겹침·고정을 계산한다 (분류는 실제 시간으로).
+	// → {pairs: [{o, n, score, sim, ov, anchor}] (입력 자리, 시간순), oldPair: [n|-1], newPair: [o|-1], shift: 초}
+	function matchCues(oldRows, newCues, opts) {
+		const A = (oldRows || []).map(_matchItem);
+		const B = (newCues || []).map(_matchItem);
+		const oldPair = A.map(() => -1);
+		const newPair = B.map(() => -1);
+		const res = { pairs: [], oldPair, newPair, shift: 0 };
+		if (!A.length || !B.length) return res;
+		const order = (X) => X.map((_, i) => i).sort((x, y) => (X[x].s - X[y].s) || (X[x].e - X[y].e) || (x - y));
+		const ai = order(A);
+		const bi = order(B);
+		const bStart = bi.map((j) => B[j].s);
+		const byText = {};
+		bi.forEach((j, q) => { (byText[B[j].t] = byText[B[j].t] || []).push(q); });
+		const shift = opts && opts.noShift ? 0 : _matchShift(A, B, byText, bi);
+		res.shift = shift;
+		// 1) 고정
+		const anchorQ = {};
+		const usedQ = {};
+		ai.forEach((i, p) => {
+			const a = A[i];
+			const list = byText[a.t];
+			if (!list) return;
+			let best = -1;
+			let bd = Infinity;
+			list.forEach((q) => {
+				if (usedQ[q]) return;
+				const b = B[bi[q]];
+				const ds = Math.abs(b.s - (a.s + shift));
+				const de = Math.abs(b.e - (a.e + shift));
+				if (ds <= MERGE_TIME_EPS && de <= MERGE_TIME_EPS && ds + de < bd) {
+					bd = ds + de;
+					best = q;
+				}
+			});
+			if (best >= 0) {
+				usedQ[best] = true;
+				anchorQ[p] = best;
+			}
+		});
+		// 2) 후보 (옛 줄 시간순 p, 새 자막 시간순 q)
+		const cand = [];
+		ai.forEach((i, p) => {
+			const a = A[i];
+			const as = a.s + shift;
+			const ae = a.e + shift;
+			const add = (q) => {
+				const b = B[bi[q]];
+				const anchor = anchorQ[p] === q;
+				const ov = _overlapFrac(as, ae, b.s, b.e);
+				const same = a.t === b.t;
+				let sim;
+				if (same) sim = 1;
+				else if (ov > 0) {
+					const n = Math.max(a.k.length, b.k.length);
+					sim = n ? 1 - levenshtein(a.k, b.k) / n : 1;
+				} else {
+					const n = Math.max(a.k.length, b.k.length);
+					const lim = Math.floor(n * (1 - MATCH_SIM_ALLOW) + 1e-9);
+					const dist = levenshteinWithin(a.k, b.k, lim);
+					if (dist > lim) return;
+					sim = n ? 1 - dist / n : 1;
+				}
+				const score = 0.6 * ov + 0.4 * sim;
+				if (!anchor && score < MATCH_ACCEPT) return;
+				let w = score + (anchor ? MATCH_ANCHOR_W : 0) + (same ? MATCH_SAME_TEXT_W : 0);
+				if (a.no !== null && b.no !== null) w += 1e-6 / (1 + Math.abs(a.no - b.no));
+				cand.push({ p, q, w, score, sim, ov, anchor });
+			};
+			const q0 = _nearestIndex(bStart, as);
+			const lo = Math.max(0, q0 - MATCH_BAND);
+			const hi = Math.min(bi.length - 1, q0 + MATCH_BAND);
+			for (let q = lo; q <= hi; q++) add(q);
+			if (anchorQ[p] !== undefined && (anchorQ[p] < lo || anchorQ[p] > hi)) add(anchorQ[p]);
+		});
+		// 3) 가중치 합이 가장 큰 엇갈리지 않는 짝 모음 (p·q 모두 증가). q에 대한 접두 최댓값 펜윅 트리
+		const m = bi.length;
+		const tv = new Float64Array(m + 1);
+		const ti = new Int32Array(m + 1).fill(-1);
+		const best = new Float64Array(cand.length);
+		const prevOf = new Int32Array(cand.length).fill(-1);
+		let k = 0;
+		while (k < cand.length) {
+			let e = k;
+			while (e < cand.length && cand[e].p === cand[k].p) e++;
+			for (let x = k; x < e; x++) {
+				let v = 0;
+				let from = -1;
+				for (let j = cand[x].q; j > 0; j -= j & -j) if (tv[j] > v) { v = tv[j]; from = ti[j]; }
+				best[x] = cand[x].w + v;
+				prevOf[x] = from;
+			}
+			for (let x = k; x < e; x++) {
+				for (let j = cand[x].q + 1; j <= m; j += j & -j) if (best[x] > tv[j]) { tv[j] = best[x]; ti[j] = x; }
+			}
+			k = e;
+		}
+		let top = -1;
+		for (let x = 0; x < cand.length; x++) if (top < 0 || best[x] > best[top]) top = x;
+		const chain = [];
+		for (let x = top; x >= 0; x = prevOf[x]) chain.push(cand[x]);
+		chain.reverse().forEach((c) => {
+			const o = ai[c.p];
+			const n = bi[c.q];
+			oldPair[o] = n;
+			newPair[n] = o;
+			res.pairs.push({ o, n, score: c.score, sim: c.sim, ov: c.ov, anchor: c.anchor });
+		});
+		return res;
+	}
+
+	// 줄의 캡션 필드 값 (프리셋 'T' 필드를 줄 자신의 _allParams에서 해석). 캡션 필드가 없거나 해석되지 않으면 null
+	function rowCaptionValue(rs, preset) {
+		const fid = preset ? captionFid(preset) : null;
+		if (!fid || !rs) return null;
+		const f = resolveFid(rs._allParams || [], fid, preset.params);
+		return f && f.param ? String(f.param.value == null ? "" : f.param.value) : null;
+	}
+	// 줄의 T-ID 필드에 문장을 쓴다: 해석한 _allParams 항목과, 같은 index·이름의 노출 속성(params) 항목.
+	// 해석되지 않으면 쓰지 않는다 (false). 행 편집기의 syncToAllParams와 같은 두 곳을 맞춘다
+	function setRowFieldValue(rs, preset, fid, text) {
+		if (!rs || !fid) return false;
+		const f = resolveFid(rs._allParams || [], fid, preset ? preset.params : null);
+		if (!f || !f.param) return false;
+		setTextValue(f.param, text);
+		(rs.params || []).forEach((p) => {
+			if (p && p !== f.param && p.type === "text" && p.index === f.index && (p.displayName || "") === (f.displayName || "")) setTextValue(p, text);
+		});
+		return true;
+	}
+	// 병합 입력 한 줄: {id, s, e, text, srtNo, cap: 캡션 필드 값|null, others: [{fid, value}] (캡션이 아닌 텍스트 필드)}
+	function mergeRowInput(sub, rs, preset) {
+		const capFid = preset ? captionFid(preset) : null;
+		const res = resolveFields((rs && rs._allParams) || [], preset ? preset.params : null);
+		const others = [];
+		Object.keys(res).forEach((fid) => {
+			if (fid === capFid) return;
+			const p = res[fid].param;
+			others.push({ fid, value: p && p.value != null ? String(p.value) : "" });
+		});
+		return {
+			id: sub.id, s: sub.startSec, e: sub.endSec, text: sub.text,
+			srtNo: sub.srtNo !== undefined && sub.srtNo !== null ? sub.srtNo : sub.index,
+			cap: rowCaptionValue(rs, preset), others
+		};
+	}
+	// 화자 K(null = 화자 없는 줄)의 병합 입력 → {rows, trash: [{…, ref: 휴지통 항목 sub.id, why}]}
+	function mergeInputs(data, key, presets) {
+		const inKey = (s) => !!s && (key ? s.spk === key : !s.spk);
+		const pre = (rs) => (rs && rs.presetId && presets ? presets[rs.presetId] || null : null);
+		const rows = data.subtitles.filter(inKey).map((s) => mergeRowInput(s, data.rowStates[s.id], pre(data.rowStates[s.id])));
+		const trash = [];
+		data.trashBin.forEach((t) => {
+			if (t && t.sub && inKey(t.sub)) trash.push(Object.assign(mergeRowInput(t.sub, t.state, pre(t.state)), { ref: t.sub.id, why: t.why || "" }));
+		});
+		return { rows, trash };
+	}
+	// 포인트 텍스트 확인: 이전 캡션의 '$$' 조각으로만 된 다른 텍스트 필드를 새 캡션으로 다시 본다 (값은 고치지 않는다)
+	// → [{fid, missing, dup}] (문제 있는 필드만)
+	function pointWarnings(others, oldCap, newCap) {
+		const out = [];
+		(others || []).forEach((f) => {
+			const v = f && f.value != null ? String(f.value) : "";
+			if (!v || !pointSegmentsOk(v, oldCap).ok) return;
+			const r = pointSegmentsOk(v, newCap);
+			if (r.missing.length || r.dup.length) out.push({ fid: f.fid, missing: r.missing, dup: r.dup });
+		});
+		return out;
+	}
+	// 짝지은 한 줄의 결과 (3-way: base = 옛 sub.text, ours = 캡션 필드, theirs = 새 문장)
+	//   theirs == base → 아무것도 바꾸지 않는다 (패널 편집 유지)
+	//   ours == base   → theirs를 쓴다
+	//   ours == theirs → sub.text만
+	//   그 밖          → 충돌: 기본은 theirs, keepPanelEdits면 ours를 둔다 (sub.text는 어느 쪽이든 theirs)
+	// 비교는 정규화 문장(normText)으로 한다. 캡션 필드가 없으면(프리셋 없음) sub.text만 바뀐다
+	function _mergeRowResult(r, c, sim, keep) {
+		const textChanged = normText(r.text) !== normText(c.text);
+		const timeChanged = Math.abs(r.s - c.startSec) > MERGE_TIME_EPS || Math.abs(r.e - c.endSec) > MERGE_TIME_EPS;
+		let cls = textChanged ? (timeChanged ? "both" : "text") : (timeChanged ? "time" : "same");
+		if (textChanged && sim < MERGE_CHECK_SIM) cls = "check";
+		const ours = r.cap;
+		let capWrite = null;
+		let conflict = false;
+		if (textChanged && ours !== null) {
+			if (normText(ours) === normText(r.text)) capWrite = c.text;
+			else if (normText(ours) !== normText(c.text)) {
+				conflict = true;
+				capWrite = keep ? null : c.text;
+			}
+		}
+		const oldCap = ours !== null ? ours : r.text;
+		const newCap = capWrite !== null ? capWrite : ours !== null ? ours : c.text;
+		const capChanged = normText(oldCap) !== normText(newCap);
+		return { cls, textChanged, timeChanged, sim, capWrite, conflict, oldCap, newCap, capChanged, warn: capChanged ? pointWarnings(r.others, oldCap, newCap) : null };
+	}
+	// 병합 계획 (순수). oldRows·trashItems는 mergeInputs 결과, cues는 parseSRT(opts) 결과.
+	// → {key, rows: [{id, cue, …결과}], removed: [id], added: [cue 자리], trashKept: [{ref, cue}], restored: [{ref, id, cue, …결과}],
+	//    stats: {same, text, time, both, check, new, removed, conflict, point, trashKept, restored}, shift}
+	// 휴지통 2차 매칭: 짝 없는 새 자막을 K의 휴지통 항목과 맞춘다.
+	//   사용자가 지운 항목(why 없음)과 짝 → trashKept (지운 것을 존중하고 휴지통 항목의 시간·문장만 새로)
+	//   merge·replace 항목과 짝 → restored (id·프리셋·후반 작업 그대로 목록으로, mm "restored")
+	function buildMergePlan(key, oldRows, trashItems, cues, opts) {
+		const keep = !!(opts && opts.keepPanelEdits);
+		const rowsIn = oldRows || [];
+		const trashIn = trashItems || [];
+		const list = cues || [];
+		const stats = { same: 0, text: 0, time: 0, both: 0, check: 0, new: 0, removed: 0, conflict: 0, point: 0, trashKept: 0, restored: 0 };
+		const plan = { key: key || null, rows: [], removed: [], added: [], trashKept: [], restored: [], stats, shift: 0 };
+		const m = matchCues(rowsIn, list);
+		plan.shift = m.shift;
+		const simOf = {};
+		m.pairs.forEach((p) => { simOf[p.o] = p.sim; });
+		const note = (res) => {
+			if (res.conflict) stats.conflict++;
+			if (res.warn && res.warn.length) stats.point++;
+		};
+		rowsIn.forEach((r, i) => {
+			const j = m.oldPair[i];
+			if (j < 0) {
+				plan.removed.push(r.id);
+				stats.removed++;
+				return;
+			}
+			const res = _mergeRowResult(r, list[j], simOf[i] !== undefined ? simOf[i] : 1, keep);
+			plan.rows.push(Object.assign({ id: r.id, cue: j }, res));
+			stats[res.cls]++;
+			note(res);
+		});
+		const free = [];
+		list.forEach((_, j) => { if (m.newPair[j] < 0) free.push(j); });
+		if (free.length && trashIn.length) {
+			const m2 = matchCues(trashIn, free.map((j) => list[j]));
+			m2.pairs.forEach((p) => {
+				const t = trashIn[p.o];
+				const j = free[p.n];
+				if (t.why === "merge" || t.why === "replace") {
+					const res = _mergeRowResult(t, list[j], p.sim, keep);
+					plan.restored.push(Object.assign({ ref: t.ref, id: t.id, cue: j }, res));
+					stats.restored++;
+					note(res);
+				} else {
+					plan.trashKept.push({ ref: t.ref, id: t.id, cue: j });
+					stats.trashKept++;
+				}
+			});
+			const taken = {};
+			m2.pairs.forEach((p) => { taken[free[p.n]] = true; });
+			plan.added = free.filter((j) => !taken[j]);
+		} else plan.added = free;
+		stats.new = plan.added.length;
+		return plan;
+	}
+	// 병합 뒤 mm (타임라인에 다시 적용해야 하는 이유). 앞선 것이 이긴다:
+	//   이번 충돌 > 이번 나누기·합치기 의심 > 아직 적용 안 한 새 줄("new") > 휴지통에서 복구 >
+	//   마지막 적용 상태(mmPrev)와 비교한 문장·시간 변경. 적용 상태로 돌아왔어도 지우지 않는다 (검증된 적용만 지운다)
+	function _mergeMm(rs, res, sub, capNow, restored) {
+		if (res.conflict) return "conflict";
+		if (res.cls === "check") return "check";
+		if (rs.mm === "new") return "new";
+		if (restored) return "restored";
+		const p = rs.mmPrev;
+		if (!p) return rs.mm || (res.textChanged && res.timeChanged ? "both" : res.textChanged ? "text" : res.timeChanged ? "time" : undefined);
+		const t = Math.abs(sub.startSec - p.s) > MERGE_TIME_EPS || Math.abs(sub.endSec - p.e) > MERGE_TIME_EPS;
+		const x = normText(capNow) !== normText(p.cap);
+		if (t && x) return "both";
+		if (t) return "time";
+		if (x) return "text";
+		return rs.mm;
+	}
+	// 자막 시간·번호를 새 자막에서
+	function _setCueTimes(sub, c) {
+		sub.startTime = c.startTime;
+		sub.endTime = c.endTime;
+		sub.startSec = c.startSec;
+		sub.endSec = c.endSec;
+	}
+	// 짝지은 줄(또는 복구한 줄)에 결과를 적는다. mmPrev는 없을 때만 (바꾸기 전 값으로)
+	function _applyMergeRow(sub, rs, preset, res, c, restored) {
+		const touched = res.cls !== "same" || restored;
+		if (touched && !rs.mmPrev && rs.mm !== "new") rs.mmPrev = { s: sub.startSec, e: sub.endSec, cap: res.oldCap };
+		if (res.timeChanged) _setCueTimes(sub, c);
+		if (res.textChanged) sub.text = c.text;
+		if (c.srtNo !== undefined && c.srtNo !== null && sub.srtNo !== c.srtNo && (touched || Object.prototype.hasOwnProperty.call(sub, "srtNo"))) sub.srtNo = c.srtNo;
+		if (res.capWrite !== null) setRowFieldValue(rs, preset, captionFid(preset), res.capWrite);
+		if (res.warn !== null) {
+			if (res.warn.length) rs.warn = res.warn;
+			else delete rs.warn;
+		}
+		if (res.capChanged) delete rs.sugg;
+		if (touched) {
+			const mm = _mergeMm(rs, res, sub, res.newCap, restored);
+			if (mm) rs.mm = mm;
+			else delete rs.mm;
+		}
+	}
+	// 병합 계획을 data에 적용한다 (제자리). ctx {presets, now, newPresetId: 새 줄의 프리셋}
+	// → {changedOrder: 줄의 모임·시간이 바뀌었다 (번호를 다시 매기고 정렬해야 한다), newIds}
+	function applyMergePlan(data, plan, cues, ctx) {
+		const c = ctx || {};
+		const presets = c.presets || {};
+		const now = typeof c.now === "number" ? c.now : 0;
+		const key = plan.key;
+		const pre = (rs) => (rs && rs.presetId ? presets[rs.presetId] || null : null);
+		const byId = {};
+		data.subtitles.forEach((s) => { if (s) byId[s.id] = s; });
+		let changedOrder = false;
+		plan.rows.forEach((r) => {
+			const sub = byId[r.id];
+			if (!sub) return;
+			const rs = data.rowStates[r.id] || (data.rowStates[r.id] = { presetId: "", params: [], _allParams: [], open: false, checked: false });
+			if (r.timeChanged) changedOrder = true;
+			_applyMergeRow(sub, rs, pre(rs), r, cues[r.cue], false);
+		});
+		// 빠진 줄 → 휴지통 (why "merge"). position은 옮기기 전 자리
+		if (plan.removed.length) {
+			const gone = {};
+			plan.removed.forEach((id) => { gone[id] = true; });
+			const hit = [];
+			data.subtitles.forEach((s, i) => { if (s && gone[s.id]) hit.push(i); });
+			hit.forEach((i) => {
+				const s = data.subtitles[i];
+				data.trashBin.push({ sub: s, state: data.rowStates[s.id] || { presetId: "", params: [], _allParams: [], open: false, checked: false }, position: i, why: "merge", at: now });
+			});
+			for (let k = hit.length - 1; k >= 0; k--) {
+				const s = data.subtitles[hit[k]];
+				data.subtitles.splice(hit[k], 1);
+				delete data.rowStates[s.id];
+			}
+			changedOrder = true;
+		}
+		// 휴지통 2차: 사용자가 지운 항목은 시간·문장만 새로, merge·replace 항목은 목록으로 되돌린다
+		const trashAt = (ref) => data.trashBin.findIndex((t) => t && t.sub && t.sub.id === ref);
+		plan.trashKept.forEach((t) => {
+			const at = trashAt(t.ref);
+			if (at < 0) return;
+			const sub = data.trashBin[at].sub;
+			const cue = cues[t.cue];
+			if (Math.abs(sub.startSec - cue.startSec) > MERGE_TIME_EPS || Math.abs(sub.endSec - cue.endSec) > MERGE_TIME_EPS) _setCueTimes(sub, cue);
+			if (normText(sub.text) !== normText(cue.text)) sub.text = cue.text;
+			if (cue.srtNo !== undefined && cue.srtNo !== null && Object.prototype.hasOwnProperty.call(sub, "srtNo") && sub.srtNo !== cue.srtNo) sub.srtNo = cue.srtNo;
+		});
+		plan.restored.forEach((t) => {
+			const at = trashAt(t.ref);
+			if (at < 0) return;
+			const item = data.trashBin.splice(at, 1)[0];
+			const sub = item.sub;
+			const rs = item.state || { presetId: "", params: [], _allParams: [], open: false, checked: false };
+			_applyMergeRow(sub, rs, pre(rs), t, cues[t.cue], true);
+			if (key) sub.spk = key;
+			data.subtitles.push(sub);
+			data.rowStates[sub.id] = rs;
+			changedOrder = true;
+		});
+		// 새 줄 (mm "new")
+		const newIds = plan.added.length ? addCueRows(data, key, plan.added.map((j) => cues[j]), c.newPresetId || "", { mm: "new" }) : [];
+		if (newIds.length) changedOrder = true;
+		return { changedOrder, newIds };
+	}
+	// 병합 통계 글 (가져오기 창·상태 줄): "같음 47 · 문장 2 · 시간 3 · 새 줄 1 · 빠짐 1 · 충돌 1 · 포인트 확인 1 · 휴지통에 있어 제외 1 · 휴지통에서 복구 2"
+	// 0인 항목은 빼고(같음은 늘), 바뀐 것이 하나도 없으면 "변경 없음"
+	function mergeStatsText(st) {
+		const s = st || {};
+		const parts = [["문장", s.text], ["시간", s.time], ["문장·시간", s.both], ["나눔·합침 확인", s.check], ["새 줄", s.new], ["빠짐", s.removed],
+			["충돌", s.conflict], ["포인트 확인", s.point], ["휴지통에 있어 제외", s.trashKept], ["휴지통에서 복구", s.restored]].filter((x) => x[1] > 0);
+		if (!parts.length && !s.trashKept) return "변경 없음 (같음 " + (s.same || 0) + ")";
+		return ["같음 " + (s.same || 0)].concat(parts.map((x) => x[0] + " " + x[1])).join(" · ");
+	}
+	// 히스토리 자동 항목용 짧은 통계: "문장 2 · 시간 3 · 새 1 · 빠짐 1 · 충돌 0 · 복구 2"
+	function mergeStatsShort(st) {
+		const s = st || {};
+		const n = (v) => v || 0;
+		return "문장 " + (n(s.text) + n(s.both) + n(s.check)) + " · 시간 " + (n(s.time) + n(s.both)) + " · 새 " + n(s.new) + " · 빠짐 " + n(s.removed) + " · 충돌 " + n(s.conflict) + " · 복구 " + n(s.restored);
+	}
+
+	// ── 기존 목록 나누기 (분배) ──
+
+	// 화자 없는 기존 줄·휴지통 항목을 파일(화자)마다 맞춰 본다.
+	//   items [{id, s, e, text, srtNo, trash}], files [{key, cues}]
+	//   파일마다 matchCues로 짝 점수를 얻는다 (살아 있는 줄과 휴지통 항목은 따로 맞춘다: 서로 짝을 빼앗지 않게)
+	//   최고 ≥ 0.5이고 다른 파일의 최고보다 0.15 이상 높으면 그 화자(assigned), 최고 ≥ 0.35면 확인 필요(ambiguous, 기본은 최고 화자),
+	//   그 밖에는 짝 없음(unmatched)
+	// → {items: [{id, trash, status, key, best, second, scores}], counts: {byKey: {K: n}, ambiguous, unmatched}}
+	function distributeLegacy(items, files) {
+		const list = items || [];
+		const fl = (files || []).filter((f) => f && f.key);
+		const score = {};
+		const groups = [list.filter((x) => !x.trash), list.filter((x) => x.trash)];
+		fl.forEach((f) => {
+			groups.forEach((g) => {
+				if (!g.length) return;
+				matchCues(g, f.cues || []).pairs.forEach((p) => {
+					const id = g[p.o].id;
+					(score[id] = score[id] || {})[f.key] = Math.max((score[id] || {})[f.key] || 0, p.score);
+				});
+			});
+		});
+		const counts = { byKey: {}, ambiguous: 0, unmatched: 0 };
+		fl.forEach((f) => { counts.byKey[f.key] = 0; });
+		const out = list.map((it) => {
+			const sc = score[it.id] || {};
+			const ks = Object.keys(sc).sort((a, b) => (sc[b] - sc[a]) || (castKeyNum(a) - castKeyNum(b)));
+			const best = ks.length ? sc[ks[0]] : 0;
+			const second = ks.length > 1 ? sc[ks[1]] : 0;
+			let status = "unmatched";
+			let key = null;
+			if (best >= DIST_ASSIGN && best - second >= DIST_MARGIN) {
+				status = "assigned";
+				key = ks[0];
+			} else if (best >= DIST_AMBIG) {
+				status = "ambiguous";
+				key = ks[0];
+			}
+			if (!it.trash) {
+				if (status === "assigned") counts.byKey[key]++;
+				else if (status === "ambiguous") counts.ambiguous++;
+				else counts.unmatched++;
+			}
+			return { id: it.id, trash: !!it.trash, status, key, best, second, scores: sc };
+		});
+		return { items: out, counts };
+	}
+	// 분배를 data에 적용한다 (제자리). legacy {mode: "split"|"one"|"trash", oneKey, assign: {id: "C1"|""(휴지통)}}
+	//   split  distributeLegacy대로: 배정·확인 필요(고른 화자, 기본은 최고 화자) → spk, 짝 없음·휴지통 → 휴지통(why "merge")
+	//          휴지통 항목(사용자가 지운 줄)은 배정된 화자의 것이 된다 (그 화자의 사용자 삭제로 남는다)
+	//   one    화자 없는 줄·휴지통 항목을 모두 oneKey로
+	//   trash  화자 없는 줄을 모두 휴지통으로 (why "replace")
+	// mi.legacyTrack = ctx.trackValue (v27 클립이 있는 트랙). → {total, mode, counts: {K: n}, ambiguous: [{id, s, text, key, scores}], unmatched, trashAssigned}
+	function applyLegacySplit(data, legacy, files, ctx) {
+		const c = ctx || {};
+		const now = typeof c.now === "number" ? c.now : 0;
+		const live = data.subtitles.filter((s) => s && !s.spk);
+		const mode = (legacy && legacy.mode) || "split";
+		const info = { total: live.length, mode, counts: {}, ambiguous: [], unmatched: 0, trashAssigned: 0 };
+		if (!live.length) return info;
+		if (typeof c.trackValue === "number" && isFinite(c.trackValue)) data.mi.legacyTrack = c.trackValue;
+		if (mode === "trash") {
+			info.unmatched = moveKeyToTrash(data, null, "replace", now);
+			return info;
+		}
+		const fl = (files || []).filter((f) => f && f.key);
+		const assign = {};
+		const legacyTrash = data.trashBin.filter((t) => t && t.sub && !t.sub.spk);
+		if (mode === "one") {
+			const K = (legacy && legacy.oneKey) || (fl[0] && fl[0].key) || null;
+			live.forEach((s) => { assign[s.id] = K; });
+			legacyTrash.forEach((t) => { assign[t.sub.id] = K; });
+		} else {
+			const items = live.map((s) => ({ id: s.id, s: s.startSec, e: s.endSec, text: s.text, srtNo: s.srtNo !== undefined ? s.srtNo : s.index, trash: false }))
+				.concat(legacyTrash.map((t) => ({ id: t.sub.id, s: t.sub.startSec, e: t.sub.endSec, text: t.sub.text, srtNo: t.sub.srtNo !== undefined ? t.sub.srtNo : t.sub.index, trash: true })));
+			const dist = distributeLegacy(items, fl);
+			const over = (legacy && legacy.assign) || {};
+			dist.items.forEach((d) => {
+				let K = d.status === "unmatched" ? null : d.key;
+				if (d.status === "ambiguous") {
+					if (!d.trash) {
+						const s = live.find((x) => x.id === d.id);
+						info.ambiguous.push({ id: d.id, s: s.startSec, text: s.text, key: d.key, scores: d.scores });
+					}
+					if (Object.prototype.hasOwnProperty.call(over, d.id)) K = over[d.id] || null;
+				}
+				assign[d.id] = K;
+			});
+		}
+		live.forEach((s) => {
+			const K = assign[s.id];
+			if (K) {
+				s.spk = K;
+				info.counts[K] = (info.counts[K] || 0) + 1;
+			}
+		});
+		// 짝 없는 줄(과 휴지통을 고른 줄) → 휴지통 (why "merge")
+		const hit = [];
+		data.subtitles.forEach((s, i) => { if (s && !s.spk) hit.push(i); });
+		hit.forEach((i) => {
+			const s = data.subtitles[i];
+			data.trashBin.push({ sub: s, state: data.rowStates[s.id] || { presetId: "", params: [], _allParams: [], open: false, checked: false }, position: i, why: "merge", at: now });
+		});
+		for (let k = hit.length - 1; k >= 0; k--) {
+			const s = data.subtitles[hit[k]];
+			data.subtitles.splice(hit[k], 1);
+			delete data.rowStates[s.id];
+		}
+		info.unmatched = hit.length;
+		legacyTrash.forEach((t) => {
+			const K = assign[t.sub.id];
+			if (K) {
+				t.sub.spk = K;
+				info.trashAssigned++;
+			}
+		});
+		return info;
+	}
+	// 의심 파일 (분배 모드가 아닐 때): 이 파일 문장의 60% 이상이 다른 화자(J)의 줄·다른 파일과 같다 → {why: "same", other: J}
+	function suspectSameAs(data, f, files) {
+		const mine = (f.cues || []).map((c) => normText(c.text)).filter((t) => t !== "");
+		if (!mine.length) return null;
+		const other = {};
+		const see = (K, text) => { if (K && K !== f.key) (other[K] = other[K] || new Set()).add(normText(text)); };
+		data.subtitles.forEach((s) => { if (s && s.spk) see(s.spk, s.text); });
+		(files || []).forEach((g) => { if (g && g !== f && g.key) (g.cues || []).forEach((c) => see(g.key, c.text)); });
+		let hit = null;
+		sortCastKeys(Object.keys(other)).forEach((J) => {
+			if (hit) return;
+			const n = mine.filter((t) => other[J].has(t)).length;
+			if (n / mine.length >= 0.6) hit = { why: "same", other: J };
+		});
+		return hit;
+	}
+
 	// 가져오기 작업을 세션 데이터에 적용한다. data를 바꾼다 (호출한 쪽이 사본을 넘기고, 바뀌었으면 상태에 넣는다).
 	//   data  {subtitles, rowStates, trashBin, nextId, mi}
-	//   job   {files: [{key, name, presetId, action: "new"|"replace", file: {name, path, size, mtime}, cues}]}
-	//         cues = parseSRT(text, {keepNo, stripTags}). 키가 없거나 자막이 0개인 파일은 건너뛴다
-	//   ctx   {now, salt: mi.salt가 비었을 때 쓸 값, presets: 살아 있는 프리셋 (없는 presetId는 쓰지 않는다)}
+	//   job   {files: [{key, name, presetId, action: "new"|"merge"|"replace", file: {name, path, size, mtime}, cues, idx}],
+	//          keepPanelEdits, legacy: null | {mode, oneKey, assign} (화자 없는 기존 줄을 나눈다)}
+	//         cues = parseSRT(text, {keepNo, stripTags}). 자막이 0개인 파일은 건너뛴다.
+	//         key가 null인 파일은 화자 없는 레거시 목록에 병합한다 (C번호 없는 한 파일 + 프리셋이 있는 목록)
+	//   ctx   {now, salt: mi.salt가 비었을 때 쓸 값, presets: 살아 있는 프리셋, trackValue: 분배 때 mi.legacyTrack}
 	// 화자 만들기: 이름 = 입력 > 키, 트랙 자동(null), 색 = 비어 있는 첫 색, castOrder는 C번호 순.
-	// 이미 있는 화자의 "replace"는 그 화자의 살아 있는 줄을 휴지통(why "replace")으로 보내고 새로 넣는다.
-	// → {files: [{key, action, count, name}]}
+	// 화자 K에 살아 있는 줄이나 휴지통 항목이 있으면(분배로 넘어온 기존 줄 포함) 병합, 없으면 새 줄로 넣는다.
+	// "replace"는 K의 살아 있는 줄을 휴지통(why "replace")으로 보내고 새로 넣는다.
+	// → {files: [{idx, key, action, count, name, stats?, shift?, suspect?}], legacy: 분배 결과 | null}
 	function importIntoData(data, job, ctx) {
 		const c = ctx || {};
 		const now = typeof c.now === "number" ? c.now : 0;
 		const mi = data.mi;
-		const presetOk = (pid) => !!pid && (!c.presets || !!c.presets[pid]);
-		const report = { files: [] };
-		const files = ((job && job.files) || []).filter((f) => f && f.key && Array.isArray(f.cues) && f.cues.length > 0);
+		const presets = c.presets || null;
+		const presetOk = (pid) => !!pid && (!presets || !!presets[pid]);
+		const keep = !!(job && job.keepPanelEdits);
+		const report = { files: [], legacy: null };
+		const files = ((job && job.files) || []).filter((f) => f && Array.isArray(f.cues) && f.cues.length > 0);
 		if (!files.length) return report;
-		if (!mi.salt) mi.salt = c.salt || "";
+		const keyed = files.filter((f) => f.key);
+		const legacyMode = !!(job && job.legacy);
+		// 의심 파일은 바꾸기 전 상태로 본다 (분배 모드에서는 끈다)
+		const suspects = files.map((f) => (!legacyMode && f.key ? suspectSameAs(data, f, keyed) : null));
+		if (keyed.length && !mi.salt) mi.salt = c.salt || "";
+		if (legacyMode) report.legacy = applyLegacySplit(data, job.legacy, keyed, c);
 		const touched = {};
-		files.forEach((f) => {
-			const K = f.key;
-			const nm = String(f.name == null ? "" : f.name).trim();
-			const fi = f.file || {};
-			let cast = mi.cast[K];
-			const exists = !!cast;
-			if (!exists) {
-				cast = { name: nm || K, track: null, autoTrack: null, presetId: presetOk(f.presetId) ? f.presetId : "", color: castColorFree(mi.cast),
-					file: fi.name || "", path: fi.path || null, size: typeof fi.size === "number" ? fi.size : null, mtime: typeof fi.mtime === "number" ? fi.mtime : null, pos: null };
-				mi.cast[K] = cast;
-			} else {
-				if (nm) cast.name = nm;
-				if (f.presetId !== undefined) cast.presetId = presetOk(f.presetId) ? f.presetId : "";
-				cast.file = fi.name || cast.file || "";
-				cast.path = fi.path || null;
-				cast.size = typeof fi.size === "number" ? fi.size : null;
-				cast.mtime = typeof fi.mtime === "number" ? fi.mtime : null;
+		let needSort = false;
+		const hasRows = (K) => data.subtitles.some((s) => s && (K ? s.spk === K : !s.spk)) || data.trashBin.some((t) => t && t.sub && (K ? t.sub.spk === K : !t.sub.spk));
+		files.forEach((f, fi) => {
+			const K = f.key || null;
+			const out = { idx: f.idx, key: K, action: "", count: f.cues.length, name: "" };
+			let cast = null;
+			let newPreset = "";
+			if (K) {
+				const nm = String(f.name == null ? "" : f.name).trim();
+				const info = f.file || {};
+				cast = mi.cast[K];
+				if (!cast) {
+					cast = { name: nm || K, track: null, autoTrack: null, presetId: presetOk(f.presetId) ? f.presetId : "", color: castColorFree(mi.cast),
+						file: info.name || "", path: info.path || null, size: typeof info.size === "number" ? info.size : null, mtime: typeof info.mtime === "number" ? info.mtime : null, pos: null };
+					mi.cast[K] = cast;
+				} else {
+					if (nm) cast.name = nm;
+					if (f.presetId !== undefined) cast.presetId = presetOk(f.presetId) ? f.presetId : "";
+					cast.file = info.name || cast.file || "";
+					cast.path = info.path || null;
+					cast.size = typeof info.size === "number" ? info.size : null;
+					cast.mtime = typeof info.mtime === "number" ? info.mtime : null;
+				}
+				if (mi.castOrder.indexOf(K) === -1) mi.castOrder.push(K);
+				out.name = cast.name;
+				newPreset = cast.presetId;
 			}
-			if (mi.castOrder.indexOf(K) === -1) mi.castOrder.push(K);
-			if (exists) moveKeyToTrash(data, K, "replace", now);
-			addCueRows(data, K, f.cues, cast.presetId);
-			touched[K] = true;
-			report.files.push({ key: K, action: exists ? "replace" : "new", count: f.cues.length, name: cast.name });
+			if (K && f.action === "replace") {
+				moveKeyToTrash(data, K, "replace", now);
+				addCueRows(data, K, f.cues, newPreset);
+				out.action = "replace";
+				needSort = true;
+				touched[K || ""] = true;
+			} else if (hasRows(K)) {
+				const inp = mergeInputs(data, K, presets || {});
+				const plan = buildMergePlan(K, inp.rows, inp.trash, f.cues, { keepPanelEdits: keep });
+				const done = applyMergePlan(data, plan, f.cues, { presets: presets || {}, now, newPresetId: newPreset });
+				out.action = "merge";
+				out.stats = plan.stats;
+				out.shift = plan.shift;
+				out.old = inp.rows.length;
+				if (!legacyMode && inp.rows.length >= 10 && (plan.stats.removed + plan.stats.new) / inp.rows.length > 0.5) suspects[fi] = suspects[fi] || { why: "changed" };
+				if (done.changedOrder) {
+					needSort = true;
+					touched[K || ""] = true;
+				}
+			} else if (K) {
+				addCueRows(data, K, f.cues, newPreset);
+				out.action = "new";
+				needSort = true;
+				touched[K] = true;
+			} else return;
+			if (suspects[fi]) out.suspect = suspects[fi];
+			report.files.push(out);
 		});
+		// 분배로 화자가 바뀐 줄은 그 화자 안에서 번호를 다시 매긴다
+		if (report.legacy && report.legacy.total) {
+			needSort = true;
+			Object.keys(report.legacy.counts).forEach((K) => { touched[K] = true; });
+		}
 		mi.castOrder = sortCastKeys(mi.castOrder);
-		sortRowsByTime(data.subtitles, mi.castOrder);
-		Object.keys(touched).forEach((K) => renumberRows(data.subtitles, K));
+		if (needSort) sortRowsByTime(data.subtitles, mi.castOrder);
+		Object.keys(touched).forEach((K) => renumberRows(data.subtitles, K || null));
 		trimAutoTrash(data.trashBin, TRASH_AUTO_MAX);
 		return report;
 	}
@@ -2559,7 +3242,9 @@
 			row.className = "trash-row";
 			const numEl = document.createElement("span");
 			numEl.className = "trash-num";
-			numEl.textContent = String(item.sub.index);
+			// 화자 줄은 "C2·12", 병합·교체로 들어온 항목은 뒤에 "(병합)" / "(교체)" (사용자가 지운 줄은 v27 그대로)
+			numEl.textContent = (item.sub.spk && _castMode() ? rowLabel(item.sub, true) : String(item.sub.index)) +
+				(item.why === "merge" ? " (병합)" : item.why === "replace" ? " (교체)" : "");
 			const timeEl = document.createElement("span");
 			timeEl.className = "trash-time";
 			timeEl.textContent = item.sub.startTime;
@@ -4893,6 +5578,11 @@ var modalState = {
 		});
 		hdr.appendChild(chkWrap);
 		hdr.appendChild(numEl);
+		// 병합 표시 (있을 때만 → 병합한 적 없는 목록의 행 DOM은 v27 그대로)
+		const mmEl = _mmBadge(sub, rowState);
+		if (mmEl) hdr.appendChild(mmEl);
+		const warnEl = _warnBadge(rowState);
+		if (warnEl) hdr.appendChild(warnEl);
 		hdr.appendChild(timeEl);
 		hdr.appendChild(textEl);
 		hdr.appendChild(sel);
@@ -4907,6 +5597,53 @@ var modalState = {
 		row.appendChild(paramsPanel);
 		// params 렌더링은 DOM 삽입 후 renderAll에서 처리
 		return row;
+	}
+	// 병합 뒤 '타임라인에 다시 적용해야 하는 이유' 점 (rs.mm). 색: 문장 파랑, 시간 주황, 새 줄 초록, 충돌 빨강,
+	// 나누기·합치기 의심 회색, 휴지통에서 복구 청록, 되돌림 보라. 검증된 적용만 지운다 (S1-9)
+	const MM_TITLE = {
+		text: "문장이 바뀐 줄",
+		time: "시간이 바뀐 줄",
+		both: "문장과 시간이 바뀐 줄",
+		new: "새 줄 (병합으로 더해짐, 타임라인에 아직 없음)",
+		conflict: "충돌: 패널에서 고친 문장과 새 SRT 문장이 달랐습니다",
+		check: "나누기·합치기로 의심되는 줄 — 문장과 후반 작업을 확인하세요",
+		restored: "휴지통에서 복구된 줄 (프리셋·후반 작업 그대로)",
+		undone: "되돌린 줄"
+	};
+	function _mmBadge(sub, rs) {
+		if (!rs || !rs.mm) return null;
+		const el = document.createElement("span");
+		el.className = "sub-mm mm-" + rs.mm;
+		let title = MM_TITLE[rs.mm] || rs.mm;
+		const p = rs.mmPrev;
+		if (p && typeof p.s === "number" && (rs.mm === "time" || rs.mm === "both") && Math.abs(p.s - sub.startSec) > 0.0005) title += " (시간 변경 " + p.s.toFixed(2) + "→" + sub.startSec.toFixed(2) + ")";
+		el.title = title;
+		return el;
+	}
+	// 포인트 텍스트 경고 (rs.warn): "T2 포인트 텍스트 ‘하늘’이 문장에 없음" / "… ‘날씨’가 두 번 나와 첫 번째만 칠해집니다"
+	function _warnBadge(rs) {
+		const list = rs && Array.isArray(rs.warn) ? rs.warn : [];
+		if (!list.length) return null;
+		const preset = rs.presetId ? state.presets[rs.presetId] : null;
+		const names = {};
+		if (preset) fieldIdMap(preset.params).forEach((f) => { names[f.fid] = f.displayName; });
+		const lines = [];
+		list.forEach((w) => {
+			const nm = w.fid + (names[w.fid] ? " " + names[w.fid] : "");
+			(w.missing || []).forEach((m) => lines.push(nm + " ‘" + m + "’이 문장에 없음"));
+			(w.dup || []).forEach((m) => lines.push(nm + " ‘" + m + "’이 두 번 나와 첫 번째만 칠해집니다"));
+		});
+		const el = document.createElement("span");
+		el.className = "sub-warn";
+		el.textContent = "!";
+		el.title = lines.join("\n");
+		return el;
+	}
+	// 줄의 T-ID 필드에 문장을 쓴다 (_allParams와 같은 index·이름의 노출 속성). 해석되지 않으면 false
+	function _setRowFieldValue(subId, fid, text) {
+		const rs = state.rowStates[subId];
+		if (!rs) return false;
+		return setRowFieldValue(rs, rs.presetId ? state.presets[rs.presetId] : null, fid, text);
 	}
 	function renderParamsPanel(subId) {
 		const panel = document.getElementById("params-" + subId);
@@ -5155,6 +5892,13 @@ var modalState = {
 		const closeBtn = document.getElementById("btnCloseAllParams");
 		const hasOpenParams = Object.values(state.rowStates).some((rs) => rs.open);
 		if (closeBtn) closeBtn.disabled = !hasOpenParams;
+		// "변경 줄 (N)": 병합으로 mm이 붙은 줄이 있을 때만 보인다
+		const changedBtn = document.getElementById("btnSelectChanged");
+		if (changedBtn) {
+			const n = state.subtitles.filter((s) => state.rowStates[s.id] && state.rowStates[s.id].mm).length;
+			changedBtn.textContent = "변경 줄 (" + n + ")";
+			changedBtn.style.display = n > 0 ? "" : "none";
+		}
 	}
 	async function syncFromTimeline() {
 		const trackSel = document.getElementById("trackSel");
@@ -5261,11 +6005,15 @@ var modalState = {
 	// #srtInput에서 고른 파일은 모두 _onSrtFilesChosen을 지난다:
 	//   readAsArrayBuffer → decodeSrtBytes → parseSRT(text, {keepNo, stripTags}) → parseCaptionKey
 	// 경로는 core srtImportRoute (계획서 §3.4):
-	//   legacy      플래그 꺼짐(운영), 또는 C번호 없는 파일 하나 + 화자 표 없음.
+	//   legacy      플래그 꺼짐(운영), 또는 C번호 없는 파일 하나 + 화자 표 없음 + 프리셋이 걸린 줄 없음.
 	//               첫 파일 하나를 v27 교체 본문(_legacyReplace, parseSRT opts 없음)으로 읽는다.
 	//               UTF-8이 아니거나 깨진 글자가 있으면 목록을 바꾸기 전에 첫 자막 미리보기와 함께 묻는다
-	//   modal       2개 이상 | C번호 | 화자 표 있음 → 'SRT 가져오기' 창 → _importIntoCast
-	//   distribute  C번호 파일 + 화자 없는 기존 줄 → 기존 목록 나누기 (S1-8). 이 커밋에서는 거부한다
+	//   choice      위와 같은데 프리셋이 걸린 줄이 있다 → [병합 (후반 작업 유지)] [교체 (지금까지 방식)] [취소].
+	//               병합은 _applyMerge(화자 없는 목록에 병합). S1-9까지 플래그 뒤에 있다
+	//   modal       2개 이상 | C번호 | 화자 표 있음 → 'SRT 가져오기' 창 → _importIntoCast (새 화자·병합·교체)
+	//   distribute  C번호 파일 + 화자 없는 기존 줄 → 같은 창의 분배 모드 (기존 목록을 화자로 나누기)
+	// 병합 규칙(짝 맞추기·3-way·휴지통 2차·분배)은 모두 core(importIntoData, buildMergePlan, distributeLegacy)에 있다.
+	// 창은 바꾸기 전 상태의 사본으로 미리 계산해 통계를 보이고, [가져오기]에서 같은 계산을 한 번 더 해 넣는다.
 	// 여러 파일 가져오기는 S2-4까지 플래그(MI_CAST_ENABLED) 뒤에 있다. DEV·하드 테스트는
 	// 코드를 고치지 않고 window._mogrtDebug.setMiCast(true)로 켠다.
 	// 화자 이름은 파일 이름에서 가져오지 않는다 (입력 > 키).
@@ -5329,19 +6077,26 @@ var modalState = {
 	// → {route, files: [{name, key, ambiguous, encoding, replaced, cues}]}
 	function _routeSrtImport(read) {
 		const ans = read.map(_analyzeSrt);
-		const legacyLive = state.subtitles.filter((s) => !s.spk).length;
-		const route = srtImportRoute({ castEnabled: _miCastEnabled(), files: ans.map((a) => a.capKey), castEmpty: !_castMode(), legacyLive });
+		const route = _srtRouteOf(ans);
 		const summary = {
 			route,
 			files: ans.map((a) => ({ name: a.file.name, key: a.capKey.key, ambiguous: a.capKey.ambiguous, encoding: a.dec.encoding, replaced: a.dec.replaced, cues: a.cues.length }))
 		};
 		if (route === "legacy") _legacyImport(ans[0]);
-		else if (route === "distribute") {
-			// 기존 목록(화자 없는 줄)을 화자로 나누는 분배는 S1-8. 그 전에는 목록을 건드리지 않는다
-			setStatus("기존 목록 나누기는 다음 단계에서 지원", "err");
-			showAlert("기존 목록 나누기는 다음 단계에서 지원합니다.\n\n지금 목록에 화자 없는 자막 " + legacyLive + "줄이 있어 캡션 트랙 번호(C1, C2…) 파일을 더할 수 없습니다. 목록은 그대로입니다.");
-		} else _openImportModal(ans);
+		else if (route === "choice") _legacyChoice(ans[0]);
+		else _openImportModal(ans, route === "distribute");
 		return summary;
+	}
+	// 지금 목록에 대한 경로 (core srtImportRoute)
+	function _srtRouteOf(ans) {
+		const legacy = state.subtitles.filter((s) => !s.spk);
+		return srtImportRoute({
+			castEnabled: _miCastEnabled(),
+			files: ans.map((a) => a.capKey),
+			castEmpty: !_castMode(),
+			legacyLive: legacy.length,
+			legacyPreset: legacy.filter((s) => state.rowStates[s.id] && state.rowStates[s.id].presetId).length
+		});
 	}
 
 	// ── 레거시 경로 (v27) ──
@@ -5375,6 +6130,28 @@ var modalState = {
 			{ label: "가져오기", run: go },
 			{ label: "취소", run: () => setStatus("SRT 가져오기 취소: " + an.file.name, "") }
 		]);
+	}
+	// 프리셋(후반 작업)이 걸린 레거시 목록 + C번호 없는 파일 하나: 병합 / 교체 / 취소 (인코딩이 이상하면 그것부터 묻는다)
+	function _legacyChoice(an) {
+		const ask = () => showChoice("이미 후반 작업(프리셋)이 있는 자막 목록입니다.\n\n" +
+			"병합: 줄마다 시간·문장만 새 파일에 맞추고 프리셋과 후반 작업은 그대로 둡니다. 바뀐 줄에는 점이 붙고, 빠진 줄은 휴지통으로 갑니다.\n" +
+			"교체: 지금까지처럼 목록을 새 파일로 바꿉니다 (지금 목록은 안전 지점에 남습니다).", [
+			{ label: "병합 (후반 작업 유지)", run: () => _applyMerge(an) },
+			{ label: "교체 (지금까지 방식)", run: () => _legacyReplace(an.file.name, an.text) },
+			{ label: "취소", run: () => setStatus("SRT 가져오기 취소: " + an.file.name, "") }
+		]);
+		if (!needsEncodingConfirm(an.dec)) {
+			ask();
+			return;
+		}
+		showChoice(_encodingMessage(an), [
+			{ label: "가져오기", run: ask },
+			{ label: "취소", run: () => setStatus("SRT 가져오기 취소: " + an.file.name, "") }
+		]);
+	}
+	// 화자 없는 레거시 목록에 병합한다 (충돌은 SRT 문장을 따른다)
+	function _applyMerge(an) {
+		return _importIntoCast({ files: [{ key: null, name: "", action: "merge", file: an.file, cues: an.cues, idx: 0 }], keepPanelEdits: false });
 	}
 	// v27 교체 본문: 목록·휴지통을 새 파일로 바꾼다 (parseSRT opts 없음 → v27과 같은 줄).
 	// 바꾸기 전에 안전 지점을 남기고(빈 목록이면 남기지 않는다), nextId는 되돌리지 않는다
@@ -5413,12 +6190,18 @@ var modalState = {
 
 	// ── 'SRT 가져오기' 창 ──
 
-	// 창 상태: {entries: [{an, key, name, presetId, action, nameTouched, presetTouched}]} | null
+	// 창 상태 | null:
+	//   entries  [{an, key, name, presetId, action: ""|"new"|"merge"|"replace"|"skip", nameTouched, presetTouched}]
+	//   legacy   분배 모드면 {mode: "split"|"one"|"trash", oneKey, assign: {줄 id: "C1"|""(휴지통)}}, 아니면 null
+	//   keepEdits  #impKeepPanelEdits (충돌 시 패널에서 고친 문장 유지)
+	//   suspectAck 의심 파일이 있을 때 [가져오기]를 한 번 눌렀다 (다음 누름은 '그래도 가져오기')
+	//   report   마지막 미리 계산 (importIntoData를 사본에)
 	var _imp = null;
 	// 캡션 트랙 선택지는 적어도 C1..C12 (화자 표·파일 이름에 더 큰 번호가 있으면 거기까지)
 	const IMP_KEYS_MIN = 12;
-	const IMP_ACTION_LABEL = { new: "새 화자", replace: "교체", skip: "건너뜀" };
-	function _openImportModal(ans) {
+	const IMP_ACTION_LABEL = { new: "새 화자", merge: "병합", replace: "교체", skip: "건너뜀" };
+	const IMP_LEGACY_MODES = [["split", "파일에 맞춰 나누기 (후반 작업 유지)"], ["one", "모두 한 화자로"], ["trash", "휴지통으로 보내고 새로 시작"]];
+	function _openImportModal(ans, distribute) {
 		const modal = document.getElementById("importModal");
 		if (!modal) {
 			setStatus("가져오기 창이 없습니다", "err");
@@ -5429,8 +6212,14 @@ var modalState = {
 				const en = { an, key: an.capKey.key || "", name: "", presetId: "", action: "", nameTouched: false, presetTouched: false };
 				_impDefaults(en);
 				return en;
-			})
+			}),
+			legacy: distribute ? { mode: "split", oneKey: "", assign: {} } : null,
+			keepEdits: false,
+			suspectAck: false,
+			report: null
 		};
+		const keep = document.getElementById("impKeepPanelEdits");
+		if (keep) keep.checked = false;
 		_renderImportModal();
 		modal.classList.add("open");
 	}
@@ -5439,12 +6228,12 @@ var modalState = {
 		if (modal) modal.classList.remove("open");
 		_imp = null;
 	}
-	// 키를 고를 때마다: 이미 있는 화자면 그 이름·기본 프리셋을 기본값으로, 처리는 새 화자 / 교체 / 건너뜀
+	// 키를 고를 때마다: 이미 있는 화자면 그 이름·기본 프리셋이 기본값이고 처리는 병합(후반 작업 유지)
 	function _impDefaults(en) {
 		const cast = en.key ? state.mi.cast[en.key] : null;
 		if (!en.nameTouched) en.name = cast ? String(cast.name || "") : "";
 		if (!en.presetTouched) en.presetId = cast ? String(cast.presetId || "") : "";
-		en.action = !en.an.cues.length ? "skip" : !en.key ? "" : cast ? "replace" : "new";
+		en.action = !en.an.cues.length ? "skip" : !en.key ? "" : cast ? "merge" : "new";
 	}
 	// 기본 프리셋 선택지: 캡션 필드('T' 버튼)가 있는 프리셋만 → [[id, 이름]]
 	function _impPresetChoices() {
@@ -5469,19 +6258,67 @@ var modalState = {
 		if (dec.replaced > 0) parts.push("깨진 글자 " + dec.replaced + "개");
 		return parts.join(" · ");
 	}
-	// 파일 아래 줄의 안내 (키 없음·모호, 교체될 줄 수)
-	function _impInfo(en) {
-		if (!en.an.cues.length) return "";
-		if (!en.key) {
-			return en.an.capKey.ambiguous
-				? "파일 이름에 캡션 트랙 번호가 여럿입니다 (" + en.an.capKey.nums.map((n) => "C" + n).join("·") + ") — 하나를 고르세요"
-				: "파일 이름에 캡션 트랙 번호(C1, C2…)가 없습니다 — 고르세요";
+	// 가져올 파일(자막이 있고 키가 정해진 것)로 만든 작업
+	function _impJob() {
+		const files = [];
+		_imp.entries.forEach((en, i) => {
+			if (!en.an.cues.length || !en.key) return;
+			files.push({ key: en.key, name: en.name, presetId: en.presetId, action: en.action, file: en.an.file, cues: en.an.cues, idx: i });
+		});
+		let legacy = null;
+		if (_imp.legacy) {
+			legacy = { mode: _imp.legacy.mode, oneKey: _impOneKey(), assign: Object.assign({}, _imp.legacy.assign) };
 		}
+		return { files, keepPanelEdits: _imp.keepEdits, legacy };
+	}
+	// '모두 한 화자로'의 화자: 고른 값이 가져올 키 중에 있으면 그것, 아니면 첫 키
+	function _impOneKey() {
+		const keys = _imp.entries.filter((en) => en.an.cues.length && en.key).map((en) => en.key);
+		const k = _imp.legacy && _imp.legacy.oneKey;
+		return keys.indexOf(k) !== -1 ? k : keys[0] || "";
+	}
+	// 바꾸기 전 상태의 사본으로 미리 계산 (통계·분배·의심 파일). salt는 결과에 영향이 없어 임시 값
+	function _impPreview() {
+		const v = _validateImport();
+		if (!v.ok) {
+			_imp.report = null;
+			return null;
+		}
+		try {
+			_imp.report = importIntoData(_sessionClone(), _impJob(), { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum() });
+		} catch (e) {
+			console.error("[MOGRT] 가져오기 미리 계산 실패:", e);
+			_imp.report = null;
+		}
+		return _imp.report;
+	}
+	function _impReportOf(i) {
+		const rep = _imp && _imp.report;
+		return rep ? rep.files.find((f) => f.idx === i) || null : null;
+	}
+	// 파일 아래 줄: 병합 통계와 안내 (키 없음·모호, 교체될 줄 수, 전체 시간 이동, 의심 파일)
+	function _impDetail(en, i) {
+		const out = { stats: "", info: [] };
+		if (!en.an.cues.length) return out;
+		if (!en.key) {
+			out.info.push(en.an.capKey.ambiguous
+				? "파일 이름에 캡션 트랙 번호가 여럿입니다 (" + en.an.capKey.nums.map((n) => "C" + n).join("·") + ") — 하나를 고르세요"
+				: "파일 이름에 캡션 트랙 번호(C1, C2…)가 없습니다 — 고르세요");
+			return out;
+		}
+		const r = _impReportOf(i);
 		if (en.action === "replace") {
 			const n = state.subtitles.filter((s) => s.spk === en.key).length;
-			return "지금 " + en.key + " 줄 " + n + "개는 휴지통으로 갑니다 (병합은 다음 단계에서 지원)";
+			out.info.push("지금 " + en.key + " 줄 " + n + "개는 휴지통으로 갑니다 (후반 작업은 휴지통 항목에 남습니다)");
 		}
-		return "";
+		if (r && r.action === "merge" && r.stats) out.stats = mergeStatsText(r.stats);
+		if (r && r.shift) out.info.push("전체 시간이 " + (r.shift > 0 ? "+" : "") + r.shift.toFixed(2) + "초 이동했습니다 (시퀀스 시작 타임코드 확인)");
+		if (r && r.suspect) {
+			out.info.push(r.suspect.why === "same"
+				? "이 파일이 " + en.key + " 캡션이 맞는지 확인하세요 (" + r.suspect.other + "과 같아 보임)"
+				: "이 파일이 " + en.key + " 캡션이 맞는지 확인하세요 (지금 줄과 절반 넘게 다름)");
+		}
+		return out;
 	}
 	// → {ok, error, dup: {키: true}}
 	function _validateImport() {
@@ -5499,11 +6336,90 @@ var modalState = {
 		out.ok = !out.error;
 		return out;
 	}
+	// 분배 모드 머리 줄: "기존 목록 (화자 없음, 64줄) → C1 30 · C2 28 · 확인 필요 2 · 짝 없음 4" + 방식 + 확인 필요 목록
+	function _renderImportLegacy() {
+		const box = document.getElementById("impLegacy");
+		if (!box) return;
+		if (!_imp.legacy) {
+			box.style.display = "none";
+			return;
+		}
+		box.style.display = "";
+		const lg = _imp.legacy;
+		const total = state.subtitles.filter((s) => !s.spk).length;
+		const rep = _imp.report && _imp.report.legacy;
+		let tail = "";
+		if (lg.mode === "trash") tail = "모두 휴지통";
+		else if (lg.mode === "one") tail = "모두 " + (_impOneKey() || "?");
+		else if (rep) {
+			const parts = sortCastKeys(Object.keys(rep.counts)).map((k) => k + " " + rep.counts[k]);
+			if (rep.ambiguous.length) parts.push("확인 필요 " + rep.ambiguous.length);
+			if (rep.unmatched) parts.push("짝 없음 " + rep.unmatched);
+			tail = parts.join(" · ") || "짝 없음 " + total;
+		} else tail = "캡션 트랙을 고르면 나눕니다";
+		const info = document.getElementById("impLegacyInfo");
+		if (info) info.textContent = "기존 목록 (화자 없음, " + total + "줄) → " + tail;
+		const mode = document.getElementById("impLegacyMode");
+		if (mode) {
+			if (!mode.options.length) IMP_LEGACY_MODES.forEach(([v, t]) => {
+				const o = document.createElement("option");
+				o.value = v;
+				o.textContent = t;
+				mode.appendChild(o);
+			});
+			mode.value = lg.mode;
+		}
+		const keySel = document.getElementById("impLegacyKey");
+		if (keySel) {
+			keySel.innerHTML = "";
+			_imp.entries.filter((en) => en.an.cues.length && en.key).forEach((en) => {
+				const o = document.createElement("option");
+				o.value = en.key;
+				o.textContent = en.key + (en.name ? " " + en.name : "");
+				keySel.appendChild(o);
+			});
+			keySel.value = _impOneKey();
+			keySel.style.display = lg.mode === "one" ? "" : "none";
+		}
+		// 확인 필요 줄: 줄마다 [C1|C2|…|휴지통] (기본은 점수가 가장 높은 화자)
+		const amb = document.getElementById("impAmbList");
+		if (amb) {
+			amb.innerHTML = "";
+			const list = lg.mode === "split" && rep ? rep.ambiguous : [];
+			const keys = _imp.entries.filter((en) => en.an.cues.length && en.key).map((en) => en.key);
+			list.forEach((a) => {
+				const row = document.createElement("div");
+				row.className = "imp-amb";
+				const t = document.createElement("span");
+				t.className = "imp-amb-text";
+				t.textContent = a.s.toFixed(1) + "초 ‘" + _cuePreview(a.text, 40) + "’";
+				const sel = document.createElement("select");
+				sel.className = "imp-amb-key";
+				sel.dataset.id = String(a.id);
+				keys.concat([""]).forEach((k) => {
+					const o = document.createElement("option");
+					o.value = k;
+					o.textContent = k || "휴지통";
+					sel.appendChild(o);
+				});
+				sel.value = Object.prototype.hasOwnProperty.call(lg.assign, a.id) ? lg.assign[a.id] : a.key || "";
+				sel.addEventListener("change", () => {
+					lg.assign[a.id] = sel.value;
+					_renderImportModal();
+				});
+				row.appendChild(t);
+				row.appendChild(sel);
+				amb.appendChild(row);
+			});
+		}
+	}
 	function _renderImportModal() {
 		const body = document.getElementById("impBody");
 		if (!body || !_imp) return;
-		body.innerHTML = "";
 		const v = _validateImport();
+		_impPreview();
+		_renderImportLegacy();
+		body.innerHTML = "";
 		const keys = _impKeyChoices();
 		const presets = _impPresetChoices();
 		const cell = (cls) => {
@@ -5546,6 +6462,7 @@ var modalState = {
 			selK.addEventListener("change", () => {
 				en.key = selK.value;
 				_impDefaults(en);
+				_imp.suspectAck = false;
 				_renderImportModal();
 			});
 			tdK.appendChild(selK);
@@ -5562,7 +6479,7 @@ var modalState = {
 				en.nameTouched = true;
 			});
 			tdN.appendChild(inp);
-			// 기본 프리셋 (캡션 필드가 있는 프리셋만)
+			// 기본 프리셋 (캡션 필드가 있는 프리셋만. 새 줄에만 쓰고, 병합한 줄의 프리셋은 그대로)
 			const tdP = cell();
 			const selP = document.createElement("select");
 			selP.className = "imp-preset";
@@ -5576,23 +6493,48 @@ var modalState = {
 				en.presetTouched = true;
 			});
 			tdP.appendChild(selP);
-			// 줄 수, 처리
+			// 줄 수
 			const tdC = cell("imp-count");
 			tdC.textContent = empty ? "자막 없음" : en.an.cues.length + "줄";
+			// 처리: 이미 있는 화자는 [병합 | 교체], 그 밖에는 미리 계산한 결과 (분배된 줄이 있으면 병합)
 			const tdA = cell("imp-action");
-			tdA.textContent = IMP_ACTION_LABEL[en.action] || "";
+			if (!empty && en.key && state.mi.cast[en.key]) {
+				const selA = document.createElement("select");
+				selA.className = "imp-act";
+				selA.title = "병합: 시간·문장만 새 파일에 맞추고 프리셋·후반 작업은 그대로 / 교체: 지금 줄은 휴지통으로 보내고 새로 넣는다";
+				option(selA, "merge", "병합");
+				option(selA, "replace", "교체");
+				selA.value = en.action === "replace" ? "replace" : "merge";
+				selA.addEventListener("change", () => {
+					en.action = selA.value;
+					_imp.suspectAck = false;
+					_renderImportModal();
+				});
+				tdA.appendChild(selA);
+			} else {
+				const r = _impReportOf(i);
+				tdA.textContent = IMP_ACTION_LABEL[r ? r.action : en.action] || "";
+			}
 			[tdF, tdK, tdN, tdP, tdC, tdA].forEach((td) => tr.appendChild(td));
 			body.appendChild(tr);
-			const info = _impInfo(en);
-			if (info) {
+			const det = _impDetail(en, i);
+			if (det.stats || det.info.length) {
 				const tr2 = document.createElement("tr");
 				tr2.className = "imp-detail";
 				const td = cell();
 				td.colSpan = 6;
-				const sp = document.createElement("span");
-				sp.className = "imp-info";
-				sp.textContent = info;
-				td.appendChild(sp);
+				if (det.stats) {
+					const st = document.createElement("span");
+					st.className = "imp-stats";
+					st.textContent = det.stats;
+					td.appendChild(st);
+				}
+				if (det.info.length) {
+					const sp = document.createElement("span");
+					sp.className = "imp-info";
+					sp.textContent = det.info.join(" · ");
+					td.appendChild(sp);
+				}
 				tr2.appendChild(td);
 				body.appendChild(tr2);
 			}
@@ -5602,7 +6544,7 @@ var modalState = {
 		const ok = document.getElementById("impOk");
 		if (ok) {
 			ok.disabled = !v.ok;
-			ok.textContent = "가져오기";
+			ok.textContent = _imp.suspectAck ? "그래도 가져오기" : "가져오기";
 		}
 	}
 	function _onImportOk() {
@@ -5612,11 +6554,17 @@ var modalState = {
 			_renderImportModal();
 			return;
 		}
-		const job = {
-			files: _imp.entries.filter((en) => en.an.cues.length > 0 && en.key).map((en) => ({
-				key: en.key, name: en.name, presetId: en.presetId, action: en.action, file: en.an.file, cues: en.an.cues
-			}))
-		};
+		// 의심 파일이 있으면 한 번 더 누르게 한다 (분배 모드에서는 core가 의심하지 않는다)
+		const rep = _imp.report || _impPreview();
+		if (rep && rep.files.some((f) => f.suspect) && !_imp.suspectAck) {
+			_imp.suspectAck = true;
+			const ok = document.getElementById("impOk");
+			if (ok) ok.textContent = "그래도 가져오기";
+			const err = document.getElementById("impError");
+			if (err) err.textContent = "캡션 트랙 번호가 맞는지 확인하세요 — 맞으면 '그래도 가져오기'를 누릅니다";
+			return;
+		}
+		const job = _impJob();
 		_closeImportModal();
 		_importIntoCast(job);
 	}
@@ -5624,6 +6572,21 @@ var modalState = {
 	document.getElementById("impCancel")?.addEventListener("click", () => {
 		_closeImportModal();
 		setStatus("SRT 가져오기 취소", "");
+	});
+	document.getElementById("impKeepPanelEdits")?.addEventListener("change", (e) => {
+		if (!_imp) return;
+		_imp.keepEdits = !!e.target.checked;
+		_renderImportModal();
+	});
+	document.getElementById("impLegacyMode")?.addEventListener("change", (e) => {
+		if (!_imp || !_imp.legacy) return;
+		_imp.legacy.mode = e.target.value;
+		_renderImportModal();
+	});
+	document.getElementById("impLegacyKey")?.addEventListener("change", (e) => {
+		if (!_imp || !_imp.legacy) return;
+		_imp.legacy.oneKey = e.target.value;
+		_renderImportModal();
 	});
 
 	// ── 적용 ──
@@ -5650,6 +6613,12 @@ var modalState = {
 		updateMultiSelect();
 		saveSessionToStorage();
 	}
+	// #trackSel 값 (분배 때 mi.legacyTrack)
+	function _trackValueNum() {
+		const el = document.getElementById("trackSel");
+		const n = el ? parseInt(el.value, 10) : NaN;
+		return isFinite(n) ? n : null;
+	}
 	// 4자 [a-z0-9] salt (uid = salt-id, 클립 태그의 앞부분)
 	function _mintSalt() {
 		const abc = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -5672,20 +6641,35 @@ var modalState = {
 		} catch (_) {}
 		return _mintSalt();
 	}
-	// 가져오기 창의 결과를 화자 표·목록에 넣는다 (새 화자 / 교체).
-	// 안전 지점 하나(바꾸기 전) → 사본에 적용 → 상태·session.json·cast.json → 자동 항목 하나(바꾼 뒤)
+	// 가져오기 작업을 목록·화자 표에 넣는다 (새 화자 / 병합 / 교체 / 분배, 화자 없는 목록 병합).
+	// 사본에 core importIntoData → 바뀌었을 때만: 안전 지점 하나("SRT 가져오기 전: C1 a.srt · C2 b.srt") →
+	// 상태·session.json·cast.json → 자동 항목 하나("SRT 가져오기: C1 철수(7)" / "SRT 병합: C2 (문장 2 · …)").
+	// 같은 파일을 다시 가져오면 '변경 없음' (상태·히스토리 그대로)
 	function _importIntoCast(job) {
 		const data = _sessionClone();
 		const before = _sessionDataSig(data);
-		const report = importIntoData(data, job, { now: Date.now(), salt: state.mi.salt || _saltForImport(), presets: state.presets });
+		const keyed = job.files.some((f) => f.key);
+		const report = importIntoData(data, job, { now: Date.now(), salt: keyed ? state.mi.salt || _saltForImport() : "", presets: state.presets, trackValue: _trackValueNum() });
+		const byKey = (a, b) => castKeyNum(a.key) - castKeyNum(b.key);
+		const fileOf = (f) => (f.key ? f.key + " " : "") + f.file.name;
+		const nameOf = (r) => {
+			const f = job.files.find((x) => x.idx === r.idx);
+			return r.key || (f ? f.file.name : "");
+		};
 		if (_sessionDataSig(data) === before) {
-			setStatus("변경 없음", "");
+			setStatus("변경 없음: " + job.files.map(fileOf).join(" · "), "ok");
 			return report;
 		}
-		const files = job.files.slice().sort((a, b) => castKeyNum(a.key) - castKeyNum(b.key));
-		_saveSafety("SRT 가져오기 전: " + files.map((f) => f.key + " " + f.file.name).join(" · "));
+		_saveSafety("SRT 가져오기 전: " + job.files.slice().sort(byKey).map(fileOf).join(" · "));
 		_commitSessionData(data, "SRT 가져오기");
-		const label = "SRT 가져오기: " + report.files.slice().sort((a, b) => castKeyNum(a.key) - castKeyNum(b.key)).map((f) => f.key + " " + f.name + "(" + f.count + ")").join(" · ");
+		const files = report.files.slice().sort(byKey);
+		const added = files.filter((r) => r.action === "new" || r.action === "replace");
+		const merged = files.filter((r) => r.action === "merge");
+		const parts = [];
+		if (added.length) parts.push("SRT 가져오기: " + added.map((r) => r.key + " " + r.name + "(" + r.count + ")").join(" · "));
+		if (merged.length) parts.push("SRT 병합: " + merged.map((r) => nameOf(r) + " (" + mergeStatsShort(r.stats) + ")").join(" · "));
+		if (report.legacy && report.legacy.total) parts.unshift("기존 목록 " + report.legacy.total + "줄 나눔");
+		const label = parts.join(" / ");
 		_saveHistoryOnAction(label);
 		setStatus(label, "ok");
 		return report;
@@ -5826,8 +6810,72 @@ var modalState = {
 			if (read.error) return _cmdErr("bad-args", read.error);
 			if (!_keysResolved) return _cmdErr("no-sequence", "시퀀스를 열면 SRT를 열 수 있습니다");
 			return _cmdOk(_cmdClone(_routeSrtImport(_miCastEnabled() ? read.files : read.files.slice(0, 1))));
+		},
+		// 병합 미리 보기 (아무것도 바꾸지 않는다) = 가져오기 창이 보여 주는 통계.
+		// args {files: [{name, b64, key?, speaker?, presetId?, action?: new|merge|replace}], keepPanelEdits?, legacy?: {mode, oneKey, assign}}
+		//   key를 빼면 파일 이름의 C번호. C번호 없는 파일 하나 + 화자 표 없음이면 화자 없는 목록에 병합한다
+		// → {changed, files: [{name, key, action, count, stats, statsText, shift, suspect}], legacy}
+		mergePreview: (args) => {
+			const r = _cmdImportJob(args);
+			if (r.error) return _cmdErr(r.code || "bad-args", r.error);
+			const data = _sessionClone();
+			const before = _sessionDataSig(data);
+			const rep = importIntoData(data, r.job, { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum() });
+			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(data) !== before)));
+		},
+		// 병합(가져오기)을 넣는다: 가져오기 창의 [가져오기]와 같다 (안전 지점 하나 → 적용 → 자동 항목 하나, 변화가 없으면 아무것도 쓰지 않는다).
+		// args는 mergePreview와 같다. agent는 승인 카드(M5.4) 전까지 needs-approval
+		mergeCommit: (args, ctx) => {
+			if (ctx.source === "agent") return _cmdErr("needs-approval", "병합은 패널에서 승인해야 합니다");
+			const r = _cmdImportJob(args);
+			if (r.error) return _cmdErr(r.code || "bad-args", r.error);
+			const before = _sessionDataSig(_sessionClone());
+			const rep = _importIntoCast(r.job);
+			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(_sessionClone()) !== before)));
 		}
 	};
+	// mergePreview·mergeCommit 인자 → {job} | {error, code}
+	function _cmdImportJob(args) {
+		if (!_keysResolved) return { error: "시퀀스를 열면 SRT를 열 수 있습니다", code: "no-sequence" };
+		if (!_miCastEnabled()) return { error: "여러 SRT 가져오기·병합은 아직 꺼져 있다 (MI_CAST_ENABLED, DEV는 setMiCast)" };
+		const read = _cmdReadFiles(args.files);
+		if (read.error) return { error: read.error };
+		const ans = read.files.map(_analyzeSrt);
+		const castEmpty = !_castMode();
+		const legacyLive = state.subtitles.filter((s) => !s.spk).length;
+		const files = [];
+		const seen = {};
+		for (let i = 0; i < ans.length; i++) {
+			const a = args.files[i];
+			const an = ans[i];
+			if (!an.cues.length) continue;
+			let key = a.key !== undefined ? a.key : an.capKey.key;
+			key = key ? String(key) : null;
+			if (key && !/^C[1-9][0-9]?$/.test(key)) return { error: "key는 C1..C99: " + key };
+			if (!key && !(ans.length === 1 && castEmpty)) return { error: "캡션 트랙 번호(key)가 필요하다: " + an.file.name };
+			if (key && seen[key]) return { error: key + "가 두 파일에 지정되었다" };
+			if (key) seen[key] = true;
+			const cast = key ? state.mi.cast[key] : null;
+			const action = a.action !== undefined ? String(a.action) : key && !cast ? "new" : "merge";
+			if (["new", "merge", "replace"].indexOf(action) === -1) return { error: "action은 new|merge|replace" };
+			const presetId = a.presetId !== undefined ? String(a.presetId || "") : cast ? undefined : "";
+			if (presetId && (!state.presets[presetId] || captionFid(state.presets[presetId]) === null)) return { error: "캡션 필드가 있는 프리셋이 아니다: " + presetId };
+			files.push({ key, name: typeof a.speaker === "string" ? a.speaker : "", presetId, action, file: an.file, cues: an.cues, idx: i });
+		}
+		if (!files.length) return { error: "가져올 자막이 없다" };
+		const legacy = legacyLive > 0 && files.some((f) => f.key) ? Object.assign({ mode: "split", oneKey: "", assign: {} }, args.legacy && typeof args.legacy === "object" ? args.legacy : {}) : null;
+		return { job: { files, keepPanelEdits: args.keepPanelEdits === true, legacy } };
+	}
+	function _cmdImportSummary(job, rep, changed) {
+		return {
+			changed,
+			files: rep.files.map((f) => {
+				const src = job.files.find((x) => x.idx === f.idx);
+				return { name: src ? src.file.name : "", key: f.key, action: f.action, count: f.count, stats: f.stats || null, statsText: f.stats ? mergeStatsText(f.stats) : "", shift: f.shift || 0, suspect: f.suspect || null };
+			}),
+			legacy: rep.legacy
+		};
+	}
 	// base64 → Uint8Array
 	function _b64ToBytes(b64) {
 		const bin = atob(String(b64).replace(/\s+/g, ""));
@@ -6348,6 +7396,22 @@ var modalState = {
 			});
 		}
 		updateMultiSelect();
+	});
+	// ── 변경 줄 선택: 병합으로 mm이 붙은 줄만 체크한다 (나머지는 체크를 푼다) ──
+	document.getElementById("btnSelectChanged")?.addEventListener("click", () => {
+		let n = 0;
+		state.subtitles.forEach((sub) => {
+			const rs = state.rowStates[sub.id];
+			if (!rs) return;
+			rs.checked = !!rs.mm;
+			if (rs.checked) n++;
+			const chk = document.querySelector("#row-" + sub.id + " input[type=checkbox]");
+			if (chk) chk.checked = rs.checked;
+			const rowEl = document.getElementById("row-" + sub.id);
+			if (rowEl) rowEl.className = _buildRowClass(sub.id, rs);
+		});
+		updateMultiSelect();
+		setStatus("변경 줄 " + n + "개 선택", "ok");
 	});
 	document.getElementById("btnMultiDel")?.addEventListener("click", () => {
 		Object.entries(state.rowStates).filter(([, rs]) => rs.checked).map(([id]) => parseInt(id, 10)).forEach((id) => deleteSubtitle(id));

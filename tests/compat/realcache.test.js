@@ -136,3 +136,51 @@ test("운영 캐시: 줄마다 캡션 T-ID가 캡션 필드로 해석되고, v27
 	}
 	t.diagnostic("캡션이 있는 줄 " + rows + "개, 옛 구조 " + stale + "개, isV27Unsafe " + unsafe + "개");
 });
+
+test("운영 캐시 (S1-8): 세션마다 자기 자막을 다시 병합해도 아무것도 바뀌지 않고, 캡션을 바꾼 병합은 캡션이 아닌 속성을 건드리지 않는다", { skip }, (t) => {
+	const core = loadRegions(["src/srtParser.ts", "src/mi/core.ts"]);
+	const js = (v) => JSON.stringify(v);
+	let sessions = 0;
+	let changed = 0;
+	for (const s of sequences()) {
+		const raw = readText(path.join(s.dir, "session.json"));
+		if (!raw) continue;
+		let sess;
+		let presets = {};
+		try {
+			sess = JSON.parse(raw);
+			if (s.presets) presets = JSON.parse(s.presets).presets || {};
+		} catch (_) { continue; }
+		if (!sess || !Array.isArray(sess.subtitles) || !sess.subtitles.length) continue;
+		const data = () => ({ subtitles: JSON.parse(js(sess.subtitles)), rowStates: JSON.parse(js(sess.rowStates || {})), trashBin: JSON.parse(js(sess.trashBin || [])), nextId: sess.nextId || 1, mi: core.miDefault() });
+		// 레거시 목록을 v27이 읽은 그 SRT로 다시 병합 (parseSRT opts 결과 모양)
+		const cues = sess.subtitles.map((x, i) => ({ index: i + 1, startTime: x.startTime, endTime: x.endTime, startSec: x.startSec, endSec: x.endSec, text: x.text, srtNo: x.index }));
+		const d1 = data();
+		const before = js(d1);
+		core.importIntoData(d1, { files: [{ key: null, action: "merge", cues }] }, { now: 1, presets });
+		assert.equal(js(d1), before, tag(s) + ": 같은 자막 병합은 변화 없음");
+		// 모든 캡션 문장 끝에 글자 하나를 붙인 파일: 캡션이 아닌 속성은 그대로
+		const d2 = data();
+		const orig = JSON.parse(js(d2.rowStates));
+		core.importIntoData(d2, { files: [{ key: null, action: "merge", cues: cues.map((c) => Object.assign({}, c, { text: c.text + "." })) }] }, { now: 1, presets });
+		let n = 0;
+		d2.subtitles.forEach((x) => {
+			const rs = d2.rowStates[x.id];
+			const o = orig[x.id];
+			assert.ok(rs && o, tag(s) + " id " + x.id + ": 같은 id");
+			const preset = o.presetId ? presets[o.presetId] : null;
+			const f = preset ? core.resolveFid(o._allParams || [], core.captionFid(preset), preset.params) : null;
+			const capIdx = f ? f.index : -999;
+			const strip = (l) => (l || []).filter((p) => p && p.index !== capIdx);
+			assert.equal(js(strip(rs._allParams)), js(strip(o._allParams)), tag(s) + " id " + x.id + ": 캡션이 아닌 속성");
+			if (f) {
+				assert.equal(core.rowCaptionValue(rs, preset), x.text, tag(s) + " id " + x.id + ": 캡션 필드 = 새 문장 (패널에서 고친 줄은 충돌 → 기본 SRT)");
+				n++;
+			}
+		});
+		assert.equal(d2.subtitles.length, sess.subtitles.length, tag(s) + ": 줄 수");
+		sessions++;
+		changed += n;
+	}
+	t.diagnostic("세션 " + sessions + "개, 캡션을 바꾼 줄 " + changed + "개");
+});

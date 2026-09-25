@@ -25,6 +25,8 @@ test("srtImportRoute: 플래그·파일 수·C번호·화자 표·화자 없는 
 	assert.equal(R({ castEnabled: false, files: [{ key: "C1" }, { key: "C2" }], castEmpty: false, legacyLive: 5 }), "legacy");
 	// 플래그 켜짐
 	assert.equal(R({ castEnabled: true, files: one(null), castEmpty: true, legacyLive: 12 }), "legacy", "C번호 없는 한 파일 + 화자 표 없음");
+	assert.equal(R({ castEnabled: true, files: one(null), castEmpty: true, legacyLive: 12, legacyPreset: 1 }), "choice", "프리셋이 걸린 줄이 있으면 병합/교체/취소");
+	assert.equal(R({ castEnabled: false, files: one(null), castEmpty: true, legacyLive: 12, legacyPreset: 1 }), "legacy", "플래그가 꺼져 있으면 v27");
 	assert.equal(R({ castEnabled: true, files: one(null), castEmpty: false, legacyLive: 0 }), "modal", "화자 표가 있으면 키를 골라야 한다");
 	assert.equal(R({ castEnabled: true, files: one(null, true), castEmpty: true, legacyLive: 0 }), "modal", "C1_C2 (모호)");
 	assert.equal(R({ castEnabled: true, files: one("C1"), castEmpty: true, legacyLive: 0 }), "modal");

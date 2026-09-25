@@ -244,7 +244,7 @@ test("C번호가 없거나 모호한 파일은 키를 골라야 하고, 자막 �
 	noErrors(h);
 });
 
-test("이미 있는 화자를 다시 가져오면 교체 — 지금 줄은 휴지통(why replace), 안전 지점 하나, 다른 화자는 그대로", async () => {
+test("이미 있는 화자를 다시 가져오면 기본은 병합, [교체]를 고르면 지금 줄은 휴지통(why replace), 안전 지점 하나, 다른 화자는 그대로", async () => {
 	const h = await bootCast();
 	await h.dropSrts([{ name: "C1.srt", content: bytesOf("cap_C1.srt") }, { name: "C2.srt", content: bytesOf("cap_interview_C2.srt") }]);
 	h.$("impOk").click();
@@ -253,9 +253,12 @@ test("이미 있는 화자를 다시 가져오면 교체 — 지금 줄은 휴�
 	const c2 = s1.subtitles.filter((x) => x.spk === "C2");
 	await h.dropSrt("cap_C1_edit.srt", bytesOf("cap_C1_edit.srt"));
 	const rows = impRows(h);
-	assert.equal(rows[0].querySelector(".imp-action").textContent, "교체");
-	assert.match(h.$("impBody").querySelector(".imp-info").textContent, /지금 C1 줄 7개는 휴지통으로/);
+	const act = rows[0].querySelector(".imp-act");
+	assert.ok(act, "이미 있는 화자는 [병합 | 교체]");
+	assert.equal(act.value, "merge", "기본은 병합");
 	assert.equal(rows[0].querySelector(".imp-name").value, "C1", "지금 이름이 기본값");
+	setSel(h, act, "replace");
+	assert.match(h.$("impBody").querySelector(".imp-info").textContent, /지금 C1 줄 7개는 휴지통으로/);
 	h.$("impOk").click();
 	await h.flush();
 	const s2 = snap(h);
@@ -266,8 +269,10 @@ test("이미 있는 화자를 다시 가져오면 교체 — 지금 줄은 휴�
 	assert.deepEqual(safetyList(h).map((e) => e.label), ["SRT 가져오기 전: C1 cap_C1_edit.srt"]);
 	assert.equal(safetyList(h)[0].subtitles.length, 13, "바꾸기 전 상태");
 	assert.deepEqual(autoList(h).map((e) => e.label), ["SRT 가져오기: C1 C1(8)", "SRT 가져오기: C1 C1(7) · C2 C2(6)"]);
-	// 휴지통 탭에도 보인다
-	assert.equal(h.$("trashWrap").querySelectorAll(".trash-row").length, 7);
+	// 휴지통 탭에도 보인다 ("C1·3 (교체)")
+	const trashNums = h.$("trashWrap").querySelectorAll(".trash-num").map((e) => e.textContent);
+	assert.equal(trashNums.length, 7);
+	assert.equal(trashNums[0], "C1" + DOT + "1 (교체)");
 	noErrors(h);
 });
 
@@ -281,15 +286,15 @@ test("플래그 켜짐: C번호 없는 파일 하나 + 화자 표 없음 → 레
 	noErrors(h);
 });
 
-test("플래그 켜짐: 화자 없는 줄이 있는 목록에 C번호 파일 → 이 커밋에서는 거부 (목록 그대로)", async () => {
+test("플래그 켜짐: 화자 없는 줄이 있는 목록에 C번호 파일 → 가져오기 창의 분배 모드 (OK 전에는 목록 그대로)", async () => {
 	const h = await bootCast();
 	await h.dropSrt("golden_crlf.srt", GOLDEN);
 	const before = snap(h);
 	await h.dropSrt("C1.srt", bytesOf("cap_C1.srt"));
-	assert.equal(importOpen(h), false);
-	assert.equal(h.$("alertModal").classList.contains("open"), true);
-	assert.match(h.$("alertMessage").textContent, /기존 목록 나누기는 다음 단계에서 지원/);
-	assert.match(h.status().text, /기존 목록 나누기는 다음 단계에서 지원/);
+	assert.equal(importOpen(h), true);
+	assert.equal(h.$("impLegacy").style.display, "", "분배 머리 줄");
+	assert.match(h.$("impLegacyInfo").textContent, /^기존 목록 \(화자 없음, 3줄\) → /);
+	h.$("impCancel").click();
 	assert.deepEqual(snap(h).subtitles, before.subtitles);
 	noErrors(h);
 });

@@ -164,7 +164,10 @@ function pageSetMiCast(on) {
 	return "window._mogrtDebug.setMiCast(" + (on ? "true" : "false") + ")";
 }
 
-/** 'SRT 가져오기' 창의 파일 줄 [{file, key, name, preset, count, action, dup}] + {open, ok, okText, error} */
+/**
+ * 'SRT 가져오기' 창: {open, rows: [{file, key, name, preset, count, action, dup}], ok, okText, error, stats, info, legacy}
+ * action은 이미 있는 화자면 선택 값(merge|replace), 아니면 칸의 글자(새 화자·병합·건너뜀). legacy는 분배 모드일 때만
+ */
 const PAGE_IMPORT_MODAL = "(() => { const m = document.getElementById('importModal'); if (!m) return null;" +
 	" const rows = Array.from(document.querySelectorAll('#impBody tr.imp-row')).map((r) => ({" +
 	"  file: (r.querySelector('.imp-file span') || {}).textContent || ''," +
@@ -172,10 +175,13 @@ const PAGE_IMPORT_MODAL = "(() => { const m = document.getElementById('importMod
 	"  name: (r.querySelector('.imp-name') || {}).value || ''," +
 	"  preset: (r.querySelector('.imp-preset') || {}).value || ''," +
 	"  count: (r.querySelector('.imp-count') || {}).textContent || ''," +
-	"  action: (r.querySelector('.imp-action') || {}).textContent || ''," +
+	"  action: r.querySelector('.imp-act') ? r.querySelector('.imp-act').value : ((r.querySelector('.imp-action') || {}).textContent || '')," +
 	"  dup: r.classList.contains('imp-dup') }));" +
 	" const ok = document.getElementById('impOk');" +
+	" const lg = document.getElementById('impLegacy');" +
 	" return { open: m.classList.contains('open'), rows, ok: !!ok && !ok.disabled, okText: ok ? ok.textContent : ''," +
+	"  legacy: lg && lg.style.display !== 'none' ? { info: (document.getElementById('impLegacyInfo') || {}).textContent || '', mode: (document.getElementById('impLegacyMode') || {}).value || ''," +
+	"   ambiguous: Array.from(document.querySelectorAll('#impAmbList .imp-amb')).map((a) => a.textContent) } : null," +
 	"  error: (document.getElementById('impError') || {}).textContent || ''," +
 	"  stats: Array.from(document.querySelectorAll('#impBody .imp-stats')).map((e) => e.textContent)," +
 	"  info: Array.from(document.querySelectorAll('#impBody .imp-info')).map((e) => e.textContent) }; })()";
