@@ -1130,6 +1130,10 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 .sub-mm.mm-restored { background: #26a69a; }
 .sub-mm.mm-undone { background: #ab47bc; }
 .sub-warn { font-size: 10px; font-weight: 700; color: #ffb300; flex-shrink: 0; cursor: help; padding: 0 2px; }
+/* 마지막 적용 결과 (안전하게 적용이 건너뛴 까닭·클립 없음, S1-9) */
+.sub-res { font-size: 9px; color: #ef9a9a; border: 1px solid #5a3030; border-radius: 3px; padding: 0 4px; flex-shrink: 0; white-space: nowrap; max-width: 150px; overflow: hidden; text-overflow: ellipsis; cursor: help; }
+#btnApplyStop { padding: 6px 10px; font-size: 11px; background: #4a1a1a; border: 1px solid #8a2a2a; color: #ef9a9a; border-radius: 4px; cursor: pointer; }
+#btnApplyStop:hover { background: #5a2a2a; }
 .btn-sel-changed {
     font-size: 10px; padding: 2px 8px;
     background: #1a2a3a; border: 1px solid #2a4a6a; color: #90caf9; border-radius: 3px; cursor: pointer; white-space: nowrap;
@@ -1230,6 +1234,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
         <option value="9">V10</option>
       </select>
       <button id="btnApply">▶ 타임라인에 적용</button>
+      <button id="btnApplyStop" title="안전하게 적용을 줄 사이에서 멈춤" style="display:none;">중지</button>
     </div>
   </div>
 

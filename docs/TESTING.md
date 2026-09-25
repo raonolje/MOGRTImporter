@@ -34,6 +34,9 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   - 상태는 `h.snapshot()`(= `window._mogrtDebug.snapshot()`, 읽기 전용 사본)으로 본다. `h.errors()`는 부팅·타이머·콘솔의 TypeError/ReferenceError.
   - `panel_golden.test.js`(단일 화자 SRT → 프리셋 → ▶ 페이로드·session.json)는 v27 app.js에서도 통과한다. 단일 화자 경로가 바뀌면 여기서 깨진다.
 - **픽스처는 합성 텍스트만** 넣는다(`tests/fixtures/`). 저장소에 GitHub 원격이 있다. `tests/fixtures/**`는 `-text`라 CRLF·CR·BOM 바이트가 그대로 커밋된다.
+- `tests/fixtures/mogrt/make_old_mogrt.js` (S1-9): '옛 버전 MOGRT' 하드 픽스처. 사용자 템플릿이 들어 있어 **커밋하지 않고** 테스트할 때마다 설치된 MOGRT에서 저장소 밖 임시 폴더(`<os.tmpdir()>/mi_mogrt_fixtures`)로 만든다(저장소 안 폴더는 거부, `*.mogrt`는 `.gitignore`).
+  - `makeOldLayoutMogrt({newName})`: 새 버전(기본 '자동 줄바꿈 박스')과 텍스트 컨트롤 이름이 순서대로 같고 구조가 다른 옛 버전(이 PC에서는 `Project_MOGRT/기본 자막.mogrt`, 8속성)을 찾아 바이트 그대로 복사한다. `MI_OLD_MOGRT`로 원본을 직접 지정할 수 있다.
+  - `makeRenamedMogrt(src, {옛: 새}, out)`: 같은 capsuleID로 컨트롤 이름만 바꾼 사본(S0-3 x ②). zip 읽기·쓰기는 의존성 없이 이 파일에 있다(`tests/unit/fixtures_mogrt.test.js`는 합성 템플릿으로만 본다).
 - `tests/compat/` (S1-5부터, `preset_refs.test.js`는 S1-2 리뷰 반영): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지). 출력은 숫자·id만.
   - `realcache.test.js` (S1-5): 비어 있지 않은 session.json을 하네스(메모리 cep.fs)에 넣고 불러와 다시 저장해도 JSON이 같고 키 4개(mi 없음)인지, 히스토리 항목을 드롭다운으로 복원해도 목록·rowStates·휴지통이 같은지, 캡션 T-ID가 모든 줄에서 캡션 필드로 해석되고 isV27Unsafe가 옛 구조 줄과 정확히 같은지 본다. 실행: `MI_REAL_CACHE="$APPDATA/Adobe/CEP/extensions/CEP_MogrtImporter/cache" node --test tests/compat/realcache.test.js`
 - `runCommand` (S1-5, `//#region src/mi/commands.ts`): 하드 케이스는 `await window._mogrtDebug.cmd(op, args)`(약속)로 부른다 (`hard.js`의 `pageCmd`). 읽기 명령 status·rows·resolve·presets·cast.get·session.snapshot.

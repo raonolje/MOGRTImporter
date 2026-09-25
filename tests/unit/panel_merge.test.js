@@ -280,15 +280,40 @@ test("레거시 목록 + 프리셋 + C번호 없는 파일 (플래그 켜짐): [
 	}
 });
 
-test("플래그 꺼짐(운영): 프리셋이 있는 목록에도 선택 창 없이 v27 교체", async () => {
+test("플래그 꺼짐(운영, S1-9): 프리셋이 있는 목록이면 병합/교체/취소를 묻고, 병합은 후반 작업을 지킨다", async () => {
 	const h = await boot();
 	await h.dropSrt("interview.srt", CAP.srt(CAP.C1));
 	const id = snap(h).subtitles[1].id;
 	setSel(h, h.$("sel-" + id), "preset_3");
+	await h.flush();
+	typeField(h, id, "T2", "날씨");
 	await h.dropSrt("interview_v2.srt", CAP.srt(CAP.C1_EDIT));
-	assert.equal(confirmOpen(h), false);
+	assert.equal(confirmOpen(h), true, "선택 창 (플래그와 무관)");
+	assert.deepEqual([h.$("confirmYes").textContent, h.$("confirmAlt").textContent, h.$("confirmNo").textContent], ["병합 (후반 작업 유지)", "교체 (지금까지 방식)", "취소"]);
+	h.$("confirmYes").click();
+	await h.flush();
+	const s = snap(h);
+	assert.ok(s.subtitles.some((x) => x.id === id), "id 그대로");
+	assert.equal(fieldOf(s, id, 2), "날씨");
+	assert.equal(s.rowStates[id].mm, "text");
+	assert.equal(h.$("btnSelectChanged").style.display, "");
+	assert.deepEqual(Object.keys(h.fs.readJson(P.session(PROJ, A.seqId))), ["subtitles", "rowStates", "trashBin", "nextId"], "단일 화자 파일 모양 그대로");
+	assert.equal(h.$("srtInput").multiple, false, "여러 파일은 여전히 플래그 뒤");
+	noErrors(h);
+});
+
+test("플래그 꺼짐(운영): 프리셋이 없는 목록·C번호 파일은 선택 창 없이 v27 교체", async () => {
+	const h = await boot();
+	await h.dropSrt("interview.srt", CAP.srt(CAP.C1));
+	const first = snap(h).subtitles.map((x) => x.id);
+	await h.dropSrt("interview_v2.srt", CAP.srt(CAP.C1_EDIT));
+	assert.equal(confirmOpen(h), false, "프리셋 없음 → 묻지 않는다");
+	assert.equal(snap(h).subtitles.some((x) => first.indexOf(x.id) !== -1), false, "v27 교체");
+	const id = snap(h).subtitles[1].id;
+	setSel(h, h.$("sel-" + id), "preset_3");
+	await h.dropSrt("C1.srt", CAP.srt(CAP.C1));
+	assert.equal(confirmOpen(h), false, "C번호 파일 → 플래그가 꺼져 있으면 v27 교체");
 	assert.equal(snap(h).subtitles.some((x) => x.id === id), false);
-	assert.equal(h.$("btnSelectChanged").style.display, "none");
 	assert.equal(h.$("listWrap").querySelectorAll(".sub-mm").length, 0);
 	noErrors(h);
 });

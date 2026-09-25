@@ -184,3 +184,44 @@ test("운영 캐시 (S1-8): 세션마다 자기 자막을 다시 병합해도 �
 	}
 	t.diagnostic("세션 " + sessions + "개, 캡션을 바꾼 줄 " + changed + "개");
 });
+
+test("운영 캐시 (S1-9): 병합으로 문장을 바꾼 줄은 안전 적용이 캡션을 이름(index -1)으로 보내고, 옛 구조 줄은 이름으로 쓸 수 있는 속성만 보낸다", { skip }, (t) => {
+	const core = loadRegions(["src/srtParser.ts", "src/mi/core.ts"]);
+	let text = 0;
+	let named = 0;
+	let staleRows = 0;
+	const skips = {};
+	for (const s of sequences()) {
+		const raw = readText(path.join(s.dir, "session.json"));
+		if (!raw || !s.presets) continue;
+		let sess;
+		let presets;
+		try { sess = JSON.parse(raw); presets = JSON.parse(s.presets).presets || {}; } catch (_) { continue; }
+		if (!sess || !Array.isArray(sess.subtitles) || !sess.subtitles.length) continue;
+		const data = { subtitles: JSON.parse(JSON.stringify(sess.subtitles)), rowStates: JSON.parse(JSON.stringify(sess.rowStates || {})), trashBin: JSON.parse(JSON.stringify(sess.trashBin || [])), nextId: sess.nextId || 1, mi: core.miDefault() };
+		const cues = data.subtitles.map((x, i) => ({ index: i + 1, startTime: x.startTime, endTime: x.endTime, startSec: x.startSec, endSec: x.endSec, text: x.text + ".", srtNo: x.index }));
+		core.importIntoData(data, { files: [{ key: null, action: "merge", cues }] }, { now: 1, presets });
+		const rows = data.subtitles.map((x) => {
+			const rs = data.rowStates[x.id];
+			return { sub: x, rs, preset: rs && rs.presetId ? presets[rs.presetId] || null : null, track: 2 };
+		});
+		const plan = core.legacySafePlan(rows, core.legacyNeighbors(data.subtitles, data.rowStates, data.trashBin, 2));
+		plan.forEach((p, i) => {
+			const r = rows[i];
+			if (!r.preset || !core.captionFid(r.preset)) return;
+			if (p.op === "skip") {
+				skips[p.why] = (skips[p.why] || 0) + 1;
+				assert.notEqual(p.why, "caption-name", tag(s) + " id " + p.id + ": 옛 구조 줄의 캡션을 이름으로 쓸 수 있어야 한다");
+				return;
+			}
+			text++;
+			const unsafe = core.isV27Unsafe(r.rs, r.preset);
+			if (unsafe) staleRows++;
+			const cap = p.params.find((x) => x.type === "text" && x.value === r.sub.text);
+			assert.ok(cap, tag(s) + " id " + p.id + ": 캡션 속성을 보낸다");
+			if (unsafe) assert.ok(p.params.every((x) => x.index === -1), tag(s) + " id " + p.id + ": 옛 구조 줄은 이름으로만");
+			if (cap.index === -1) named++;
+		});
+	}
+	t.diagnostic("안전 적용으로 보낼 줄 " + text + "개 (캡션 이름 쓰기 " + named + "개, 옛 구조 " + staleRows + "개), 건너뜀 " + JSON.stringify(skips));
+});

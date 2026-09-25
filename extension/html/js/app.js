@@ -33,6 +33,10 @@
 	const MI_CAST_ENABLED = false;
 	// 화자 줄의 ▶·↑ 안내 (화자별 트랙 배치는 S2-4. 그 전에는 v27 한 트랙 경로로 보내지 않는다)
 	const CAST_APPLY_PENDING_MSG = "화자별 배치는 개발 중입니다";
+	// 레거시 적용 (src/mi/apply.ts, S1-9). renderAll이 부팅 중에 읽으므로 여기 둔다.
+	//   _rowRes     줄마다 마지막 적용 결과 문구 {줄 id: "타임라인에 클립 없음" …} (.sub-res). 메모리에만, renderAll이 비운다
+	//   _legacyRun  실행 중인 '안전하게 적용' {stop}. [중지]가 stop을 켜면 줄 사이에서 멈춘다
+	var _rowRes = null, _legacyRun = null;
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -1376,14 +1380,17 @@
 	//   o.legacyLive   화자(spk) 없는 살아 있는 줄 수
 	//   o.legacyPreset 그중 프리셋이 걸린 줄 수 (후반 작업이 있는 목록)
 	// → "legacy"      첫 파일 하나를 v27 교체 본문으로
-	//   "choice"      C번호 없는 파일 하나 + 프리셋이 걸린 기존 목록 → [병합] [교체] [취소]
-	//   "modal"       'SRT 가져오기' 창
-	//   "distribute"  C번호 파일 + 화자 없는 기존 줄 (기존 목록을 화자로 나누기)
+	//   "choice"      C번호 없는 파일 하나 + 화자 표 없음 + 프리셋이 걸린 기존 목록 → [병합] [교체] [취소].
+	//                 S1-9부터 플래그와 무관하다 (운영에서도 묻는다)
+	//   "modal"       'SRT 가져오기' 창 (플래그)
+	//   "distribute"  C번호 파일 + 화자 없는 기존 줄 (기존 목록을 화자로 나누기, 플래그)
 	function srtImportRoute(o) {
 		const files = (o && o.files) || [];
-		if (!o || !o.castEnabled || !files.length) return "legacy";
+		if (!o || !files.length) return "legacy";
 		const f0 = files[0] || {};
-		if (files.length === 1 && !f0.key && !f0.ambiguous && o.castEmpty) return o.legacyPreset > 0 ? "choice" : "legacy";
+		const single = files.length === 1 && !f0.key && !f0.ambiguous && !!o.castEmpty;
+		if (single && o.legacyPreset > 0) return "choice";
+		if (!o.castEnabled || single) return "legacy";
 		if (o.legacyLive > 0) return "distribute";
 		return "modal";
 	}
@@ -2207,6 +2214,138 @@
 		const ft = Number(frameTicks);
 		if (!(ft > 0)) return NaN;
 		return Math.round((Number(sec) * TICKS_PER_SEC) / ft);
+	}
+
+	// ── 레거시 목록 적용 (바꾸지 않은 v27 호스트, S1-9) ──
+	// 화자 표가 없는 목록은 v27 호스트로 적용한다. 병합으로 바뀐 줄(mm)이나 v27 index 쓰기가 위험한 줄
+	// (isV27Unsafe)은 ▶에서 '안전하게 적용'을 고를 수 있다: 한 줄씩 updateClipAtTime(mogrtPath "")으로
+	// 제자리에서 이름 확인 속성만 쓴다. 새로 놓지도, 밀지도, 옮기지도 않는다 (S2-5부터 v28 호스트).
+
+	// updateClipAtTime은 시작 시각 ±0.5초 안의 첫 클립을 잡는다 (hostscript updateClipAtTime)
+	const V27_NEAR_SEC = 0.5;
+	// v27 applyToTimeline 결과가 검증된 성공인가: "SUCCESS"로 시작하고 "(실패"가 없다.
+	// v27은 실패가 있어도 "SUCCESS: … (실패 n개…)"를 돌려준다
+	function v27ResultOk(res) {
+		const s = typeof res === "string" ? res : "";
+		return s.indexOf("SUCCESS") === 0 && s.indexOf("(실패") === -1;
+	}
+	// v27 결과의 실패 개수 ("… (실패 3개: …)" → 3). 없으면 0
+	function v27FailCount(res) {
+		const m = /\(실패 (\d+)개/.exec(typeof res === "string" ? res : "");
+		return m ? parseInt(m[1], 10) : 0;
+	}
+	// 줄의 클립이 타임라인에 있을 것으로 보는 자리: 마지막 검증 적용(ap) → 병합 전 값(mmPrev) → 지금 시간
+	// → {s, e, from: "ap"|"mmPrev"|"sub"}
+	function applyLocate(rs, sub) {
+		const ok = (x) => !!x && typeof x.s === "number" && typeof x.e === "number";
+		if (rs && ok(rs.ap)) return { s: rs.ap.s, e: rs.ap.e, from: "ap" };
+		if (rs && ok(rs.mmPrev)) return { s: rs.mmPrev.s, e: rs.mmPrev.e, from: "mmPrev" };
+		return { s: sub ? sub.startSec : 0, e: sub ? sub.endSec : 0, from: "sub" };
+	}
+	// 줄 시간이 클립이 있을 자리(applyLocate)와 다른가 (시작·끝 중 하나라도 MERGE_TIME_EPS 넘게).
+	// mm이 "time"이어도 적용한 시간으로 돌아왔으면 false다 (병합은 적용 상태로 돌아와도 mm을 지우지 않는다)
+	function rowTimeChanged(rs, sub) {
+		if (!sub) return false;
+		const at = applyLocate(rs, sub);
+		if (at.from === "sub") return false;
+		return Math.abs(at.s - sub.startSec) > MERGE_TIME_EPS || Math.abs(at.e - sub.endSec) > MERGE_TIME_EPS;
+	}
+	// 줄이 보내는 속성 목록 (v27과 같은 규칙: _allParams가 있으면 그것, 없으면 노출 속성)
+	function rowSendParams(rs) {
+		if (!rs) return [];
+		return rs._allParams && rs._allParams.length > 0 ? rs._allParams : rs.params || [];
+	}
+	// 적용 뒤 기록(ap)을 적을 줄인가: 병합 표시(mm)가 있거나, v27에 위험하거나, 이미 ap가 있다.
+	// 그 밖의 줄(병합한 적 없는 v27 목록)은 적지 않는다 → session.json 모양이 v27 그대로
+	function needsApplyBook(rs, unsafe) {
+		return !!rs && (!!rs.mm || !!unsafe || !!rs.ap);
+	}
+	// 검증된 적용 기록 {s, e, cap, ps, t}: 시간, 캡션 필드 값(없으면 문장), 보낸 속성 목록의 paramSig, 트랙
+	function apRecord(sub, rs, preset, track) {
+		const cap = rowCaptionValue(rs, preset);
+		return { s: sub.startSec, e: sub.endSec, cap: cap !== null ? cap : sub.text, ps: paramSig(rowSendParams(rs)), t: track };
+	}
+	// 검증된 적용 뒤: ap를 적고 병합 표시(mm·mmPrev)를 지운다 (제자리)
+	function markApplied(rs, sub, preset, track) {
+		if (!rs || !sub) return;
+		rs.ap = apRecord(sub, rs, preset, track);
+		delete rs.mm;
+		delete rs.mmPrev;
+	}
+	// 안전 적용으로 보낼 속성 → {params} | {skip: 까닭}
+	//   v27에 위험한 줄(unsafe): 이름으로 쓸 수 있는 속성 전부 (namedParams에서 index가 -1이 된 것만.
+	//     이름이 겹치거나 이름으로 쓰지 않는 종류는 index로 가서 옛 구조 클립의 다른 속성에 들어갈 수 있어 뺀다).
+	//     캡션 필드가 있는데 이름으로 쓸 수 없으면 건너뛴다 (문장 변경이 빠진다)
+	//   그 밖(병합으로 문장이 바뀐 줄): 캡션 속성 하나. 이름이 유일하면 index -1, 겹치면 v27과 같은 index
+	//   네이티브 템플릿은 스크립트로 쓴 텍스트가 그려지지 않아(S0-3 §3-1) 제자리에서 갱신하지 않는다
+	function legacySafeParams(rs, preset, unsafe) {
+		if (!preset) return { skip: "no-preset" };
+		const all = rowSendParams(rs);
+		if (!all.length) return { skip: "no-params" };
+		if (isNativeList(all) || isNativeList(preset.params)) return { skip: "native" };
+		const named = namedParams(all);
+		const fid = captionFid(preset);
+		const f = fid ? resolveFid(all, fid, preset.params) : null;
+		const pos = f ? all.indexOf(f.param) : -1;
+		if (unsafe) {
+			if (fid && pos >= 0 && named[pos].index !== -1) return { skip: "caption-name" };
+			if (fid && pos < 0) return { skip: "no-caption" };
+			const list = named.filter((p) => p && p.index === -1);
+			return list.length ? { params: list } : { skip: "no-named" };
+		}
+		if (pos < 0) return { skip: "no-caption" };
+		return { params: [named[pos]] };
+	}
+	// 다른 줄의 클립이 있을 수 있는 자리 (안전 적용의 '근처 줄' 검사용).
+	// 살아 있는 줄과 휴지통 항목 모두 (목록에서 지워도 타임라인 클립은 남는다), 자리는 ap·mmPrev·지금 시간 전부.
+	// 트랙은 ap.t, 없으면 trackDefault → [{id, track, at: [초…]}]
+	function legacyNeighbors(subtitles, rowStates, trashBin, trackDefault) {
+		const one = (sub, rs) => {
+			const at = [];
+			[rs && rs.ap, rs && rs.mmPrev].forEach((x) => { if (x && typeof x.s === "number") at.push(x.s); });
+			if (typeof sub.startSec === "number") at.push(sub.startSec);
+			return { id: sub.id, track: rs && rs.ap && typeof rs.ap.t === "number" ? rs.ap.t : trackDefault, at };
+		};
+		const out = [];
+		(subtitles || []).forEach((s) => { if (s && !s.spk) out.push(one(s, rowStates ? rowStates[s.id] : null)); });
+		(trashBin || []).forEach((t) => { if (t && t.sub && !t.sub.spk) out.push(one(t.sub, t.state)); });
+		return out;
+	}
+	// 같은 트랙에서 다른 줄의 자리가 sec ±0.5초 안에 있는가 (updateClipAtTime이 그 클립을 잡을 수 있다)
+	function nearOtherRow(id, track, sec, neighbors) {
+		return (neighbors || []).some((o) => o && o.id !== id && o.track === track &&
+			(o.at || []).some((t) => typeof t === "number" && Math.abs(t - sec) < V27_NEAR_SEC));
+	}
+	// 레거시 안전 적용 계획. rows: [{sub, rs, preset, track}] (목록 순서), neighbors: legacyNeighbors 결과
+	// → [{id, op: "update"|"skip", why, startSec, endSec, track, params}]
+	//   why: new(아직 타임라인에 없음) · time(시간이 바뀜, 옮기지 못함) · near(0.5초 안에 다른 줄) · legacySafeParams의 까닭
+	function legacySafePlan(rows, neighbors) {
+		return (rows || []).map((r) => {
+			const sub = r.sub;
+			const rs = r.rs;
+			const out = { id: sub.id, op: "skip", why: "", startSec: sub.startSec, endSec: sub.endSec, track: r.track, params: null };
+			if (rs && rs.mm === "new" && !rs.ap) {
+				out.why = "new";
+				return out;
+			}
+			if (rowTimeChanged(rs, sub)) {
+				out.why = "time";
+				return out;
+			}
+			out.startSec = applyLocate(rs, sub).s;
+			const pr = legacySafeParams(rs, r.preset, isV27Unsafe(rs, r.preset));
+			if (pr.skip) {
+				out.why = pr.skip;
+				return out;
+			}
+			if (nearOtherRow(sub.id, r.track, out.startSec, neighbors)) {
+				out.why = "near";
+				return out;
+			}
+			out.op = "update";
+			out.params = pr.params;
+			return out;
+		});
 	}
 
 	// ── 명령(runCommand)용 주소·요약 ──
@@ -5436,6 +5575,8 @@ var modalState = {
 		_renderTrash = renderTrash;
 	}
 	function renderAll() {
+		// 줄 결과 문구(.sub-res)는 그 목록을 그린 동안만 보인다 (목록을 다시 그리면 비운다)
+		_rowRes = null;
 		const listWrap = document.getElementById("listWrap");
 		const emptyMsg = document.getElementById("emptyMsg");
 		emptyMsg.style.display = state.subtitles.length === 0 ? "flex" : "none";
@@ -5453,9 +5594,9 @@ var modalState = {
 	// v27은 'params가 비었으면 다시 읽기'라서 노출 속성이 없는 프리셋의 줄은 renderAll마다
 	// _allParams가 프리셋 기본값으로 돌아가 후반 작업 값이 사라졌다.
 	// 예외: 노출 속성(params)이 빈 줄의 _allParams 구조가 프리셋과 다르면(그 사이 프리셋을 다른 구조의
-	// MOGRT로 다시 저장했다) v27처럼 프리셋에서 다시 채운다. ▶·↑는 index로 쓰므로 옛 구조를 그대로 보내면
-	// 캡션이 다른 필드에 들어가고 진짜 캡션 필드가 비워진다. 속성창이 없는 줄이라 잃을 패널 편집도 없다.
-	// (S1-9 이름 쓰기·S1-10 구조 맞춤이 들어오면 이 예외를 다시 본다)
+	// MOGRT로 다시 저장했다) v27처럼 프리셋에서 다시 채운다. 속성창이 없는 줄이라 잃을 패널 편집도 없다.
+	// 다만 그 줄의 클립은 옛 구조일 수 있으므로 다시 채우기 전 서명을 psOld로 남긴다(적용 기록 ap가 없을 때).
+	// psOld가 있는 줄은 v27에 위험한 줄(isV27Unsafe)이 되어 ▶·↑가 이름으로 쓴다 (S1-9)
 	function _ensureRowParams(sub, rs) {
 		if (!rs) return;
 		const tBtn = document.getElementById("toggle-" + sub.id);
@@ -5464,6 +5605,7 @@ var modalState = {
 		const preset = rs.presetId ? state.presets[rs.presetId] : null;
 		const stale = !!(preset && hasAll && noExposed && layoutMismatch(rs._allParams, preset.params));
 		if (rs.presetId && noExposed && (!hasAll || stale)) {
+			if (stale && !rs.ap && !rs.psOld) rs.psOld = paramSig(rs._allParams);
 			loadParamsFromPreset(sub.id, rs.presetId, sub.text, rs.open !== false);
 			if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
 			return;
@@ -5625,6 +5767,9 @@ var modalState = {
 		if (mmEl) hdr.appendChild(mmEl);
 		const warnEl = _warnBadge(rowState);
 		if (warnEl) hdr.appendChild(warnEl);
+		// 마지막 적용 결과 (안전하게 적용이 건너뛰었거나 클립을 찾지 못한 까닭, 메모리에만)
+		const resEl = _resBadge(sub.id);
+		if (resEl) hdr.appendChild(resEl);
 		hdr.appendChild(timeEl);
 		hdr.appendChild(textEl);
 		hdr.appendChild(sel);
@@ -5897,10 +6042,15 @@ var modalState = {
 			_setStatus("프리셋을 찾을 수 없습니다.", "err");
 			return;
 		}
-		const params = rs._allParams.length > 0 ? rs._allParams : rs.params;
+		// v27에 위험한 줄(옛 구조 등)과 시간이 바뀐 줄은 이름으로 쓴다 (index -1 → 찾은 클립이 옛 구조여도 맞는 속성에).
+		// 나머지 줄은 v27과 같은 페이로드다. 클립을 못 찾으면 v27처럼 새로 놓는다 (S1-9)
+		const unsafe = isV27Unsafe(rs, preset);
+		const timeChanged = rowTimeChanged(rs, sub);
+		const params = unsafe || timeChanged ? namedParams(rowSendParams(rs)) : rs._allParams.length > 0 ? rs._allParams : rs.params;
 		const trackSel = document.getElementById("trackSel");
 		const trackIndex = parseInt(trackSel.value, 10);
 		_setStatus("클립 업데이트 중...", "info");
+		const seq = _importSeqToken();
 		let res;
 		try {
 			res = await host.updateClipAtTime({
@@ -5914,8 +6064,18 @@ var modalState = {
 			_setStatus("클립 업데이트 실패: " + (err.hostReason || err.message), "err");
 			return;
 		}
-		if (res.startsWith("SUCCESS")) _setStatus("[" + sub.index + "] " + res.replace("SUCCESS:", "").trim(), "ok");
-		else _setStatus(res.replace("ERROR:", "").trim(), "err");
+		if (res.startsWith("SUCCESS")) {
+			// 시간이 바뀐 줄에서 찾은 클립은 옛 자리 그대로다 → 새로 놓았을 때만 검증된 적용으로 본다
+			const placed = res.indexOf("새 클립") !== -1;
+			if (needsApplyBook(rs, unsafe) && (!timeChanged || placed) && seq === _importSeqToken()) {
+				markApplied(rs, sub, preset, trackIndex);
+				_setRowRes(sub.id, null);
+				_refreshRowMarks(sub);
+				saveSessionToStorage();
+				_updateMultiSelect();
+			}
+			_setStatus("[" + sub.index + "] " + res.replace("SUCCESS:", "").trim() + (timeChanged && !placed ? " — 시간은 옮기지 않았습니다 (이 버전에서 자동으로 옮길 수 없습니다)" : ""), "ok");
+		} else _setStatus(res.replace("ERROR:", "").trim(), "err");
 	}
 	function updateMultiSelect() {
 		const count = Object.values(state.rowStates).filter((rs) => rs.checked).length;
@@ -6047,11 +6207,11 @@ var modalState = {
 	// #srtInput에서 고른 파일은 모두 _onSrtFilesChosen을 지난다:
 	//   readAsArrayBuffer → decodeSrtBytes → parseSRT(text, {keepNo, stripTags}) → parseCaptionKey
 	// 경로는 core srtImportRoute (계획서 §3.4):
-	//   legacy      플래그 꺼짐(운영), 또는 C번호 없는 파일 하나 + 화자 표 없음 + 프리셋이 걸린 줄 없음.
+	//   legacy      C번호 없는 파일 하나 + 화자 표 없음 + 프리셋이 걸린 줄 없음, 또는 플래그 꺼짐(운영)의 나머지 경우.
 	//               첫 파일 하나를 v27 교체 본문(_legacyReplace, parseSRT opts 없음)으로 읽는다.
 	//               UTF-8이 아니거나 깨진 글자가 있으면 목록을 바꾸기 전에 첫 자막 미리보기와 함께 묻는다
-	//   choice      위와 같은데 프리셋이 걸린 줄이 있다 → [병합 (후반 작업 유지)] [교체 (지금까지 방식)] [취소].
-	//               병합은 _applyMerge(화자 없는 목록에 병합). S1-9까지 플래그 뒤에 있다
+	//   choice      C번호 없는 파일 하나 + 화자 표 없음 + 프리셋이 걸린 줄이 있다 → [병합 (후반 작업 유지)] [교체 (지금까지 방식)] [취소].
+	//               병합은 _applyMerge(화자 없는 목록에 병합). S1-9부터 플래그와 무관하다 (운영에서도 묻는다)
 	//   modal       2개 이상 | C번호 | 화자 표 있음 → 'SRT 가져오기' 창 → _importIntoCast (새 화자·병합·교체)
 	//   distribute  C번호 파일 + 화자 없는 기존 줄 → 같은 창의 분배 모드 (기존 목록을 화자로 나누기)
 	// 병합 규칙(짝 맞추기·3-way·휴지통 2차·분배)은 모두 core(importIntoData, buildMergePlan, distributeLegacy)에 있다.
@@ -7037,6 +7197,264 @@ var modalState = {
 	// 다른 출처로 부른다 (agent가 needs-approval을 받는지 시험할 때)
 	window._mogrtDebug.cmdAs = (source, op, args) => runCommand(op, args, { source });
 	//#endregion
+	//#region src/mi/apply.ts
+	// ─────────────────────────────────────────────────────────────
+	// 레거시 목록(화자 표 없음)의 타임라인 적용 — 바꾸지 않은 v27 호스트 (S1-9)
+	//
+	// ▶ → doApplyToTimeline(main.ts):
+	//   대상 줄에 병합 표시(mm)도 v27에 위험한 줄(isV27Unsafe)도 없으면 → _legacyApply = v27 본문 그대로
+	//     (같은 페이로드, 같은 기록·상태 줄. session.json에 새 키를 쓰지 않는다)
+	//   있으면 → 확인창 [안전하게 적용 (N)] [지금 방식으로 전체 적용] [취소]
+	//     안전하게 적용 = _legacySafeUpdateV27: 한 줄씩 updateClipAtTime(mogrtPath "")으로 제자리 갱신.
+	//       mogrtPath가 비면 v27 호스트는 클립을 새로 놓지도 밀지도 않는다 (못 찾으면 "ERROR: 클립 없음 …").
+	//       보내는 속성은 이름 확인 쓰기(index -1 → applyParamsToItem이 displayName으로 찾는다):
+	//       문장만 바뀐 줄은 캡션 하나, 구조가 다른 줄은 이름으로 쓸 수 있는 속성 전부 (core legacySafeParams).
+	//       시간이 바뀐 줄·새 줄·0.5초 안에 다른 줄이 있는 줄은 건너뛰고 까닭을 줄에 적는다(.sub-res).
+	//     지금 방식으로 전체 적용 = _legacyApply: 위험한 줄만 namedParams, 나머지는 v27 바이트.
+	// v27 결과는 실패가 있어도 SUCCESS다 → "(실패"가 없을 때만 검증된 적용으로 보고 ap를 적고 mm을 지운다.
+	// ↑(updateSingleClip)는 위험하거나 시간이 바뀐 줄만 이름으로 쓴다 (subtitleList).
+	// S2-5부터는 MI_ 호스트의 nodeId 기준 레거시 안전 경로가 이 단계를 대신한다.
+	// ─────────────────────────────────────────────────────────────
+	// 건너뛴 까닭 (줄 표시 .sub-res와 상태 줄)
+	const LEGACY_WHY = {
+		new: "새 줄: 타임라인에 아직 없음",
+		time: "시간이 바뀜: 이 버전에서 자동으로 옮길 수 없음",
+		near: "근처에 다른 줄이 있어 건너뜀",
+		"no-preset": "프리셋 없음",
+		"no-params": "속성 없음",
+		native: "네이티브 템플릿: 이 버전에서 제자리 갱신 불가",
+		"caption-name": "캡션 필드 이름이 겹쳐 이름으로 쓸 수 없음",
+		"no-caption": "캡션 필드를 찾지 못함",
+		"no-named": "이름으로 쓸 속성이 없음"
+	};
+	const LEGACY_MISSING = "타임라인에 클립 없음";
+	// 줄 결과 문구 (.sub-res). renderAll이 모두 비운다
+	function _setRowRes(id, text) {
+		if (!_rowRes) _rowRes = {};
+		if (text) _rowRes[id] = text;
+		else delete _rowRes[id];
+	}
+	function _resBadge(id) {
+		const text = _rowRes && _rowRes[id];
+		if (!text) return null;
+		const el = document.createElement("span");
+		el.className = "sub-res";
+		el.textContent = text;
+		el.title = text;
+		return el;
+	}
+	// 행 머리의 표시(병합 점·포인트 경고·결과 문구)만 다시 그린다 (속성창은 그대로)
+	function _refreshRowMarks(sub) {
+		const row = document.getElementById("row-" + sub.id);
+		const hdr = row && row.querySelector(".sub-header");
+		const num = hdr && hdr.querySelector(".sub-num");
+		if (!num) return;
+		hdr.querySelectorAll(".sub-mm, .sub-warn, .sub-res").forEach((el) => el.parentNode && el.parentNode.removeChild(el));
+		const rs = state.rowStates[sub.id];
+		let after = num;
+		[_mmBadge(sub, rs), _warnBadge(rs), _resBadge(sub.id)].forEach((el) => {
+			if (!el) return;
+			hdr.insertBefore(el, after.nextSibling);
+			after = el;
+		});
+	}
+	// 대상 줄 → [{sub, rs, preset, unsafe, track}]. track은 마지막 검증 적용의 트랙(ap.t), 없으면 지금 트랙 선택
+	function _legacyTargets(subs) {
+		const trackIndex = _trackValueNum();
+		return subs.map((sub) => {
+			const rs = state.rowStates[sub.id];
+			const preset = rs && rs.presetId ? state.presets[rs.presetId] || null : null;
+			return { sub, rs, preset, unsafe: isV27Unsafe(rs, preset), track: rs && rs.ap && typeof rs.ap.t === "number" ? rs.ap.t : trackIndex };
+		});
+	}
+	// 대상 중 확인이 필요한 줄 (병합 표시가 있거나 v27에 위험)
+	function _legacyFlagged(subs) {
+		return _legacyTargets(subs).filter((t) => t.rs && (t.rs.mm || t.unsafe));
+	}
+	// v27 ▶ 본문 (doApplyToTimeline v27). 달라진 것은 둘뿐이다:
+	//   v27에 위험한 줄은 namedParams를 보낸다 (나머지 줄은 v27과 같은 바이트)
+	//   결과에 "(실패"가 없을 때만 mm·위험·ap가 있는 줄에 ap를 적고 병합 표시를 지운다
+	async function _legacyApply(targetSubs) {
+		const trackSel = document.getElementById("trackSel");
+		const trackIndex = parseInt(trackSel.value, 10);
+		const books = [];
+		const items = targetSubs.map((sub) => {
+			const rs = state.rowStates[sub.id];
+			const preset = rs.presetId ? state.presets[rs.presetId] : null;
+			const unsafe = isV27Unsafe(rs, preset);
+			const params = unsafe ? namedParams(rowSendParams(rs)) : rs._allParams.length > 0 ? rs._allParams : rs.params;
+			if (needsApplyBook(rs, unsafe)) books.push({ sub, rs, preset });
+			return {
+				mogrtPath: preset ? preset.mogrtPath : "",
+				startSec: sub.startSec,
+				endSec: sub.endSec,
+				text: sub.text,
+				params
+			};
+		});
+		setStatus("타임라인에 배치 중... (" + items.length + "개)", "info");
+		const btnApply = document.getElementById("btnApply");
+		btnApply.disabled = true;
+		const seq = _importSeqToken();
+		let res;
+		try {
+			res = await host.applyToTimeline({
+				videoTrackIndex: trackIndex,
+				subtitles: items
+			});
+		} catch (err) {
+			btnApply.disabled = false;
+			setStatus("타임라인 적용 실패: " + (err.hostReason || err.message), "err");
+			return;
+		}
+		btnApply.disabled = false;
+		if (res.startsWith("SUCCESS")) {
+			const ok = v27ResultOk(res);
+			// 그 사이 시퀀스가 바뀌었으면(폴러가 목록을 바꿨다) 적지 않는다
+			if (ok && books.length && seq === _importSeqToken()) {
+				books.forEach((b) => {
+					markApplied(b.rs, b.sub, b.preset, trackIndex);
+					_setRowRes(b.sub.id, null);
+					_refreshRowMarks(b.sub);
+				});
+				saveSessionToStorage();
+				updateMultiSelect();
+			}
+			_saveHistoryOnAction("타임라인 적용 (" + items.length + "개)");
+			const kept = ok ? 0 : books.filter((b) => b.rs.mm).length;
+			if (kept) setStatus(res.replace("SUCCESS:", "").trim() + " — 실패 " + v27FailCount(res) + "개가 있어 바뀐 줄 " + kept + "개의 표시를 남겼습니다", "err");
+			else setStatus(res.replace("SUCCESS:", "").trim(), "ok");
+		} else setStatus(res.replace("ERROR:", "").trim(), "err");
+	}
+	// ▶ 확인창: 바뀐 줄·구조가 바뀐 줄이 있을 때 (flagged = _legacyFlagged(targetSubs))
+	function _legacyApplyChoice(targetSubs, flagged) {
+		const neighbors = legacyNeighbors(state.subtitles, state.rowStates, state.trashBin, _trackValueNum());
+		const plan = legacySafePlan(flagged, neighbors);
+		const count = (why) => plan.filter((p) => p.why === why).length;
+		const changed = flagged.filter((t) => t.rs.mm);
+		const timeN = changed.filter((t) => rowTimeChanged(t.rs, t.sub)).length;
+		const unsafeN = flagged.filter((t) => t.unsafe).length;
+		const sendN = plan.filter((p) => p.op === "update").length;
+		const parts = [];
+		if (changed.length) parts.push("바뀐 줄 " + changed.length + "개" + (timeN ? "(시간 변경 " + timeN + "개 포함)" : ""));
+		if (unsafeN) parts.push("구조가 바뀐 줄 " + unsafeN + "개");
+		const lines = [parts.join("와 ") + "가 있습니다.", "",
+			"안전하게 적용: 이 줄들만 제자리에서 속성 이름으로 갱신합니다. 클립을 새로 놓거나 밀거나 옮기지 않습니다."];
+		if (count("time")) lines.push("  · 시간이 바뀐 줄 " + count("time") + "개는 이 버전에서 자동으로 옮길 수 없습니다.");
+		if (count("new")) lines.push("  · 새 줄 " + count("new") + "개는 아직 타임라인에 없습니다 (↑로 한 줄씩 놓을 수 있습니다).");
+		if (count("near")) lines.push("  · 0.5초 안에 다른 줄이 있는 " + count("near") + "개는 건너뜁니다.");
+		const other = plan.filter((p) => p.op === "skip" && ["time", "new", "near"].indexOf(p.why) === -1).length;
+		if (other) lines.push("  · 그 밖에 " + other + "개는 건너뜁니다 (줄에 까닭이 표시됩니다).");
+		lines.push("", "지금 방식으로 전체 적용: 대상 " + targetSubs.length + "줄을 지금까지처럼 다시 적용합니다. 기존 클립을 찾지 못한 줄은 새로 놓여 다음 자막의 앞부분을 자를 수 있습니다.");
+		const ids = flagged.map((t) => t.sub.id);
+		const seq = _importSeqToken();
+		const guard = (fn) => () => {
+			if (seq !== _importSeqToken()) {
+				setStatus("시퀀스가 바뀌어 적용을 취소했습니다", "err");
+				return;
+			}
+			fn();
+		};
+		showChoice(lines.join("\n"), [
+			{ label: "안전하게 적용 (" + sendN + ")", run: guard(() => _legacySafeUpdateV27(ids)) },
+			{ label: "지금 방식으로 전체 적용", run: guard(() => _legacyApply(targetSubs)) },
+			{ label: "취소", run: () => setStatus("타임라인 적용 취소", "") }
+		]);
+	}
+	// 안전하게 적용: ids(목록 줄 id)를 한 줄씩 updateClipAtTime(mogrtPath "")으로 제자리 갱신한다.
+	// 줄 사이마다 [중지]와 시퀀스 전환을 확인한다. → {updated, missing, failed, skipped: {까닭: n}, stopped, aborted}
+	async function _legacySafeUpdateV27(ids) {
+		if (_legacyRun) {
+			setStatus("안전하게 적용이 이미 실행 중입니다", "err");
+			return null;
+		}
+		const want = {};
+		(ids || []).forEach((id) => { want[id] = true; });
+		const targets = _legacyTargets(state.subtitles.filter((s) => want[s.id] && !s.spk));
+		const plan = legacySafePlan(targets, legacyNeighbors(state.subtitles, state.rowStates, state.trashBin, _trackValueNum()));
+		const byId = {};
+		targets.forEach((t) => { byId[t.sub.id] = t; });
+		const report = { updated: 0, missing: 0, failed: 0, skipped: {}, stopped: false, aborted: false };
+		plan.forEach((p) => {
+			if (p.op === "skip") report.skipped[p.why] = (report.skipped[p.why] || 0) + 1;
+			_setRowRes(p.id, p.op === "skip" ? LEGACY_WHY[p.why] || p.why : null);
+			_refreshRowMarks(byId[p.id].sub);
+		});
+		const todo = plan.filter((p) => p.op === "update");
+		const seq = _importSeqToken();
+		const run = { stop: false };
+		_legacyRun = run;
+		const btnApply = document.getElementById("btnApply");
+		const btnStop = document.getElementById("btnApplyStop");
+		if (btnApply) btnApply.disabled = true;
+		if (btnStop) btnStop.style.display = "";
+		try {
+			for (let k = 0; k < todo.length; k++) {
+				if (run.stop) {
+					report.stopped = true;
+					break;
+				}
+				if (seq !== _importSeqToken()) {
+					report.aborted = true;
+					break;
+				}
+				const p = todo[k];
+				const t = byId[p.id];
+				setStatus("안전하게 적용 중… " + (k + 1) + "/" + todo.length, "info");
+				let res;
+				try {
+					res = await host.updateClipAtTime({ videoTrackIndex: p.track, startSec: p.startSec, endSec: p.endSec, mogrtPath: "", params: p.params });
+				} catch (err) {
+					res = "ERROR: " + (err.hostReason || err.message);
+				}
+				if (seq !== _importSeqToken()) {
+					report.aborted = true;
+					break;
+				}
+				if (res.indexOf("SUCCESS") === 0) {
+					markApplied(t.rs, t.sub, t.preset, p.track);
+					_setRowRes(p.id, null);
+					report.updated++;
+				} else if (res.indexOf("클립 없음") !== -1) {
+					_setRowRes(p.id, LEGACY_MISSING);
+					report.missing++;
+				} else {
+					_setRowRes(p.id, "적용 실패: " + res.replace(/^ERROR:\s*/, ""));
+					report.failed++;
+				}
+				_refreshRowMarks(t.sub);
+			}
+		} finally {
+			_legacyRun = null;
+			if (btnApply) btnApply.disabled = false;
+			if (btnStop) btnStop.style.display = "none";
+		}
+		if (report.aborted) {
+			setStatus("시퀀스가 바뀌어 안전하게 적용을 멈췄습니다 (" + report.updated + "개 적용)", "err");
+			return report;
+		}
+		if (report.updated) {
+			saveSessionToStorage();
+			_saveHistoryOnAction("안전하게 적용 (" + report.updated + "개)");
+		}
+		updateMultiSelect();
+		const SHORT = { time: "시간 변경", new: "새 줄", near: "근처 줄" };
+		const parts = ["갱신 " + report.updated];
+		if (report.missing) parts.push("클립 없음 " + report.missing);
+		if (report.failed) parts.push("실패 " + report.failed);
+		let other = 0;
+		Object.keys(report.skipped).forEach((why) => { if (!SHORT[why]) other += report.skipped[why]; });
+		Object.keys(SHORT).forEach((why) => { if (report.skipped[why]) parts.push(SHORT[why] + " " + report.skipped[why]); });
+		if (other) parts.push("건너뜀 " + other);
+		let msg = (report.stopped ? "중지함 — " : "") + "안전하게 적용: " + parts.join(" · ");
+		if (report.skipped.time) msg += " — 시간이 바뀐 줄 " + report.skipped.time + "개는 이 버전에서 자동으로 옮길 수 없습니다";
+		setStatus(msg, report.missing || report.failed || report.stopped ? "err" : "ok");
+		return report;
+	}
+	document.getElementById("btnApplyStop")?.addEventListener("click", () => {
+		if (_legacyRun) _legacyRun.stop = true;
+	});
+	//#endregion
 	//#region src/main.ts
 	function setStatus(msg, cls) {
 		const el = document.getElementById("statusBar");
@@ -7558,40 +7976,12 @@ var modalState = {
 		if (checkedIds.length > 0) showConfirm(checkedIds.length + "개 자막이 선택되어 있습니다.\n\n확인: 선택된 " + checkedIds.length + "개만 적용\n취소: 전체 " + state.subtitles.length + "개 적용", () => doApplyToTimeline(state.subtitles.filter((sub) => checkedIds.includes(sub.id))), () => doApplyToTimeline(state.subtitles));
 		else doApplyToTimeline(state.subtitles);
 	});
+	// ▶ 적용 (화자 줄은 위 처리기에서 막았다 → 화자 표 없는 레거시 목록). 병합으로 바뀐 줄이나 v27 index 쓰기가
+	// 위험한 줄이 있으면 [안전하게 적용] 확인창을 먼저 띄우고, 없으면 v27 본문 그대로 (src/mi/apply.ts)
 	async function doApplyToTimeline(targetSubs) {
-		const trackSel = document.getElementById("trackSel");
-		const trackIndex = parseInt(trackSel.value, 10);
-		const items = targetSubs.map((sub) => {
-			const rs = state.rowStates[sub.id];
-			const preset = rs.presetId ? state.presets[rs.presetId] : null;
-			const params = rs._allParams.length > 0 ? rs._allParams : rs.params;
-			return {
-				mogrtPath: preset ? preset.mogrtPath : "",
-				startSec: sub.startSec,
-				endSec: sub.endSec,
-				text: sub.text,
-				params
-			};
-		});
-		setStatus("타임라인에 배치 중... (" + items.length + "개)", "info");
-		const btnApply = document.getElementById("btnApply");
-		btnApply.disabled = true;
-		let res;
-		try {
-			res = await host.applyToTimeline({
-				videoTrackIndex: trackIndex,
-				subtitles: items
-			});
-		} catch (err) {
-			btnApply.disabled = false;
-			setStatus("타임라인 적용 실패: " + (err.hostReason || err.message), "err");
-			return;
-		}
-		btnApply.disabled = false;
-		if (res.startsWith("SUCCESS")) {
-			_saveHistoryOnAction("타임라인 적용 (" + items.length + "개)");
-			setStatus(res.replace("SUCCESS:", "").trim(), "ok");
-		} else setStatus(res.replace("ERROR:", "").trim(), "err");
+		const flagged = _legacyFlagged(targetSubs);
+		if (!flagged.length) return _legacyApply(targetSubs);
+		_legacyApplyChoice(targetSubs, flagged);
 	}
 	document.getElementById("btnAddPreset")?.addEventListener("click", () => {
 		openPresetModal(null);

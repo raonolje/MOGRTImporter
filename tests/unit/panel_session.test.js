@@ -342,7 +342,7 @@ test("노출 속성이 없는 프리셋의 줄: renderAll을 여러 번 해도 _
 	noErrors(h);
 });
 
-test("노출 속성이 없는 줄의 _allParams가 프리셋과 다른 구조면 v27처럼 프리셋에서 다시 채운다 (▶가 캡션을 엉뚱한 필드에 쓰지 않게)", async () => {
+test("노출 속성이 없는 줄의 _allParams가 프리셋과 다른 구조면 v27처럼 프리셋에서 다시 채우고, 옛 서명을 psOld로 남겨 ▶가 이름으로 쓴다 (클립은 옛 구조일 수 있다)", async () => {
 	const { helpers } = build();
 	const { T, N } = helpers;
 	// 지금 프리셋 구조: 캡션 idx4. 줄에는 옛 구조(캡션 idx0, '서브 포인트 텍스트' idx4)가 남아 있다
@@ -356,12 +356,18 @@ test("노출 속성이 없는 줄의 _allParams가 프리셋과 다른 구조면
 	const all = h.snapshot().rowStates[1]._allParams;
 	assert.deepEqual(all.map((p) => [p.index, p.displayName]), cur.map((p) => [p.index, p.displayName]), "지금 프리셋 구조");
 	assert.equal(all[4].value, "캡션 문장");
+	assert.match(h.snapshot().rowStates[1].psOld, /^[0-9a-f]{8}$/, "다시 채우기 전 서명 (S1-9)");
 	h.$("btnApply").click();
+	await h.flush();
+	// psOld → v27에 위험한 줄 → 확인창. '지금 방식으로 전체 적용'도 이 줄은 이름으로 보낸다
+	assert.equal(h.$("confirmModal").classList.contains("open"), true, "확인창");
+	assert.match(h.$("confirmMessage").textContent, /^구조가 바뀐 줄 1개가 있습니다\./);
+	h.$("confirmAlt").click();
 	await h.flush();
 	const call = h.host.calls.find((c) => c.fn === "applyToTimeline");
 	assert.ok(call, "applyToTimeline");
 	const sent = JSON.parse(call.args[0]).subtitles[0].params;
-	assert.deepEqual(sent.filter((p) => p.type === "text").map((p) => [p.index, p.displayName, p.value]), [[4, "전체 텍스트", "캡션 문장"], [6, "포인트 텍스트", ""]]);
+	assert.deepEqual(sent.filter((p) => p.type === "text").map((p) => [p.index, p.displayName, p.value]), [[-1, "전체 텍스트", "캡션 문장"], [-1, "포인트 텍스트", ""]]);
 	noErrors(h);
 });
 

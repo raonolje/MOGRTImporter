@@ -76,7 +76,11 @@ test("단일 화자 세션: 불러오고 저장해도 JSON이 같고 키 4개 (m
 	assert.deepEqual(saved, orig);
 	assert.deepEqual(h.snapshot().mi, DEFAULT_MI);
 	// SRT 로드: id를 줄 때 hwm이 메모리에서 오르지만 파일에는 여전히 키 4개
+	// (프리셋이 걸린 줄이 있어 병합/교체를 묻는다 → v27 교체, S1-9)
 	await h.dropSrt("새.srt", "1\n00:00:01,000 --> 00:00:02,000\n가\n\n2\n00:00:03,000 --> 00:00:04,000\n나\n");
+	assert.equal(h.$("confirmAlt").textContent, "교체 (지금까지 방식)");
+	h.$("confirmAlt").click();
+	await h.flush();
 	const s = h.snapshot();
 	assert.deepEqual(s.subtitles.map((x) => x.id), [3, 4]);
 	assert.equal(s.mi.hwm, 4);
