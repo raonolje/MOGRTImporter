@@ -134,6 +134,12 @@
 		if (!root) return null;
 		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/history_manual.json";
 	}
+	// 안전 지점: 목록을 바꾸는 동작 직전의 상태 (자동저장과 따로 둔다)
+	function _getHistorySafetyPath() {
+		const root = _getCacheRoot();
+		if (!root) return null;
+		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/history_safety.json";
+	}
 	function _getTrackPath() {
 		const root = _getCacheRoot();
 		if (!root) return null;
@@ -363,7 +369,7 @@
 		const e = _presetRefEntry();
 		if (n > e.max) e.max = n;
 	}
-	// cache/<projKey>/*/{session,history_auto,history_manual}.json의 "presetId":"preset_N" 중 가장 큰 N.
+	// cache/<projKey>/*/{session,history_auto,history_manual,history_safety}.json의 "presetId":"preset_N" 중 가장 큰 N.
 	// 파싱하지 않고 글자로만 찾는다 (깨진 파일도 본다). 프로젝트 키마다 한 번 (처음 id를 줄 때).
 	// 그 뒤로 디스크에 새로 생기는 참조는 살아 있거나 휴지통에 있던 프리셋의 것이라 카운터가 덮는다.
 	function _scanDiskPresetRefs() {
@@ -379,7 +385,7 @@
 			if (!ls || ls.err !== 0 || !Array.isArray(ls.data)) return;
 			const re = /"presetId"\s*:\s*"preset_(\d+)"/g;
 			ls.data.forEach((name) => {
-				["session.json", "history_auto.json", "history_manual.json"].forEach((f) => {
+				["session.json", "history_auto.json", "history_manual.json", "history_safety.json"].forEach((f) => {
 					const r = fsx.readFile(dir + "/" + name + "/" + f);
 					if (!r || r.err !== 0 || !r.data) return;
 					let m;
@@ -4146,6 +4152,8 @@ var modalState = {
 			if (!presetId) presetId = _allocPresetId();
 			const usedBy = Object.entries(state.rowStates).filter(([, rs]) => rs.presetId === presetId).map(([id]) => parseInt(id, 10));
 			const doSave = () => {
+				// 이 프리셋을 쓰는 줄의 속성을 다시 채우기 전에 안전 지점을 남긴다
+				if (usedBy.length > 0) _saveSafety("프리셋 저장 전: " + presetName);
 				state.presets[presetId] = {
 					id: presetId,
 					name: presetName,
@@ -4710,6 +4718,8 @@ var modalState = {
 		reader.onload = (ev) => {
 			const text = ev.target?.result;
 			const parsed = parseSRT(text);
+			// 지금 목록(과 휴지통)을 비우기 전에 안전 지점을 남긴다 (히스토리 드롭다운 '안전 지점'에서 되돌린다)
+			_saveSafety("SRT 가져오기 전: " + file.name);
 			// 아래 push 루프와 rowStates 구성이 끝난 뒤 saveSessionToStorage()가
 			// 한 번 돈다. 여기서 저장하면 빈 배열이 먼저 쓰인다.
 			// nextId는 되돌리지 않는다: 같은 시퀀스에서 id(→ 클립 태그·applied)가 다시 쓰이지 않게
@@ -5422,12 +5432,14 @@ var modalState = {
 						const plan = matchImportedPresets(accepted.map((a) => ({ id: a.pid, name: a.p.name, mogrtPath: a.p.mogrtPath })), live);
 						let lostRows = 0;
 						if (clearFirst) {
+							lostRows = Object.values(state.rowStates).filter((rs) => rs && rs.presetId && plan.dropped.indexOf(rs.presetId) !== -1).length;
+							// 줄의 프리셋 연결이 끊기기 전에 안전 지점을 남긴다 (프리셋은 프리셋 휴지통에 남는다)
+							if (lostRows > 0) _saveSafety("프리셋 가져오기 전");
 							const deletedAt = new Date().toISOString();
 							plan.dropped.forEach((id) => {
 								state.presetTrash.push({ preset: JSON.parse(JSON.stringify(live[id])), deletedAt, why: "import" });
 								delete state.presets[id];
 							});
-							lostRows = Object.values(state.rowStates).filter((rs) => rs && rs.presetId && plan.dropped.indexOf(rs.presetId) !== -1).length;
 						}
 						let kept = 0;
 						let moved = 0;
@@ -5531,6 +5543,8 @@ var modalState = {
 			try {
 				const data = JSON.parse(ev.target?.result);
 				if (!data.subtitles || !data.rowStates) { showAlert("올바른 작업 파일이 아닙니다."); return; }
+				// 지금 목록을 바꾸기 전에 안전 지점을 남긴다
+				_saveSafety("작업 불러오기 전");
 				// _sanitizeOrphanPresets()로 rowStates까지 정리한 뒤
 				// saveSessionToStorage()가 돈다.
 				setSubtitles(data.subtitles, { reason: "작업 파일 불러오기", persist: false });
@@ -5562,10 +5576,21 @@ var modalState = {
 
 	// ── 히스토리 기능 ──
 	// 자동저장/수동저장 각각 최대 20개, 별도 파일로 관리
+	// 안전 지점(history_safety.json)은 최대 10개: 목록을 바꾸는 동작 직전의 상태만 둔다.
+	// 5분 무작업 자동저장은 안전 지점에 쓰지 않으므로 자동저장이 안전 지점을 밀어내지 못한다.
 	const HISTORY_MAX = 20;
+	const SAFETY_MAX = 10;
+	// kind: "auto" | "manual" | "safety" → 파일 경로
+	function _historyPathOf(kind) {
+		return kind === "safety" ? _getHistorySafetyPath() : kind === "manual" ? _getHistoryManualPath() : _getHistoryPath();
+	}
+	// isManual: true/false (v27 호출) 또는 kind 문자열
+	function _histKind(isManual) {
+		return typeof isManual === "string" ? isManual : isManual ? "manual" : "auto";
+	}
 	function _loadHistoryList(isManual) {
 		try {
-			const path = isManual ? _getHistoryManualPath() : _getHistoryPath();
+			const path = _historyPathOf(_histKind(isManual));
 			if (!path) return [];
 			const data = _fsRead(path);
 			return Array.isArray(data) ? data : [];
@@ -5573,31 +5598,63 @@ var modalState = {
 	}
 	function _saveHistoryList(list, isManual) {
 		try {
-			const path = isManual ? _getHistoryManualPath() : _getHistoryPath();
-			if (path) _fsWrite(path, list);
+			const path = _historyPathOf(_histKind(isManual));
+			if (path) return _fsWrite(path, list);
 		} catch(_) {}
+		return false;
+	}
+	// 항목의 내용 해시. hash가 없는 옛 항목은 그 자리에서 계산한다
+	function _entryHash(entry) {
+		if (!entry) return "";
+		return typeof entry.hash === "string" && entry.hash ? entry.hash : contentHash(entry.subtitles, entry.rowStates, entry.trashBin);
+	}
+	// 지금 상태로 히스토리 항목을 만든다 (v27 모양 + hash)
+	function _makeHistoryEntry(label, isManual) {
+		const entry = {
+			ts: Date.now(),
+			label,
+			isManual: !!isManual,
+			sequenceKey: state.currentSequenceKey,
+			subtitles: JSON.parse(JSON.stringify(state.subtitles)),
+			rowStates: JSON.parse(JSON.stringify(state.rowStates)),
+			trashBin: JSON.parse(JSON.stringify(state.trashBin)),
+			nextId: state.nextId,
+			trackValue: document.getElementById("trackSel")?.value ?? "2"
+		};
+		entry.hash = contentHash(entry.subtitles, entry.rowStates, entry.trashBin);
+		return entry;
 	}
 	// → 히스토리 파일에 썼는가 (빈 목록·키 미확정·세션 읽기 실패면 false)
-	function _saveHistory(label, isManual) {
+	// opts.skipSame: 가장 최근 항목과 내용이 같으면 쓰지 않는다 (false) — 5분 무작업 자동저장용
+	function _saveHistory(label, isManual, opts) {
 		if (state.subtitles.length === 0) return false;
 		// 키가 정해지기 전이거나 세션 파일을 읽지 못한 키면, 메모리 목록이 이 키의 것이 아니다
 		if (!_keysResolved || _sessionReadFailed) return false;
 		try {
 			const list = _loadHistoryList(isManual);
-			const entry = {
-				ts: Date.now(),
-				label: label || (isManual ? "수동저장" : "자동저장"),
-				isManual: !!isManual,
-				sequenceKey: state.currentSequenceKey,
-				subtitles: JSON.parse(JSON.stringify(state.subtitles)),
-				rowStates: JSON.parse(JSON.stringify(state.rowStates)),
-				trashBin: JSON.parse(JSON.stringify(state.trashBin)),
-				nextId: state.nextId,
-				trackValue: document.getElementById("trackSel")?.value ?? "2"
-			};
+			const entry = _makeHistoryEntry(label || (isManual ? "수동저장" : "자동저장"), isManual);
+			if (opts && opts.skipSame && list.length && _entryHash(list[0]) === entry.hash) return false;
 			list.unshift(entry);
 			if (list.length > HISTORY_MAX) list.length = HISTORY_MAX;
 			_saveHistoryList(list, isManual);
+			_updateHistoryBtn();
+			return true;
+		} catch(_) { return false; }
+	}
+	// 안전 지점을 남긴다 → 새로 남겼는가.
+	// 남기지 않는 경우: 목록과 휴지통이 모두 비었다(잃을 것이 없다), 키가 정해지기 전·세션 읽기 실패
+	// (메모리 목록이 이 키의 것이 아니다), 가장 최근 안전 지점과 내용 해시가 같다.
+	function _saveSafety(label) {
+		if (state.subtitles.length === 0 && state.trashBin.length === 0) return false;
+		if (!_keysResolved || _sessionReadFailed) return false;
+		try {
+			const list = _loadHistoryList("safety");
+			const entry = _makeHistoryEntry(label || "안전 지점", false);
+			entry.kind = "safety";
+			if (list.length && _entryHash(list[0]) === entry.hash) return false;
+			list.unshift(entry);
+			if (list.length > SAFETY_MAX) list.length = SAFETY_MAX;
+			if (!_saveHistoryList(list, "safety")) return false;
 			_updateHistoryBtn();
 			return true;
 		} catch(_) { return false; }
@@ -5606,8 +5663,9 @@ var modalState = {
 		try {
 			const autoList = _loadHistoryList(false);
 			const manualList = _loadHistoryList(true);
+			const safetyList = _loadHistoryList("safety");
 			const btn = document.getElementById("btnHistory");
-			if (btn) btn.classList.toggle("has-history", autoList.length > 0 || manualList.length > 0);
+			if (btn) btn.classList.toggle("has-history", autoList.length > 0 || manualList.length > 0 || safetyList.length > 0);
 		} catch(_) {}
 	}
 	function _buildHistoryDropdown() {
@@ -5617,6 +5675,7 @@ var modalState = {
 		try {
 			const autoList = _loadHistoryList(false);
 			const manualList = _loadHistoryList(true);
+			const safetyList = _loadHistoryList("safety");
 			// ── 수동저장 섹션 (항상 표시) ──
 			const manualSection = document.createElement("div");
 			manualSection.style.cssText = "border-bottom:1px solid #333;padding:5px 10px 6px;";
@@ -5657,11 +5716,34 @@ var modalState = {
 				const manualListWrap = document.createElement("div");
 				manualListWrap.style.cssText = "margin-top:4px;max-height:120px;overflow-y:auto;";
 				manualList.forEach((entry, idx) => {
-					manualListWrap.appendChild(_makeHistoryItem(entry, idx, true));
+					manualListWrap.appendChild(_makeHistoryItem(entry, idx, "manual"));
 				});
 				manualSection.appendChild(manualListWrap);
 			}
 			dropdown.appendChild(manualSection);
+			// ── 안전 지점 섹션 (자동저장 위) ──
+			const safetySection = document.createElement("div");
+			safetySection.id = "historySafety";
+			safetySection.style.cssText = "border-bottom:1px solid #333;padding:5px 10px 6px;";
+			const safetyHeader = document.createElement("div");
+			safetyHeader.style.cssText = "font-size:10px;color:#888;margin-bottom:4px;";
+			safetyHeader.title = "SRT 가져오기·히스토리 복원·작업 불러오기·프리셋 저장·프리셋 가져오기 직전의 상태 (자동저장이 밀어내지 않습니다)";
+			safetyHeader.innerHTML = '안전 지점 <span style="color:#555;">' + safetyList.length + '/' + SAFETY_MAX + '</span>';
+			safetySection.appendChild(safetyHeader);
+			if (safetyList.length === 0) {
+				const emptyS = document.createElement("div");
+				emptyS.style.cssText = "font-size:11px;color:#555;padding:2px 0;";
+				emptyS.textContent = "안전 지점 없음";
+				safetySection.appendChild(emptyS);
+			} else {
+				const safetyListWrap = document.createElement("div");
+				safetyListWrap.style.cssText = "max-height:120px;overflow-y:auto;";
+				safetyList.forEach((entry, idx) => {
+					safetyListWrap.appendChild(_makeHistoryItem(entry, idx, "safety"));
+				});
+				safetySection.appendChild(safetyListWrap);
+			}
+			dropdown.appendChild(safetySection);
 			// ── 자동저장 섹션 ──
 			const autoSection = document.createElement("div");
 			autoSection.style.cssText = "padding:5px 10px 6px;";
@@ -5678,14 +5760,17 @@ var modalState = {
 				const autoListWrap = document.createElement("div");
 				autoListWrap.style.cssText = "max-height:120px;overflow-y:auto;";
 				autoList.forEach((entry, idx) => {
-					autoListWrap.appendChild(_makeHistoryItem(entry, idx, false));
+					autoListWrap.appendChild(_makeHistoryItem(entry, idx, "auto"));
 				});
 				autoSection.appendChild(autoListWrap);
 			}
 			dropdown.appendChild(autoSection);
 		} catch(_) {}
 	}
-	function _makeHistoryItem(entry, idx, isManual) {
+	// kind: "auto" | "manual" | "safety" (복원 흐름은 셋 다 같다)
+	function _makeHistoryItem(entry, idx, kind) {
+		const isManual = kind === "manual";
+		const defLabel = kind === "safety" ? "안전 지점" : isManual ? "수동저장" : "자동저장";
 		const item = document.createElement("div");
 		item.className = "history-item";
 		const d = new Date(entry.ts);
@@ -5695,15 +5780,17 @@ var modalState = {
 		infoWrap.style.cssText = "display:flex;align-items:center;gap:6px;flex:1;min-width:0;cursor:pointer;";
 		infoWrap.innerHTML =
 			'<span class="hist-time">' + dateStr + ' ' + timeStr + '</span>' +
-			'<span class="hist-label">' + escapeHtml(entry.label || (isManual ? "수동저장" : "자동저장")) + '</span>' +
+			'<span class="hist-label">' + escapeHtml(entry.label || defLabel) + '</span>' +
 			'<span class="hist-count">' + (entry.subtitles ? entry.subtitles.length : 0) + '개</span>';
 		infoWrap.title = "이 시점으로 복원";
 		infoWrap.addEventListener("click", (e) => {
 			e.stopPropagation();
 			showConfirm(
-				"[" + dateStr + " " + timeStr + "] " + (entry.label || (isManual ? "수동저장" : "자동저장")) + "\n" +
+				"[" + dateStr + " " + timeStr + "] " + (entry.label || defLabel) + "\n" +
 				(entry.subtitles ? entry.subtitles.length : 0) + "개 자막\n\n이 시점으로 복원하시겠습니까?",
 				() => {
+					// 복원하기 전 상태를 안전 지점으로 남긴다 (복원을 되돌릴 수 있게)
+					_saveSafety("히스토리 복원 전");
 					// 아래에서 _sanitizeOrphanPresets() 후 saveSessionToStorage()가 돈다.
 					setSubtitles(entry.subtitles, { reason: "히스토리 복원", persist: false });
 					state.rowStates = entry.rowStates;
@@ -5736,9 +5823,12 @@ var modalState = {
 		delBtn.addEventListener("click", (e) => {
 			e.stopPropagation();
 			try {
-				const list2 = _loadHistoryList(isManual);
-				list2.splice(idx, 1);
-				_saveHistoryList(list2, isManual);
+				const list2 = _loadHistoryList(kind);
+				// 드롭다운을 연 뒤 목록이 바뀌었을 수 있다(자동저장·안전 지점) → 시각·이름이 같은 항목을 지운다
+				let at = list2.findIndex((x) => x && x.ts === entry.ts && x.label === entry.label);
+				if (at === -1) at = idx;
+				list2.splice(at, 1);
+				_saveHistoryList(list2, kind);
 				_updateHistoryBtn();
 				_buildHistoryDropdown();
 				setStatus("히스토리 삭제됨", "ok");
@@ -5768,19 +5858,23 @@ var modalState = {
 		}
 	});
 	// 자동저장: 5분 무작업 시 히스토리 저장
+	// 가장 최근 자동 항목과 내용이 같으면 건너뛴다 (변화 없이 30분이 지나도 '자동저장'은 하나)
 	let _lastActivityTime = Date.now();
 	const _activityEvents = ["click", "keydown", "input", "change"];
 	_activityEvents.forEach((ev) => {
 		document.addEventListener(ev, () => { _lastActivityTime = Date.now(); }, { passive: true });
 	});
-	setInterval(() => {
+	function _idleAutosaveTick() {
 		if (state.subtitles.length === 0) return;
 		const idle = Date.now() - _lastActivityTime;
 		if (idle >= 5 * 60 * 1000) { // 5분
-		_saveHistory("자동저장 (5분 무작업)", false);
-		_lastActivityTime = Date.now(); // 중복 저장 방지
+			_saveHistory("자동저장 (5분 무작업)", false, { skipSame: true });
+			_lastActivityTime = Date.now(); // 중복 저장 방지
 		}
-	}, 60 * 1000); // 1분마다 체크
+	}
+	setInterval(_idleAutosaveTick, 60 * 1000); // 1분마다 체크
+	// 하드 테스트용: 1분 타이머를 기다리지 않고 무작업 확인을 한 번 돌린다 (Date.now를 앞당긴 뒤 부른다)
+	window._mogrtDebug.idleAutosaveTick = _idleAutosaveTick;
 	// 주요 작업 시 히스토리 저장 지점 등록 (SRT 로드, 타임라인 적용)
 	// 이 함수를 호출하는 코드는 아래 srtInput/btnApply 핸들러에서 호출됨
 	function _saveHistoryOnAction(label) { _saveHistory(label, false); }

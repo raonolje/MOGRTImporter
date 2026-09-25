@@ -458,6 +458,8 @@ const cachePaths = {
 	session: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/session.json",
 	settings: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/settings.json",
 	historyAuto: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/history_auto.json",
+	historyManual: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/history_manual.json",
+	historySafety: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/history_safety.json",
 	defaultSession: CACHE_ROOT + "/default/default_seq/session.json"
 };
 

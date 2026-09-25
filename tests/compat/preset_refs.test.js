@@ -12,12 +12,12 @@ const ROOT = process.env.MI_REAL_CACHE || "";
 const skip = !ROOT || !fs.existsSync(ROOT) ? "MI_REAL_CACHE가 없다" : false;
 const REF = /"presetId"\s*:\s*"preset_(\d+)"/g;
 
-// 앱의 _scanDiskPresetRefs와 같은 규칙: <projKey>/*/{session,history_auto,history_manual}.json의 가장 큰 번호
+// 앱의 _scanDiskPresetRefs와 같은 규칙: <projKey>/*/{session,history_auto,history_manual,history_safety}.json의 가장 큰 번호
 function diskRefMax(projDir) {
 	let max = 0;
 	for (const e of fs.readdirSync(projDir, { withFileTypes: true })) {
 		if (!e.isDirectory()) continue;
-		for (const f of ["session.json", "history_auto.json", "history_manual.json"]) {
+		for (const f of ["session.json", "history_auto.json", "history_manual.json", "history_safety.json"]) {
 			const p = path.join(projDir, e.name, f);
 			if (!fs.existsSync(p)) continue;
 			const text = fs.readFileSync(p, "utf8");

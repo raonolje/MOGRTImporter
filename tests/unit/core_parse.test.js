@@ -238,6 +238,29 @@ test("contentHash: 필드 순서가 달라도 내용이 같으면 같고, 값이
 	assert.equal(core.contentHash(), core.contentHash([], {}, []));
 });
 
+test("contentHash (S1-4): rowStates 키를 넣은 순서·속성 안의 키 순서와 상관없고, JSON 왕복 뒤에도 같다", () => {
+	const p = (i, v) => ({ index: i, displayName: "텍스트", type: "text", value: v, rawValue: JSON.stringify({ textEditValue: v, fontTextRunLength: [v.length] }) });
+	const rsA = {};
+	rsA["12"] = { presetId: "preset_3", params: [p(0, "가")], _allParams: [p(0, "가"), p(1, "나")], open: false, checked: false };
+	rsA["3"] = { presetId: "", params: [], _allParams: [], open: true, checked: true };
+	rsA["abc"] = { presetId: "", params: [], _allParams: [], open: false, checked: false };
+	const rsB = {};
+	rsB["abc"] = { checked: false, open: false, _allParams: [], params: [], presetId: "" };
+	rsB["3"] = { checked: true, open: true, _allParams: [], params: [], presetId: "" };
+	rsB["12"] = { checked: false, open: false, _allParams: [p(0, "가"), p(1, "나")].map((x) => ({ value: x.value, rawValue: x.rawValue, type: x.type, displayName: x.displayName, index: x.index })), params: [p(0, "가")], presetId: "preset_3" };
+	const subs = [{ id: 3, text: "하나" }, { id: 12, text: "둘" }];
+	const trash = [{ sub: { id: 7, text: "셋" }, state: { presetId: "" }, position: 1 }];
+	const h = core.contentHash(subs, rsA, trash);
+	assert.equal(core.contentHash(subs, rsB, trash), h);
+	assert.equal(core.contentHash(JSON.parse(JSON.stringify(subs)), JSON.parse(JSON.stringify(rsB)), JSON.parse(JSON.stringify(trash))), h, "JSON 왕복");
+	// 배열 순서(줄 순서)는 내용이다
+	assert.notEqual(core.contentHash(subs.slice().reverse(), rsA, trash), h);
+	// 체크 하나만 달라도 다르다
+	const rsC = JSON.parse(JSON.stringify(rsA));
+	rsC["3"].checked = false;
+	assert.notEqual(core.contentHash(subs, rsC, trash), h);
+});
+
 // ── (17) frameOf ──
 const RATES = [
 	{ name: "23.976", ticks: 10594584000, num: 24000, den: 1001 },
