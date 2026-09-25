@@ -979,6 +979,15 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
 
 - cast.set, suggest, sugg.list, plan, apply, verify, resolve.
 - agent는 needs-approval, 안전 지점, "AI: …" 라벨.
+- (S3-1 구현) 명령: cast.set {items}, suggest {items: [{uid, fid, value, sig, by?, note?, cap?}]}, sugg.list {uid?}, sugg.approve·sugg.reject {items | all} (ui·test만),
+  plan {ids | uids | spk} → planToken, apply {planToken}(또는 plan과 같은 인자), verify(읽기만), approvals.list·approve·reject (ui·test만). importSrt·merge*의 files는 {path}도 받는다 (5단계 import_srt).
+- (S3-1 구현) agent의 바꾸는 명령(importSrt·mergeCommit·apply·undo·cast.set)은 실행하지 않고 **승인 대기열**(메모리, 10분, 시퀀스가 바뀌면 버림)에 넣고
+  needs-approval + rid를 돌려준다. approvals.approve {rid}가 승인 단계다: 안전 지점 'AI: <명령> 전' → 실행 → 그동안 남는 히스토리·안전 지점 이름은 'AI: …'.
+  M5.4 승인 카드는 이 대기열을 보여 주기만 하면 된다. suggest는 agent도 바로 된다 — 제안 대기열 자체가 승인 단계이고 속성·타임라인에 쓰지 않으므로
+  안전 지점을 남기지 않는다(안전 지점 10개를 제안이 밀어내지 않게, spec과 다른 점). sugg.approve·sugg.reject·approvals.*는 agent가 부르면 needs-approval(대기열에 넣지 않음).
+- (S3-1 구현) ctx.seqId·ctx.build가 있으면 지금 시퀀스·패널 빌드와 비교한다(seq-mismatch·build-mismatch). 바꾸는 명령은 적용 중(_miBusy) busy이고 무작업 자동저장 시계를 되돌린다.
+  ui·test의 cast.set은 화자 표 칸과 같은 함수(_castSetItems)라 안전 지점을 남기지 않는다(칸을 고칠 때마다 안전 지점이 쌓이지 않게) — 히스토리 자동 항목만.
+- (S3-1 구현) validateSuggestion(core)과 verifyReport(core)·_miVerify는 S3-2·S3-3 몫이지만 suggest·verify 명령이 쓰므로 여기서 넣었다 (UI는 S3-2·S3-3).
 
 #### S3-2 AI 제안 대기열
 

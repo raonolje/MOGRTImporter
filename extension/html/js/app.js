@@ -48,6 +48,9 @@
 	//   _miCancel     [중지]를 눌렀다 (청크 사이에서 멈춘다)
 	//   _miRowStatus  줄마다 마지막 배치 결과 {줄 id: {st, why, detail}} (runCommand·테스트용. 줄 표시는 .sub-res)
 	var _miBusy = false, _miCancel = false, _miRowStatus = {};
+	// AI 명령 (src/mi/commands.ts, S3-1). 히스토리 저장(main.ts)이 읽는다.
+	//   _aiLabel  승인한 agent 요청을 실행하는 동안 참: 그 사이 남는 안전 지점·히스토리 이름에 "AI: "를 붙인다
+	var _aiLabel = false;
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -2864,6 +2867,99 @@
 		const generic = native && fields.length > 0 && fields.every((f) => /^텍스트 \d+$/.test(f.label));
 		return { id: (preset && preset.id) || "", name: (preset && preset.name) || "", captionFid: captionFid(preset), sig: fieldSignature(params), fields, notes, native, orderVerified: !native || !generic };
 	}
+	// 줄 uid → 줄 id. 다화자는 "salt-id"(지금 salt만), 단일 화자(salt 없음)는 id 문자열. 형식이 아니면 null
+	function uidToId(uid, salt) {
+		const s = String(uid == null ? "" : uid).trim();
+		const m = /^([a-z0-9]{4})-(\d+)$/.exec(s);
+		if (m) return salt && m[1] === salt ? parseInt(m[2], 10) : null;
+		return !salt && /^\d+$/.test(s) ? parseInt(s, 10) : null;
+	}
+
+	// ── AI 제안 (S3-1·S3-2) ──
+	// AI가 캡션이 아닌 텍스트 필드(T-ID)에 값을 제안한다 (사용자 결정 4·10: 켠다, 캡션이 아닌 텍스트 필드 모두).
+	// 제안은 rs.sugg[fid]에만 두고 사용자가 [적용]하기 전에는 속성(_allParams·params)에도 타임라인에도 쓰지 않는다.
+	// 적용 페이로드는 _allParams·params만 읽으므로 rs.sugg는 어디에도 실리지 않는다.
+	//   rs.sugg = {T2: {v, by, ts, cap: 제안 때 캡션 해시, sig: 제안 때 줄 필드 서명, st: "pending", note}}
+	// 캡션(해시)이나 필드 구조(서명)가 바뀐 제안은 낡은 것이다: 회색으로 보이고 적용할 수 없으며, 다음 병합이 지운다.
+	const SUGG_MAX_LEN = 500;
+	// 제안이 기억하는 캡션 해시 (normText의 fnv)
+	function suggCapHash(caption) {
+		return fnv1a32(normText(caption));
+	}
+	// 줄의 지금 캡션: 캡션 필드 값, 캡션 필드가 없거나 해석되지 않으면 sub.text
+	function suggCaptionOf(sub, rs, preset) {
+		const cap = preset ? rowCaptionValue(rs, preset) : null;
+		return cap !== null ? cap : String((sub && sub.text) || "");
+	}
+	// 제안 하나를 확인한다 (순수). inp {sub, rs, preset, fid, value, sig, cap?: 제안이 본 캡션 해시}
+	// → {ok, error, detail, warn: [], kind: "point"|"text", segs, missing, dup, max, capHash, field: 필드 이름}
+	//   error (받지 않음): too-long · empty · no-preset · native-unverified(순서 미확인 네이티브) · no-fields · fields-changed(서명 다름) ·
+	//     caption-field(캡션은 SRT 문장만) · unknown-field · stale(캡션이 바뀜) · missing-segment('$$' 조각이 캡션에 없음) · too-many(최대 N개 초과)
+	//   warn (받되 알림): not-in-caption('$$' 없는 문구가 캡션에 없음, 제목 같은 자유 문구) · dup(조각이 캡션에 두 번 → 첫 번째만 칠해짐)
+	// '$$'가 있는 값은 포인트 텍스트다: 조각마다 지금 캡션 안에 그대로 있어야 하고, 조각 수는 프리셋 설명(comment)의 '최대 N개'를 넘지 않는다.
+	function validateSuggestion(inp) {
+		const o = inp || {};
+		const rs = o.rs || {};
+		const preset = o.preset || null;
+		const value = typeof o.value === "string" ? o.value : null;
+		const out = { ok: false, error: "", detail: "", warn: [], kind: "text", segs: [], missing: [], dup: [], max: null, capHash: "", field: "" };
+		const fail = (error, detail) => Object.assign(out, { ok: false, error, detail: detail || "" });
+		if (value === null) return fail("empty", "값은 문자열");
+		if (value.length > SUGG_MAX_LEN) return fail("too-long", value.length + "자 (최대 " + SUGG_MAX_LEN + "자)");
+		if (!value.trim()) return fail("empty", "빈 값");
+		if (!preset) return fail("no-preset", "프리셋이 없는 줄");
+		if (!presetSummary(preset).orderVerified) return fail("native-unverified", "네이티브 템플릿: 필드 순서 미확인");
+		const all = Array.isArray(rs._allParams) ? rs._allParams : [];
+		if (!all.length) return fail("no-fields", "줄의 속성이 아직 없다");
+		const sigNow = fieldSignature(all);
+		if (String(o.sig == null ? "" : o.sig) !== sigNow) return fail("fields-changed", "지금 서명: " + sigNow);
+		const capFid = captionFid(preset);
+		if (o.fid === capFid) return fail("caption-field", o.fid + "는 캡션 필드 (SRT 문장만 들어간다)");
+		const f = resolveFid(all, o.fid, preset.params);
+		if (!f) return fail("unknown-field", String(o.fid) + " 필드가 이 줄에 없다");
+		out.field = f.displayName || "";
+		const caption = suggCaptionOf(o.sub, rs, preset);
+		out.capHash = suggCapHash(caption);
+		if (o.cap !== undefined && o.cap !== null && String(o.cap) !== out.capHash) return fail("stale", "캡션이 바뀌었다");
+		if (value.indexOf("$$") !== -1) {
+			out.kind = "point";
+			out.max = ruleMaxFromComments(preset.params);
+			const r = pointSegmentsOk(value, caption, out.max);
+			out.segs = r.segs;
+			out.missing = r.missing;
+			out.dup = r.dup;
+			if (!r.segs.length) return fail("empty", "'$$' 조각이 없다");
+			if (r.missing.length) return fail("missing-segment", r.missing.map((s) => "‘" + s + "’").join(", ") + "이 캡션에 없다");
+			if (r.tooMany) return fail("too-many", "조각 " + r.segs.length + "개 (최대 " + out.max + "개)");
+			if (r.dup.length) out.warn.push("dup");
+		} else {
+			const nfc = (s) => (String(s).normalize ? String(s).normalize("NFC") : String(s));
+			if (nfc(caption).indexOf(nfc(value)) === -1) out.warn.push("not-in-caption");
+		}
+		out.ok = true;
+		return out;
+	}
+	// 저장된 제안(rs.sugg의 항목)의 지금 상태 = 제안 때의 서명·캡션 해시로 다시 확인. stale: 캡션·필드 구조가 바뀌어 다시 확인이 필요
+	// → validateSuggestion 결과 + stale
+	function suggState(sub, rs, preset, fid, entry) {
+		const e = entry || {};
+		const r = validateSuggestion({ sub, rs, preset, fid, value: e.v, sig: e.sig, cap: e.cap });
+		r.stale = r.error === "stale" || r.error === "fields-changed";
+		return r;
+	}
+	// 제안 하나의 확인 문구 (.sugg-box): "✓ 본문에 있음" / "! 본문에 없는 문구" / 거절 까닭
+	function suggCheckText(r) {
+		if (!r) return "";
+		if (r.stale) return r.error === "fields-changed" ? "필드 구조가 바뀌어 다시 확인이 필요합니다" : "캡션이 바뀌어 다시 확인이 필요합니다";
+		if (!r.ok) {
+			if (r.error === "missing-segment") return "✕ " + r.missing.map((s) => "‘" + s + "’").join(", ") + "이 문장에 없습니다";
+			if (r.error === "too-many") return "✕ 조각 " + r.segs.length + "개 — 최대 " + r.max + "개";
+			return "✕ " + (r.detail || r.error);
+		}
+		if (r.warn.indexOf("not-in-caption") !== -1) return "! 본문에 없는 문구";
+		if (r.warn.indexOf("dup") !== -1) return "✓ 본문에 있음 · " + r.dup.map((s) => "‘" + s + "’").join(", ") + "이 두 번 나와 첫 번째만 칠해집니다";
+		return "✓ 본문에 있음";
+	}
 
 	// ── 네이티브 템플릿 굽기 (S1-11) ──
 	// Premiere에서 만든(네이티브) MOGRT는 Source Text.setValue가 어떤 형식이든 빈 글자로 그려진다
@@ -3695,7 +3791,9 @@
 			conflicts: [], edited: [], missing: [], oldVersion: [], decorated: [], unknownTemplate: [], unverifiedTemplate: [],
 			dup: [], noPreset: [], noCaption: [], bakeFailed: [], zeroLength: [], locked: [], none: [], userMoved: [], noSpeaker: [],
 			adopt: { certain: 0, uncertain: 0 }, foreignAdopt: { certain: 0, uncertain: 0 }, legacyMove: 0, legacyKept: [], legacyDecorated: 0,
-			overlaps: 0, staleLayoutRows: 0, oldVersionSkipped: 0, cleanup: [], orphans: [], perSpeaker: {}
+			overlaps: 0, staleLayoutRows: 0, oldVersionSkipped: 0, cleanup: [], orphans: [], perSpeaker: {},
+			// 우리 클립이 있는 줄의 지금 의도 해시 {줄 id: h} (검수가 applied.h와 비교해 '미적용'을 가른다, S3-3)
+			intentOf: {}
 		};
 		const idx = scanIndex(scan, salt);
 		const all = (inp.allRows || (inp.rows || []).map((r) => r.sub)).filter(Boolean);
@@ -3923,6 +4021,7 @@
 			const g0 = typeof cur.g === "number" ? cur.g : 1;
 			const cef = ap && typeof ap.cef === "number" ? ap.cef : x.ef;
 			const hNow = hOf(g0, T, x.sf, x.ef);
+			plan.intentOf[sub.id] = hNow;
 			if (!o.forceRegen[sub.id] && ap && ap.h === hNow && ((same && Math.abs(cur.ef - cef) <= 1) || (!same && !retime))) {
 				plan.none.push(sub.id);
 				if (!same) plan.userMoved.push(sub.id);
@@ -4571,6 +4670,125 @@
 		out.ops = sim.ok;
 		out.ops.forEach((op) => { out.rowOps[op.id] = op; });
 		return out;
+	}
+
+	// ── 타임라인 검수 (읽기만, S3-3) ──
+	// 화자 줄마다 타임라인의 우리 클립(태그)을 마지막 적용 기록(mi.applied)·지금 줄과 비교해 분류한다. 아무것도 쓰지 않는다.
+	// 패널이 getTracks(모든 비디오 트랙, V1 빼고)·readClipTexts(현재 클립, 40개씩)·planPlacement(마른 계획)를 모아 넘긴다.
+	// 줄 분류 (한 줄이 여럿일 수 있다. 하나도 없으면 정상):
+	//   dup        같은 태그의 현재 클립이 둘 이상 (자르기) — 나머지는 보지 않는다
+	//   missing    적용했던 줄(applied)인데 클립이 없다 (Premiere에서 지움)
+	//   moved      클립 자리(트랙·시작·끝)가 마지막 적용 자리와 1프레임 넘게 다르다 (Premiere에서 옮기거나 길이를 바꿈)
+	//   edited     AE 클립의 텍스트가 우리가 쓴 직후(applied.rh)와 다르다 (Premiere에서 고침)
+	//   oldVersion 클립의 속성 구조(clipLs)가 프리셋이 배운 구조(mogrtLs)와 다르다 (MOGRT를 다시 저장하기 전 클립)
+	//   decorated  효과가 늘었거나 Motion·Opacity에 키 (템플릿 자체의 키는 뺀다, decoratedOf)
+	//   unapplied  아직 적용하지 않은 변경: 클립이 없고 적용한 적도 없다, 병합 표시(mm), 템플릿 종류·경로가 다름,
+	//              지금 의도 해시(plan.intentOf)가 마지막 적용(applied.h)과 다름 (속성·트랙·시간·이름), 적용 기록 없음
+	// 네이티브 클립은 Source Text가 ""로 읽혀 텍스트로 확인할 수 없다: 다른 분류가 없으면 정상 대신 native(확인 불가)로 센다.
+	// 클립 분류: stale(옛 gen — 중단된 적용이 남긴 클립), orphan(목록에 없는 줄의 우리 클립).
+	// inp {rows: [{sub, rs, preset}] (화자 줄), allRows: 살아 있는 줄 전부, mi: {salt, applied}, scan, details, plan}
+	// → {counts: {ok, missing, …, native}, items: [{cat, id, uid, label, track, sf, ef, name, detail, clips?}], text: 요약 글, frameTicks, salt}
+	const VERIFY_CATS = [["ok", "정상"], ["missing", "타임라인에 없음"], ["moved", "옮겨짐"], ["dup", "같은 태그 중복"], ["stale", "옛 세대"],
+		["edited", "Premiere에서 고침"], ["oldVersion", "옛 버전 템플릿"], ["decorated", "효과·키프레임"], ["unapplied", "미적용"], ["orphan", "목록에 없는 클립"]];
+	const VERIFY_NATIVE_LABEL = "확인 불가(네이티브)";
+	// "정상 118 · 타임라인에 없음 1 · … · 목록에 없는 클립 1" (+ 네이티브가 있으면 " · 확인 불가(네이티브) N")
+	function verifySummaryText(counts) {
+		const c = counts || {};
+		const parts = VERIFY_CATS.map((x) => x[1] + " " + (c[x[0]] || 0));
+		if (c.native) parts.push(VERIFY_NATIVE_LABEL + " " + c.native);
+		return parts.join(" · ");
+	}
+	function verifyReport(inp) {
+		const o = inp || {};
+		const mi = o.mi || miDefault();
+		const salt = String(mi.salt || "");
+		const applied = mi.applied || {};
+		const scan = o.scan || { tracks: [] };
+		const ft = Number(scan.frameTicks) || 0;
+		const details = o.details || {};
+		const plan = o.plan || null;
+		const idx = scanIndex(scan, salt);
+		const counts = { native: 0 };
+		VERIFY_CATS.forEach((x) => { counts[x[0]] = 0; });
+		const items = [];
+		const byId = {};
+		(o.allRows || (o.rows || []).map((r) => r.sub)).forEach((s) => { if (s) byId[s.id] = s; });
+		const secOf = (f) => (ft > 0 ? (f * ft) / TICKS_PER_SEC : 0);
+		const place = (t, sf, ef) => "V" + (t + 1) + " " + secOf(sf).toFixed(2) + "~" + secOf(ef).toFixed(2);
+		const where = (c) => ({ track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name });
+		(o.rows || []).forEach((r) => {
+			const sub = r && r.sub;
+			if (!sub) return;
+			const rs = r.rs || {};
+			const preset = r.preset || null;
+			const uid = salt ? salt + "-" + sub.id : null;
+			const ap = uid && applied[uid] && typeof applied[uid] === "object" ? applied[uid] : null;
+			const base = { id: sub.id, uid, label: rowLabel(sub, true) };
+			const flags = [];
+			const add = (cat, extra) => flags.push(Object.assign({ cat }, base, extra));
+			const dups = uid ? idx.dup[uid] : null;
+			const cur = uid ? idx.current[uid] || null : null;
+			let kind = "";
+			if (dups) add("dup", Object.assign(where(dups[0]), { clips: dups.map(where), detail: "같은 태그 클립 " + dups.length + "개 (자르기?)" }));
+			else if (!cur) {
+				if (ap && typeof ap.t === "number") add("missing", { track: ap.t, sf: ap.sf, ef: typeof ap.cef === "number" ? ap.cef : ap.ef, detail: place(ap.t, ap.sf, typeof ap.cef === "number" ? ap.cef : ap.ef) + "에 있던 클립이 없음" });
+				else add("unapplied", { track: null, sf: ft > 0 ? frameOf(sub.startSec, ft) : null, ef: ft > 0 ? frameOf(sub.endSec, ft) : null, detail: preset ? "아직 타임라인에 없음" : "프리셋 없음" });
+			} else {
+				const d = details[cur.nodeId];
+				if (!d || d.found === false) add("missing", Object.assign(where(cur), { detail: "스캔 뒤 클립이 사라짐" }));
+				else {
+					kind = String(d.kind || "");
+					const at = where(cur);
+					if (ap && typeof ap.t === "number" && typeof ap.sf === "number") {
+						const cef = typeof ap.cef === "number" ? ap.cef : ap.ef;
+						if (cur.track !== ap.t || Math.abs(cur.sf - ap.sf) > 1 || (typeof cef === "number" && Math.abs(cur.ef - cef) > 1)) {
+							add("moved", Object.assign({}, at, { detail: place(ap.t, ap.sf, cef) + " → " + place(cur.track, cur.sf, cur.ef) }));
+						}
+					}
+					if (kind === "ae" && ap && ap.rh && textsHash(d.texts) !== ap.rh) {
+						const t = (d.texts || []).map((x) => String(x == null ? "" : x)).filter(Boolean).join(" / ");
+						add("edited", Object.assign({}, at, { detail: "클립 문장: " + (t.length > 60 ? t.slice(0, 59) + "…" : t) }));
+					}
+					const want = preset ? (isNativeList(preset.params) ? "native" : "ae") : kind;
+					const tChanged = !!preset && (kind !== want || (kind === "ae" && !!ap && !!ap.m && normPath(ap.m) !== normPath(preset.mogrtPath)));
+					if (kind === "ae" && preset && !tChanged && preset.mogrtLs && Array.isArray(d.lay) && clipLs(d.lay) !== preset.mogrtLs) add("oldVersion", Object.assign({}, at, { detail: "MOGRT를 다시 저장하기 전 구조" }));
+					if (decoratedOf(d, preset)) {
+						const k = d.deco && Array.isArray(d.deco.keyed) ? d.deco.keyed : [];
+						add("decorated", Object.assign({}, at, { detail: (k.length ? "키: " + k.join(", ") : "효과 " + ((d.deco && d.deco.comps) || 0) + "개") }));
+					}
+					const hNow = plan && plan.intentOf ? plan.intentOf[sub.id] : undefined;
+					let why = "";
+					if (tChanged) why = "템플릿이 바뀜";
+					else if (!ap) why = "마지막 적용 기록 없음";
+					else if (rs.mm) why = "바뀐 줄 (변경 표시)";
+					else if (hNow !== undefined && hNow !== ap.h) why = "패널에서 바뀐 값이 있음";
+					if (why) add("unapplied", Object.assign({}, at, { detail: why }));
+				}
+			}
+			if (!flags.length) {
+				if (cur && ((preset && isNativeList(preset.params)) || (kind && kind !== "ae"))) counts.native++;
+				else counts.ok++;
+				return;
+			}
+			flags.forEach((f) => {
+				counts[f.cat]++;
+				items.push(f);
+			});
+		});
+		// 클립 분류: 옛 gen, 목록에 없는 줄의 클립 (가장 높은 gen — 자른 조각이면 여럿)
+		idx.stale.forEach((c) => {
+			counts.stale++;
+			items.push(Object.assign({ cat: "stale", id: c.id, uid: c.uid, label: byId[c.id] ? rowLabel(byId[c.id], true) : null, g: c.g, detail: "옛 gen " + c.g + " (" + place(c.track, c.sf, c.ef) + ")" }, where(c)));
+		});
+		Object.keys(idx.own).forEach((uid) => {
+			const list = idx.own[uid];
+			if (!list.length || byId[list[0].id]) return;
+			list.filter((c) => c.g === list[0].g).forEach((c) => {
+				counts.orphan++;
+				items.push(Object.assign({ cat: "orphan", id: c.id, uid: c.uid, label: null, g: c.g, detail: c.name }, where(c)));
+			});
+		});
+		return { counts, items, text: verifySummaryText(counts), frameTicks: ft, salt };
 	}
 	// app.js 원문에서 //#region <name> 본문을 잘라낸다 (표식 줄 제외, 줄바꿈 LF). 없으면 null.
 	// tests/lib/loadRegions.js의 sliceRegion과 같은 규칙: coreHash = fnv1a32(이 region 본문)
@@ -7952,8 +8170,7 @@ var modalState = {
 		name.addEventListener("change", () => {
 			const v = String(name.value || "").trim() || K;
 			if (v === c.name) return;
-			c.name = v;
-			_castCommit(K, "화자 이름: " + K + " " + v);
+			_castSetItems([{ key: K, name: v }], { label: "화자 이름: " + K + " " + v });
 		});
 		const track = document.createElement("select");
 		track.className = "cast-track";
@@ -7961,8 +8178,8 @@ var modalState = {
 		_fillCastTrackOptions(track, K, pv);
 		track.addEventListener("change", () => {
 			const v = track.value === "" ? null : parseInt(track.value, 10);
-			c.track = v === null || !isFinite(v) ? null : v;
-			_castCommit(K, "화자 트랙: " + K + " " + (c.track === null ? "자동" : _trackName(c.track)));
+			const t = v === null || !isFinite(v) ? null : v;
+			_castSetItems([{ key: K, track: t }], { label: "화자 트랙: " + K + " " + (t === null ? "자동" : _trackName(t)) });
 		});
 		const preset = document.createElement("select");
 		preset.className = "cast-preset";
@@ -7981,8 +8198,8 @@ var modalState = {
 		});
 		preset.value = c.presetId && state.presets[c.presetId] ? c.presetId : "";
 		preset.addEventListener("change", () => {
-			c.presetId = preset.value;
-			_castCommit(K, "화자 기본 프리셋: " + K + " " + (c.presetId ? state.presets[c.presetId].name || c.presetId : "없음"));
+			const pid = preset.value;
+			_castSetItems([{ key: K, presetId: pid }], { label: "화자 기본 프리셋: " + K + " " + (pid ? state.presets[pid].name || pid : "없음") });
 		});
 		const cnt = document.createElement("span");
 		cnt.className = "cast-count";
@@ -8030,6 +8247,96 @@ var modalState = {
 		if (label) _saveHistoryOnAction(label);
 		renderCastBar();
 		renderSpeakerChips();
+	}
+	// 화자 표 바꾸기 (화자 표의 이름·트랙·기본 프리셋 칸과 runCommand cast.set이 같이 쓴다, S3-1).
+	// items [{key, name?, track?, presetId?, pos?}] — 모두 확인한 뒤에만 바꾼다 (하나라도 틀리면 아무것도 바꾸지 않는다):
+	//   name: 앞뒤 공백을 뺀 값, 비면 키 · track: null(자동) | 1..98 (V2..V99, 0-기준 트랙 번호) ·
+	//   presetId: "" | 캡션 필드가 있는 프리셋 (지금 값 그대로는 늘 된다) · pos: null | {x, y} 0~1 (4단계 화면 위치)
+	// 바뀐 것이 있으면: session.json·cast.json → cast_defaults.json → 히스토리 자동 항목(opts.label, 없으면 "화자 표: C2 이름 영희 · …") → 다시 그리기.
+	// 화자 표 칸(opts.label)에서 틀린 값이 오면 상태 줄에 알리고 칸을 되돌린다 → {changed: [키], label} | {error}
+	const CAST_SET_FIELDS = ["key", "name", "track", "presetId", "pos"];
+	function _castSetItems(items, opts) {
+		const o = opts || {};
+		const fail = (error) => {
+			if (o.label) {
+				setStatus(error, "err");
+				renderCastBar();
+			}
+			return { error };
+		};
+		if (!Array.isArray(items) || !items.length) return fail("items는 [{key, name?, track?, presetId?, pos?}] 배열");
+		const mi = state.mi;
+		const plan = [];
+		const seen = {};
+		for (const it of items) {
+			if (!it || typeof it !== "object" || Array.isArray(it)) return fail("items[]는 객체");
+			const K = it.key;
+			if (typeof K !== "string" || !mi.cast || !mi.cast[K]) return fail("화자 표에 없는 화자: " + String(K));
+			if (seen[K]) return fail(K + "가 두 번 있다");
+			seen[K] = true;
+			const extra = Object.keys(it).filter((f) => CAST_SET_FIELDS.indexOf(f) === -1);
+			if (extra.length) return fail("모르는 칸: " + extra.join(", "));
+			const c = mi.cast[K];
+			const ch = {};
+			if (it.name !== undefined) {
+				if (typeof it.name !== "string") return fail(K + " name은 문자열");
+				ch.name = it.name.trim() || K;
+			}
+			if (it.track !== undefined) {
+				if (it.track !== null && !(Number.isInteger(it.track) && it.track >= 1 && it.track < MI_SCAN_TRACK_MAX)) return fail(K + " track은 null(자동) 또는 1.." + (MI_SCAN_TRACK_MAX - 1) + " (V2..)");
+				ch.track = it.track;
+			}
+			if (it.presetId !== undefined) {
+				const p = it.presetId;
+				if (typeof p !== "string") return fail(K + " presetId는 문자열");
+				if (p && p !== (c.presetId || "") && (!state.presets[p] || captionFid(state.presets[p]) === null)) return fail(K + ": 캡션 필드가 있는 프리셋이 아니다: " + p);
+				ch.presetId = p;
+			}
+			if (it.pos !== undefined) {
+				const v = it.pos;
+				const unit = (x) => typeof x === "number" && isFinite(x) && x >= 0 && x <= 1;
+				if (v !== null && !(v && typeof v === "object" && unit(v.x) && unit(v.y))) return fail(K + " pos는 null 또는 {x, y} (0~1)");
+				ch.pos = v === null ? null : { x: v.x, y: v.y };
+			}
+			plan.push([K, ch]);
+		}
+		const changed = [];
+		const parts = [];
+		plan.forEach(([K, ch]) => {
+			const c = mi.cast[K];
+			const bits = [];
+			if (ch.name !== undefined && ch.name !== c.name) {
+				c.name = ch.name;
+				bits.push("이름 " + ch.name);
+			}
+			if (ch.track !== undefined && ch.track !== (typeof c.track === "number" ? c.track : null)) {
+				c.track = ch.track;
+				bits.push("트랙 " + (ch.track === null ? "자동" : _trackName(ch.track)));
+			}
+			if (ch.presetId !== undefined && ch.presetId !== (c.presetId || "")) {
+				c.presetId = ch.presetId;
+				bits.push("기본 프리셋 " + (ch.presetId ? state.presets[ch.presetId].name || ch.presetId : "없음"));
+			}
+			if (ch.pos !== undefined && stableJson(ch.pos) !== stableJson(c.pos === undefined ? null : c.pos)) {
+				c.pos = ch.pos;
+				bits.push("위치 " + (ch.pos ? ch.pos.x + ", " + ch.pos.y : "원래대로"));
+			}
+			if (bits.length) {
+				changed.push(K);
+				parts.push(K + " " + bits.join(", "));
+			}
+		});
+		if (!changed.length) {
+			if (o.label) renderCastBar();
+			return { changed, label: "" };
+		}
+		const label = o.label || "화자 표: " + parts.join(" · ");
+		saveSessionToStorage();
+		_saveCastDefaults(changed);
+		_saveHistoryOnAction(label);
+		renderCastBar();
+		renderSpeakerChips();
+		return { changed, label };
 	}
 	// ⋯ 메뉴 (열려 있는 것은 하나)
 	var _castMenuEl = null;
@@ -9094,6 +9401,20 @@ var modalState = {
 			reader.readAsArrayBuffer(file);
 		});
 	}
+	// 디스크의 SRT 경로 → {file: {name, path, size, mtime, bytes}} | {error}. CEP의 Node fs로 읽는다.
+	// 명령 importSrt·merge*의 {path}(5단계 import_srt)와 화자 표 ⟳(다시 가져오기, S3-3)가 쓴다. mtime은 ms 정수 (File.lastModified와 같은 단위)
+	function _readSrtPath(p) {
+		const fs = _nodeRequire("fs");
+		const path = String(p == null ? "" : p).replace(/\\/g, "/");
+		if (!fs) return { error: "파일을 읽을 수 없다 (Node 없음): " + path };
+		try {
+			const st = fs.statSync(path);
+			const bytes = new Uint8Array(fs.readFileSync(path));
+			return { file: { name: path.split("/").pop(), path, size: bytes.length, mtime: Math.floor(Number(st.mtimeMs) || 0), bytes } };
+		} catch (e) {
+			return { error: "파일을 읽지 못했다: " + path + " (" + _errText(e) + ")" };
+		}
+	}
 	// 읽은 파일 하나 → {file: {name, path, size, mtime}, dec: {encoding, replaced}, text, cues, capKey}
 	function _analyzeSrt(f) {
 		const d = decodeSrtBytes(f.bytes);
@@ -9802,13 +10123,36 @@ var modalState = {
 	// 오류 코드: needs-approval | fields-changed | busy | seq-mismatch | build-mismatch | bad-args | not-found
 	//   (예상하지 못한 예외는 exception)
 	//
-	// S1-5에는 읽기 명령만 있다: status, rows, resolve, presets, cast.get, session.snapshot.
-	// 바꾸는 명령(importSrt, merge*, plan/apply, cast.set, suggest …)은 뒤 커밋에서 더하고,
-	// agent가 보내면 M5.4(승인 카드) 전까지 needs-approval이다.
+	// 읽기: status, rows, resolve, presets, cast.get, session.snapshot, mergePreview, plan(→ planToken), verify, sugg.list, approvals.list
+	// 바꾸기: importSrt, mergeCommit, apply {planToken | ids | uids | spk}, undo, cast.set,
+	//         suggest (제안 대기열에만 넣는다 — 속성·타임라인은 그대로), sugg.approve·sugg.reject (ui·test만), approvals.approve·approvals.reject (ui·test만)
+	// agent가 바꾸는 명령(CMD_MUTATING)을 보내면 실행하지 않고 승인 대기열에 넣고 needs-approval(rid)을 돌려준다 (M5.4 승인 카드 전까지는
+	// approvals.approve로 승인한다). 승인하면 안전 지점 'AI: <명령> 전'을 먼저 남기고 실행하며, 그동안 남는 히스토리 이름은 'AI: …'다.
+	// suggest는 agent도 바로 된다: 제안 대기열 자체가 승인 단계다 (사용자가 [적용]하기 전에는 아무것도 쓰지 않는다, 결정 4).
+	// 모든 명령: ctx.seqId·ctx.build가 있으면 지금 시퀀스·패널 빌드와 같아야 하고(seq-mismatch·build-mismatch), 바꾸는 명령은
+	// 적용이 도는 동안(_miBusy) busy이고 무작업 자동저장 시계를 되돌린다(_lastActivityTime).
 	// 줄 주소 "#12" / "C2·12"는 사람이 읽는 이름일 뿐이다(파싱할 때마다 바뀐다). 쓰기 주소는 uid다.
 	// ─────────────────────────────────────────────────────────────
 	const CMD_SOURCES = { ui: true, test: true, agent: true };
 	const CMD_ROWS_MAX = 200;
+	// 바꾸는 명령 → 승인 대기열·안전 지점 이름에 쓰는 말
+	const CMD_MUTATING = { importSrt: "SRT 가져오기", mergeCommit: "SRT 병합", apply: "타임라인 적용", undo: "마지막 적용 되돌리기", "cast.set": "화자 표 바꾸기" };
+	// agent가 부를 수 없는 명령 (사용자의 승인 그 자체)
+	const CMD_UI_ONLY = { "sugg.approve": true, "sugg.reject": true, "approvals.approve": true, "approvals.reject": true };
+	// 적용이 도는 동안 막는 명령 (CMD_MUTATING + 제안·승인)
+	const CMD_BUSY_BLOCKED = { suggest: true, "sugg.approve": true, "sugg.reject": true, "approvals.approve": true };
+	// agent 요청 대기열: 최대 개수, 낡는 시간 (패널 메모리에만 둔다 — 다시 열면 빈다)
+	const AGENT_QUEUE_MAX = 20;
+	const AGENT_QUEUE_TTL = 10 * 60000;
+	// plan이 돌려준 계획 토큰: 최대 개수, 낡는 시간
+	const PLAN_TOKEN_MAX = 20;
+	const PLAN_TOKEN_TTL = 30 * 60000;
+	// suggest 한 번에 받는 제안 수
+	const SUGG_BATCH_MAX = 200;
+	var _agentQueue = [];
+	var _agentSeq = 0;
+	var _planTokens = {};
+	var _planSeq = 0;
 	function _cmdOk(data) {
 		return { ok: true, data };
 	}
@@ -9871,6 +10215,8 @@ var modalState = {
 				castMode: _castMode(),
 				speakers,
 				busy: _miBusy,
+				suggestions: _suggAll().length,
+				approvals: _agentPrune().length,
 				coreHash: _coreHash()
 			});
 		},
@@ -9928,9 +10274,8 @@ var modalState = {
 		"session.snapshot": () => _cmdOk(_cmdClone({ projKey: state.currentProjectKey, seqKey: state.currentSequenceKey, subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi })),
 		// SRT 가져오기 = #srtInput에서 그 파일들을 고른 것과 같다 (경로에 따라 v27 교체·인코딩 확인창·가져오기 창).
 		// args {files: [{name, b64}]} → {route: legacy|modal|distribute, files: [{name, key, ambiguous, encoding, replaced, cues}]}
-		// 플래그가 꺼져 있으면 첫 파일 하나만 본다. agent는 승인 카드(M5.4) 전까지 needs-approval
-		importSrt: (args, ctx) => {
-			if (ctx.source === "agent") return _cmdErr("needs-approval", "SRT 가져오기는 패널에서 승인해야 합니다");
+		// 플래그가 꺼져 있으면 첫 파일 하나만 본다. files[]는 {name, b64} 또는 {path} (디스크에서 읽는다, 5단계 import_srt)
+		importSrt: (args) => {
 			const read = _cmdReadFiles(args.files);
 			if (read.error) return _cmdErr("bad-args", read.error);
 			if (!_keysResolved) return _cmdErr("no-sequence", "시퀀스를 열면 SRT를 열 수 있습니다");
@@ -9948,53 +10293,345 @@ var modalState = {
 			const rep = importIntoData(data, r.job, { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum(), castDefaults: _loadCastDefaults() });
 			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(data) !== before)));
 		},
-		// 화자별 배치 계획 (타임라인을 읽기만 한다. 바꾸지 않는다). args {ids?: [줄 id] (없으면 화자 줄 전부), single?, opts?: 점검 선택지}
-		// → {ok, plan: {ops: {종류: 수}, removals, none, minCount, tracks, conflicts, edited, missing, …}, lines: [점검 요약 줄]}
+		// 화자별 배치 계획 (타임라인을 읽기만 한다. 바꾸지 않는다).
+		// args {ids?: [줄 id] | uids?: [uid] | spk?: "C2" (셋 중 하나, 없으면 화자 줄 전부), single?, opts?: 점검 선택지}
+		// → {planToken, plan: {ops: {종류: 수}, removals, none, minCount, tracks, conflicts, edited, missing, …}, lines: [점검 요약 줄]}
+		// planToken은 같은 줄·선택지를 기억한다 (apply {planToken}). 계획은 적용할 때 타임라인에서 다시 세운다
 		plan: async (args) => {
 			const r = _cmdTargets(args);
 			if (r.error) return _cmdErr("bad-args", r.error);
 			const res = await _miApply(r.subs, { dryRun: true, auto: true, single: args.single === true, pf: r.pf });
 			if (!res || res.ok !== true) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
-			return _cmdOk(_cmdClone({ plan: res.plan, lines: res.lines }));
+			const planToken = _planTokenNew(r.subs, args.single === true, r.pf);
+			return _cmdOk(_cmdClone({ planToken, plan: res.plan, lines: res.lines }));
 		},
-		// 화자별 배치 실행 = ▶(화자 줄)와 같다. 점검 창 없이 opts(없으면 기본 선택지)로. args는 plan과 같다.
-		// agent는 승인 카드(M5.4) 전까지 needs-approval → {created, updated, moved, adopted, replaced, removed, partial, conflict, failed, none, skipped, stopped, runId}
-		apply: async (args, ctx) => {
-			if (ctx.source === "agent") return _cmdErr("needs-approval", "타임라인 적용은 패널에서 승인해야 합니다");
-			const r = _cmdTargets(args);
-			if (r.error) return _cmdErr("bad-args", r.error);
-			const res = await _miApply(r.subs, { auto: true, single: args.single === true, pf: r.pf });
+		// 화자별 배치 실행 = ▶(화자 줄)와 같다. 점검 창 없이 opts(없으면 기본 선택지)로.
+		// args {planToken} (plan이 준 것: 그 줄·선택지) 또는 plan과 같은 인자.
+		// → {created, updated, moved, adopted, replaced, removed, partial, conflict, failed, none, skipped, stopped, runId}
+		apply: async (args) => {
+			let r;
+			if (args.planToken !== undefined) {
+				if (Object.keys(args).some((k) => k !== "planToken")) return _cmdErr("bad-args", "planToken과 다른 인자를 같이 주지 않는다");
+				r = _planTokenTargets(args.planToken);
+				if (r.error) return _cmdErr(r.code || "bad-args", r.error);
+			} else {
+				r = _cmdTargets(args);
+				if (r.error) return _cmdErr("bad-args", r.error);
+				r.single = args.single === true;
+			}
+			const res = await _miApply(r.subs, { auto: true, single: r.single, pf: r.pf });
 			if (!res || (res.ok !== true && !res.runId && res.error)) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
 			return _cmdOk(_cmdClone(res));
 		},
 		// 마지막 적용 되돌리기 (타임라인만) = 히스토리 맨 위 '↶ 마지막 적용 되돌리기'와 같다 (확인창 없이). args {runId?: 그 기록일 때만}.
-		// agent는 승인 카드(M5.4) 전까지 needs-approval → {removed, restored, moved, replaced, placed, partial, changed, skipped, failed, repaired, lost, runId}
-		undo: async (args, ctx) => {
-			if (ctx.source === "agent") return _cmdErr("needs-approval", "되돌리기는 패널에서 승인해야 합니다");
+		// → {removed, restored, moved, replaced, placed, partial, changed, skipped, failed, repaired, lost, runId}
+		undo: async (args) => {
 			if (args.runId !== undefined && typeof args.runId !== "string") return _cmdErr("bad-args", "runId는 문자열");
 			const res = await _miUndo({ runId: args.runId });
 			if (!res || (res.ok !== true && !res.runId && res.error)) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
 			return _cmdOk(_cmdClone(res));
 		},
 		// 병합(가져오기)을 넣는다: 가져오기 창의 [가져오기]와 같다 (안전 지점 하나 → 적용 → 자동 항목 하나, 변화가 없으면 아무것도 쓰지 않는다).
-		// args는 mergePreview와 같다. agent는 승인 카드(M5.4) 전까지 needs-approval
-		mergeCommit: (args, ctx) => {
-			if (ctx.source === "agent") return _cmdErr("needs-approval", "병합은 패널에서 승인해야 합니다");
+		// args는 mergePreview와 같다
+		mergeCommit: (args) => {
 			const r = _cmdImportJob(args);
 			if (r.error) return _cmdErr(r.code || "bad-args", r.error);
 			const before = _sessionDataSig(_sessionClone());
 			const rep = _importIntoCast(r.job);
 			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(_sessionClone()) !== before)));
+		},
+		// 타임라인 검수 (읽기만, _miVerify) → {counts, items, text, frameTicks, salt, legacyRows, seqId}
+		verify: async () => {
+			const res = await _miVerify();
+			if (!res || res.ok !== true) return _cmdErr((res && res.error) || "exception", (res && res.detail) || "");
+			return _cmdOk(_cmdClone(res.report));
+		},
+		// 화자 표 바꾸기 = 화자 표의 이름·트랙·기본 프리셋 칸과 같다 (_castSetItems). args {items: [{key, name?, track?, presetId?, pos?}]}
+		//   track: null(자동) | 1..98 (V2..V99), presetId: "" | 캡션 필드가 있는 프리셋, pos: null | {x, y} (0~1, 4단계에서 쓴다)
+		// 하나라도 틀리면 아무것도 바꾸지 않는다 → {changed: [키], label}
+		"cast.set": (args) => {
+			const r = _castSetItems(args.items);
+			if (r.error) return _cmdErr("bad-args", r.error);
+			return _cmdOk(_cmdClone(r));
+		},
+		// AI 제안 넣기: args {items: [{uid, fid, value, sig, by?, note?, cap?}]} (sig = rows가 준 줄 필드 서명, cap = 본 캡션 해시 — 선택)
+		// 모두 확인한 뒤(validateSuggestion) 모두 통과할 때만 rs.sugg[fid]에 넣는다 (한 필드에 하나: 새 제안이 옛 제안을 바꾼다).
+		// 속성·타임라인은 그대로다 — 사용자가 [적용]해야 쓴다. 서명이 다르면 fields-changed, 없는 줄이면 not-found
+		// → {queued, results: [{uid, fid, ok, error, detail, warn}]} (실패: {ok: false, error, detail, results})
+		suggest: (args, ctx) => {
+			const r = _suggPut(args.items, ctx.source);
+			if (r.error) return Object.assign(_cmdErr(r.error, r.detail), r.results ? { results: _cmdClone(r.results) } : {});
+			return _cmdOk(_cmdClone({ queued: r.queued, results: r.results }));
+		},
+		// 제안 목록: args {uid?} → [{uid, id, label, fid, field, v, by, ts, note, ok, stale, error, warn, check: 확인 문구}]
+		"sugg.list": (args) => {
+			let list = _suggAll();
+			if (args.uid !== undefined) {
+				const id = uidToId(args.uid, (state.mi && state.mi.salt) || "");
+				if (id === null) return _cmdErr("bad-args", "uid 형식이 아니다: " + String(args.uid));
+				list = list.filter((x) => x.sub.id === id);
+			}
+			return _cmdOk(_cmdClone(list.map(_suggView)));
+		},
+		// 제안 적용 (ui·test만) = .sugg-box [적용] / [검증 통과만 적용]. args {items: [{uid, fid}]} | {all: true}
+		// 지금 다시 확인해 통과한 것만: 안전 지점 'AI 제안 적용 전' → _setRowFieldValue → 제안 지움 → {applied, skipped: [{uid, fid, why}]}
+		"sugg.approve": (args) => {
+			const t = _suggTargets(args);
+			if (t.error) return _cmdErr("bad-args", t.error);
+			return _cmdOk(_cmdClone(_suggApprove(t.list)));
+		},
+		// 제안 무시 (ui·test만) = [무시] / [모두 무시]. args는 sugg.approve와 같다 → {removed}
+		"sugg.reject": (args) => {
+			const t = _suggTargets(args);
+			if (t.error) return _cmdErr("bad-args", t.error);
+			return _cmdOk(_cmdClone(_suggReject(t.list)));
+		},
+		// agent 요청 대기열 → [{rid, op, what, by, at, args}]
+		"approvals.list": () => _cmdOk(_cmdClone(_agentPrune().map((q) => ({ rid: q.rid, op: q.op, what: CMD_MUTATING[q.op], by: q.by, at: q.at, args: q.args })))),
+		// agent 요청 승인 (ui·test만): 안전 지점 'AI: <명령> 전' → 그 명령을 실행 (그동안 남는 히스토리 이름은 'AI: …') → 그 명령의 결과
+		"approvals.approve": async (args) => {
+			const q = _agentTake(args.rid);
+			if (q.error) return _cmdErr(q.code, q.error);
+			_saveSafety("AI: " + CMD_MUTATING[q.item.op] + " 전");
+			_aiLabel = true;
+			try {
+				return await _COMMANDS[q.item.op](_cmdClone(q.item.args), { source: "agent", approved: true, by: q.item.by });
+			} finally {
+				_aiLabel = false;
+			}
+		},
+		// agent 요청 버리기 (ui·test만) → {rid}
+		"approvals.reject": (args) => {
+			const q = _agentTake(args.rid);
+			if (q.error) return _cmdErr(q.code, q.error);
+			setStatus("AI 요청을 버렸습니다: " + CMD_MUTATING[q.item.op], "");
+			return _cmdOk({ rid: q.item.rid });
 		}
 	};
-	// plan·apply 인자 → {subs, pf} | {error}. ids: 줄 id 배열 (없으면 화자 줄 전부), opts: 점검 선택지 (MI_PF_DEFAULTS의 키만)
+	// ── agent 요청 대기열 ──
+	// 낡은 요청(AGENT_QUEUE_TTL)과 다른 시퀀스에서 온 요청을 버린다 → 남은 대기열
+	function _agentPrune() {
+		const now = Date.now();
+		const seq = _importSeqToken();
+		_agentQueue = _agentQueue.filter((q) => now - q.at < AGENT_QUEUE_TTL && q.seq === seq);
+		return _agentQueue;
+	}
+	// agent가 보낸 바꾸는 명령을 대기열에 넣는다 → needs-approval + rid
+	function _agentEnqueue(op, args, ctx) {
+		_agentPrune();
+		const rid = "a" + Date.now().toString(36) + "-" + ++_agentSeq;
+		const by = ctx && typeof ctx.by === "string" && ctx.by ? ctx.by.slice(0, 40) : "ai";
+		_agentQueue.push({ rid, op, args: _cmdClone(args || {}), by, at: Date.now(), seq: _importSeqToken() });
+		if (_agentQueue.length > AGENT_QUEUE_MAX) _agentQueue.shift();
+		setStatus("AI 요청 대기: " + CMD_MUTATING[op] + " — 패널에서 승인해야 실행됩니다", "");
+		return Object.assign(_cmdErr("needs-approval", CMD_MUTATING[op] + "은(는) 패널에서 승인해야 합니다"), { rid });
+	}
+	// 대기열에서 요청 하나를 꺼낸다 → {item} | {error, code}
+	function _agentTake(rid) {
+		if (typeof rid !== "string" || !rid) return { error: "rid는 문자열", code: "bad-args" };
+		_agentPrune();
+		const i = _agentQueue.findIndex((q) => q.rid === rid);
+		if (i === -1) return { error: "대기 중인 요청이 없다 (낡았거나 시퀀스가 바뀜): " + rid, code: "not-found" };
+		return { item: _agentQueue.splice(i, 1)[0] };
+	}
+	// ── 계획 토큰 ──
+	function _planTokenNew(subs, single, pf) {
+		const now = Date.now();
+		Object.keys(_planTokens).forEach((k) => { if (now - _planTokens[k].at >= PLAN_TOKEN_TTL) delete _planTokens[k]; });
+		const keys = Object.keys(_planTokens).sort((a, b) => _planTokens[a].at - _planTokens[b].at);
+		while (keys.length >= PLAN_TOKEN_MAX) delete _planTokens[keys.shift()];
+		const token = "p" + now.toString(36) + "-" + ++_planSeq;
+		_planTokens[token] = { at: now, seq: _importSeqToken(), ids: subs.map((s) => s.id), single: !!single, pf: Object.assign({}, pf || {}) };
+		return token;
+	}
+	// → {subs, single, pf} | {error, code}
+	function _planTokenTargets(token) {
+		const t = typeof token === "string" ? _planTokens[token] : null;
+		if (!t || Date.now() - t.at >= PLAN_TOKEN_TTL) return { error: "계획 토큰이 없거나 낡았다 — plan을 다시 부르세요", code: "not-found" };
+		if (t.seq !== _importSeqToken()) return { error: "계획한 뒤 시퀀스가 바뀌었다", code: "seq-mismatch" };
+		const want = _idSet(t.ids);
+		const subs = state.subtitles.filter((s) => want[s.id]);
+		if (!subs.length) return { error: "계획한 줄이 목록에 없다", code: "not-found" };
+		return { subs, single: t.single, pf: Object.assign({}, t.pf) };
+	}
+	// ── AI 제안 (rs.sugg) — 명령과 행 편집기의 .sugg-box가 같이 쓴다 ──
+	// 줄 uid → 줄 (없으면 null)
+	function _subByUid(uid) {
+		const id = uidToId(uid, (state.mi && state.mi.salt) || "");
+		return id === null ? null : state.subtitles.find((s) => s.id === id) || null;
+	}
+	function _uidOf(sub) {
+		const salt = (state.mi && state.mi.salt) || "";
+		return salt ? salt + "-" + sub.id : String(sub.id);
+	}
+	// 대기 중인 제안 전부 (목록 순, 필드 번호 순) → [{sub, rs, preset, fid, entry}]
+	function _suggAll() {
+		const out = [];
+		state.subtitles.forEach((sub) => {
+			const rs = state.rowStates[sub.id];
+			if (!rs || !rs.sugg || typeof rs.sugg !== "object") return;
+			const preset = rs.presetId ? state.presets[rs.presetId] || null : null;
+			Object.keys(rs.sugg).sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10)).forEach((fid) => {
+				const entry = rs.sugg[fid];
+				if (entry && typeof entry === "object") out.push({ sub, rs, preset, fid, entry });
+			});
+		});
+		return out;
+	}
+	// 제안 하나의 보기 (명령 결과·.sugg-box)
+	function _suggView(x) {
+		const r = suggState(x.sub, x.rs, x.preset, x.fid, x.entry);
+		const e = x.entry;
+		return { uid: _uidOf(x.sub), id: x.sub.id, label: rowLabel(x.sub, _castMode()), fid: x.fid, field: r.field, v: e.v, by: e.by || "", ts: e.ts || 0, note: e.note || "",
+			ok: r.ok, stale: r.stale, error: r.error, warn: r.warn, check: suggCheckText(r) };
+	}
+	// 제안을 넣는다 (모두 통과할 때만) → {queued, results} | {error, detail, results}
+	function _suggPut(items, source) {
+		if (!Array.isArray(items) || !items.length) return { error: "bad-args", detail: "items는 [{uid, fid, value, sig}] 배열" };
+		if (items.length > SUGG_BATCH_MAX) return { error: "bad-args", detail: "한 번에 " + SUGG_BATCH_MAX + "개까지" };
+		const results = [];
+		const put = [];
+		const seen = {};
+		items.forEach((it) => {
+			const o = it && typeof it === "object" && !Array.isArray(it) ? it : {};
+			const res = { uid: o.uid === undefined ? null : o.uid, fid: o.fid === undefined ? null : o.fid, ok: false, error: "", detail: "", warn: [] };
+			results.push(res);
+			const sub = _subByUid(o.uid);
+			if (!sub) return Object.assign(res, { error: "not-found", detail: "그런 줄이 없다: " + String(o.uid) });
+			if (typeof o.fid !== "string" || !/^T[1-9][0-9]*$/.test(o.fid)) return Object.assign(res, { error: "unknown-field", detail: "fid는 T1, T2 …" });
+			const k = sub.id + "|" + o.fid;
+			if (seen[k]) return Object.assign(res, { error: "bad-args", detail: "같은 필드가 두 번" });
+			seen[k] = true;
+			const rs = state.rowStates[sub.id] || {};
+			const preset = rs.presetId ? state.presets[rs.presetId] || null : null;
+			const v = validateSuggestion({ sub, rs, preset, fid: o.fid, value: o.value, sig: o.sig, cap: o.cap });
+			Object.assign(res, { ok: v.ok, error: v.error, detail: v.detail, warn: v.warn });
+			if (!v.ok) return;
+			const by = typeof o.by === "string" && o.by.trim() ? o.by.trim().slice(0, 40) : source === "agent" ? "ai" : String(source || "ai");
+			put.push({ sub, rs, fid: o.fid, entry: { v: o.value, by, ts: Date.now(), cap: v.capHash, sig: String(o.sig), st: "pending", note: typeof o.note === "string" ? o.note.slice(0, 200) : "" } });
+		});
+		const bad = results.filter((x) => !x.ok);
+		if (bad.length) {
+			const code = bad.some((x) => x.error === "fields-changed") ? "fields-changed" : bad.every((x) => x.error === "not-found") ? "not-found" : "bad-args";
+			return { error: code, detail: bad.map((x) => String(x.uid) + " " + String(x.fid) + ": " + x.error + (x.detail ? " (" + x.detail + ")" : "")).join(" · "), results };
+		}
+		put.forEach((p) => {
+			if (!p.rs.sugg || typeof p.rs.sugg !== "object") p.rs.sugg = {};
+			p.rs.sugg[p.fid] = p.entry;
+		});
+		saveSessionToStorage();
+		_suggRefresh(put.map((p) => p.sub));
+		setStatus("AI 제안 " + put.length + "개가 왔습니다 — 줄에서 확인하고 [적용]해야 바뀝니다", "ok");
+		return { queued: put.length, results };
+	}
+	// 명령 인자 → 대상 [{sub, fid}] | {error}. {all: true} = 대기 중인 제안 전부, {items: [{uid, fid}]}
+	function _suggTargets(args) {
+		if (args.all === true) return { list: _suggAll().map((x) => ({ sub: x.sub, fid: x.fid })) };
+		if (!Array.isArray(args.items) || !args.items.length) return { error: "items는 [{uid, fid}] 배열 (또는 all: true)" };
+		const list = [];
+		for (const it of args.items) {
+			const sub = it && typeof it === "object" ? _subByUid(it.uid) : null;
+			if (!sub) return { error: "그런 줄이 없다: " + String(it && it.uid) };
+			if (typeof it.fid !== "string") return { error: "fid는 T1, T2 …" };
+			list.push({ sub, fid: it.fid });
+		}
+		return { list };
+	}
+	// 제안 적용: 지금 다시 확인해 통과한 것만 쓴다. 쓸 것이 있으면 먼저 안전 지점 'AI 제안 적용 전'.
+	// 쓰기는 _setRowFieldValue(해석한 _allParams 항목과 같은 필드의 노출 속성)로만. 다화자 줄은 병합 표시(mm "text")를 단다.
+	// 레거시(화자 없는) 줄은 mm을 달지 않는다: '안전하게 적용'이 문장만 바뀐 줄(mm text)로 보고 캡션 속성 하나만 보내
+	// 승인한 값이 타임라인에 가지 않는다 — 패널에서 직접 고친 것과 같게 두고 ▶·↑가 속성 전부를 보낸다
+	// → {applied, ids: [줄 id], skipped: [{uid, fid, why, detail}]}
+	function _suggApprove(targets) {
+		const ok = [];
+		const skipped = [];
+		(targets || []).forEach((t) => {
+			const rs = state.rowStates[t.sub.id];
+			const entry = rs && rs.sugg ? rs.sugg[t.fid] : null;
+			if (!entry) {
+				skipped.push({ uid: _uidOf(t.sub), fid: t.fid, why: "not-found", detail: "대기 중인 제안이 없다" });
+				return;
+			}
+			const preset = rs.presetId ? state.presets[rs.presetId] || null : null;
+			const r = suggState(t.sub, rs, preset, t.fid, entry);
+			if (!r.ok) {
+				skipped.push({ uid: _uidOf(t.sub), fid: t.fid, why: r.error, detail: r.detail });
+				return;
+			}
+			ok.push({ sub: t.sub, rs, fid: t.fid, v: entry.v });
+		});
+		if (!ok.length) return { applied: 0, ids: [], skipped };
+		_saveSafety("AI 제안 적용 전");
+		const ids = [];
+		let n = 0;
+		ok.forEach((x) => {
+			if (!_setRowFieldValue(x.sub.id, x.fid, x.v)) {
+				skipped.push({ uid: _uidOf(x.sub), fid: x.fid, why: "unknown-field", detail: "필드를 찾지 못함" });
+				return;
+			}
+			n++;
+			delete x.rs.sugg[x.fid];
+			if (!Object.keys(x.rs.sugg).length) delete x.rs.sugg;
+			if (x.sub.spk && _castMode()) x.rs.mm = !x.rs.mm ? "text" : x.rs.mm === "time" ? "both" : x.rs.mm;
+			if (ids.indexOf(x.sub.id) === -1) ids.push(x.sub.id);
+		});
+		ids.forEach((id) => renderParamsPanel(id));
+		saveSessionToStorage();
+		_suggRefresh(ok.map((x) => x.sub));
+		if (n) _saveHistoryOnAction("AI 제안 적용 (" + n + "개)");
+		setStatus("AI 제안 " + n + "개 적용" + (skipped.length ? " · 건너뜀 " + skipped.length : "") + " — 타임라인에는 ▶·↑로 반영하세요 (바꾸기 전 상태는 안전 지점에 있습니다)", skipped.length ? "err" : "ok");
+		return { applied: n, ids, skipped };
+	}
+	// 제안 무시: 대기열에서 지운다 (속성은 그대로) → {removed}
+	function _suggReject(targets) {
+		let n = 0;
+		const subs = [];
+		(targets || []).forEach((t) => {
+			const rs = state.rowStates[t.sub.id];
+			if (!rs || !rs.sugg || !rs.sugg[t.fid]) return;
+			delete rs.sugg[t.fid];
+			if (!Object.keys(rs.sugg).length) delete rs.sugg;
+			n++;
+			subs.push(t.sub);
+		});
+		if (n) {
+			saveSessionToStorage();
+			_suggRefresh(subs);
+			setStatus("AI 제안 " + n + "개 무시", "ok");
+		}
+		return { removed: n };
+	}
+	// 제안이 바뀐 줄을 다시 그린다 (행 머리 표시·속성창의 제안 칸·선택 바 버튼)
+	function _suggRefresh(subs) {
+		const done = {};
+		(subs || []).forEach((sub) => {
+			if (!sub || done[sub.id]) return;
+			done[sub.id] = true;
+			_refreshRowMarks(sub);
+		});
+		updateMultiSelect();
+	}
+	// plan·apply 인자 → {subs, pf} | {error}. 줄: ids(줄 id 배열) | uids(uid 배열) | spk(화자 키) 중 하나, 없으면 화자 줄 전부.
+	// opts: 점검 선택지 (MI_PF_DEFAULTS의 키만)
 	function _cmdTargets(args) {
 		let subs = state.subtitles.filter((s) => s.spk);
+		if (["ids", "uids", "spk"].filter((k) => args[k] !== undefined).length > 1) return { error: "ids·uids·spk 중 하나만" };
 		if (args.ids !== undefined) {
 			if (!Array.isArray(args.ids) || !args.ids.every((x) => Number.isInteger(x))) return { error: "ids는 줄 id(정수) 배열" };
 			const want = _idSet(args.ids);
 			subs = state.subtitles.filter((s) => want[s.id]);
 			if (subs.length !== args.ids.length) return { error: "없는 줄 id가 있다" };
+		} else if (args.uids !== undefined) {
+			if (!Array.isArray(args.uids) || !args.uids.length) return { error: "uids는 줄 uid 배열" };
+			const ids = args.uids.map((u) => uidToId(u, (state.mi && state.mi.salt) || ""));
+			const badAt = ids.indexOf(null);
+			if (badAt !== -1) return { error: "이 목록의 uid가 아니다: " + String(args.uids[badAt]) };
+			const want = _idSet(ids);
+			subs = state.subtitles.filter((s) => want[s.id]);
+			if (subs.length !== Object.keys(want).length) return { error: "없는 줄 uid가 있다" };
+		} else if (args.spk !== undefined) {
+			if (typeof args.spk !== "string" || !state.mi.cast[args.spk]) return { error: "화자 표에 없는 화자: " + String(args.spk) };
+			subs = state.subtitles.filter((s) => s.spk === args.spk);
 		}
 		const pf = {};
 		if (args.opts !== undefined) {
@@ -10077,12 +10714,20 @@ var modalState = {
 		for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
 		return out;
 	}
-	// 명령 인자 files: [{name, b64}] → {files: [{name, path, size, mtime, bytes}]} | {error}
+	// 명령 인자 files: [{name, b64} | {path}] → {files: [{name, path, size, mtime, bytes}]} | {error}
+	// {path}는 디스크에서 읽는다 (Node fs, _readSrtPath). 경로가 화자 표에 남아 ⟳·바뀜 알림에 쓰인다
 	function _cmdReadFiles(files) {
-		if (!Array.isArray(files) || !files.length) return { error: "files는 [{name, b64}] 배열" };
+		if (!Array.isArray(files) || !files.length) return { error: "files는 [{name, b64}] 또는 [{path}] 배열" };
 		const out = [];
 		for (const f of files) {
-			if (!f || typeof f.name !== "string" || !f.name || typeof f.b64 !== "string") return { error: "files[]는 {name, b64}" };
+			if (f && typeof f.path === "string" && f.path && f.b64 === undefined) {
+				const r = _readSrtPath(f.path);
+				if (r.error) return { error: r.error };
+				if (typeof f.name === "string" && f.name) r.file.name = f.name;
+				out.push(r.file);
+				continue;
+			}
+			if (!f || typeof f.name !== "string" || !f.name || typeof f.b64 !== "string") return { error: "files[]는 {name, b64} 또는 {path}" };
 			let bytes;
 			try {
 				bytes = _b64ToBytes(f.b64);
@@ -10098,16 +10743,32 @@ var modalState = {
 		if (!CMD_SOURCES[source]) return _cmdErr("bad-args", "ctx.source는 ui|test|agent");
 		if (typeof op !== "string" || !Object.prototype.hasOwnProperty.call(_COMMANDS, op)) return _cmdErr("bad-args", "모르는 명령: " + String(op));
 		if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) return _cmdErr("bad-args", "args는 객체");
+		// 부른 쪽이 알고 있는 시퀀스·빌드 (5단계 인박스가 싣는다): 다르면 거절한다
+		if (ctx && ctx.seqId !== undefined && String(ctx.seqId) !== String(state.currentSequenceId || "")) return _cmdErr("seq-mismatch", "지금 시퀀스: " + String(state.currentSequenceId || ""));
+		if (ctx && ctx.build !== undefined && String(ctx.build) !== MI_BUILD_PANEL) return _cmdErr("build-mismatch", "패널 빌드: " + MI_BUILD_PANEL);
+		const mutating = Object.prototype.hasOwnProperty.call(CMD_MUTATING, op);
+		if (source === "agent") {
+			if (CMD_UI_ONLY[op]) return _cmdErr("needs-approval", "승인은 패널에서만 합니다");
+			if (mutating) return _agentEnqueue(op, args || {}, ctx);
+		}
+		if ((mutating || CMD_BUSY_BLOCKED[op]) && (_miBusy || _legacyRun)) return _cmdErr("busy", "타임라인 적용이 실행 중");
+		if (mutating || CMD_BUSY_BLOCKED[op]) _bumpActivity();
 		try {
-			return await _COMMANDS[op](args || {}, { source });
+			return await _COMMANDS[op](args || {}, { source, by: ctx && typeof ctx.by === "string" ? ctx.by : undefined });
 		} catch (e) {
 			console.error("[MOGRT] runCommand 예외:", op, e);
 			return _cmdErr("exception", (e && e.message) || String(e));
 		}
 	}
+	// 무작업 자동저장 시계를 되돌린다 (명령도 사용자 작업이다). 시계(main.ts)는 부팅 끝에 선언된다 → 그 전이면 넘어간다
+	function _bumpActivity() {
+		try {
+			_lastActivityTime = Date.now();
+		} catch (_) {}
+	}
 	window._mogrtDebug.cmd = (op, args) => runCommand(op, args, { source: "test" });
-	// 다른 출처로 부른다 (agent가 needs-approval을 받는지 시험할 때)
-	window._mogrtDebug.cmdAs = (source, op, args) => runCommand(op, args, { source });
+	// 다른 출처로 부른다 (agent가 needs-approval을 받는지 시험할 때). extra: {seqId, build, by}
+	window._mogrtDebug.cmdAs = (source, op, args, extra) => runCommand(op, args, Object.assign({}, extra || {}, { source }));
 	//#endregion
 	//#region src/mi/apply.ts
 	// ─────────────────────────────────────────────────────────────
@@ -11698,6 +12359,102 @@ var modalState = {
 		else if (ctx.aborted) setStatus("시퀀스가 바뀌어 멈췄습니다 — " + text, "err");
 		else if (ctx.stopped) setStatus("중지함 — 다시 적용하면 이어서 진행 · " + text, "err");
 		else setStatus(text, rep.conflict || rep.failed || rep.skipped || rep.partial ? "err" : "ok");
+	}
+	// ─────────────────────────────────────────────────────────────
+	// 타임라인 검수 (읽기만, S3-3) — 계획서 §8 #verifyModal, spec S3-3
+	//   ping(v28·같은 빌드·이 시퀀스) → getTracks(V1 뺀 모든 비디오 트랙, 시간 제한 없음: 옮긴 클립·목록에 없는 클립도 찾는다)
+	//   → readClipTexts(화자 줄의 현재 클립, 40개씩: 텍스트·레이아웃·효과) → planPlacement 마른 계획(지금 의도 해시) → core verifyReport.
+	// 호스트에 쓰는 호출은 없다. 굽지도 않는다 (네이티브 줄은 구운 사본의 키·경로만 계산한다: _bakeKeyOnly).
+	// salt가 비었으면 태그 표본으로 찾아보되 저장하지 않는다. 실행 중에는 _miBusy (폴러·재스캔·적용이 호스트 대기열에 끼지 않게)
+	// → {ok: true, report} | {ok: false, error, detail}
+	// ─────────────────────────────────────────────────────────────
+	async function _miVerify() {
+		if (_miBusy || _legacyRun) return { ok: false, error: "busy", detail: "타임라인 적용이 실행 중" };
+		if (!_keysResolved) return { ok: false, error: "no-sequence", detail: "시퀀스를 열면 검수할 수 있습니다" };
+		const subs = state.subtitles.filter((s) => s && s.spk);
+		if (!subs.length || !_castMode()) return { ok: false, error: "no-rows", detail: "검수는 화자 줄이 있는 목록에서만 합니다" };
+		_miBusy = true;
+		const seqTok = _importSeqToken();
+		try {
+			const hk = await _miHostOk();
+			if (!hk.ok) return { ok: false, error: hk.why === "build" ? "build-mismatch" : "no-host", detail: hk.msg };
+			const ping = hk.ping;
+			if (ping.isPreview) return { ok: false, error: "preview-active", detail: "프리뷰 시퀀스가 활성입니다" };
+			if (!ping.seqId || String(ping.seqId) !== String(state.currentSequenceId) || seqTok !== _importSeqToken()) return { ok: false, error: "seq-mismatch", detail: "Premiere의 활성 시퀀스가 패널의 시퀀스와 다릅니다" };
+			const seqId = String(ping.seqId);
+			_miShowBusy("검수: 타임라인 읽는 중…");
+			const scan = await _miCallWatch(() => host.mi.getTracks({ seqId, tracks: null }));
+			if (!scan || scan.ok !== true) throw _miHostFail("getTracks", scan);
+			_miNumTracks = scan.numVideoTracks;
+			const details = {};
+			let salt = state.mi.salt || "";
+			if (!salt && !state.mi.remapped) {
+				const rowsById = {};
+				subs.forEach((s) => {
+					const rs = state.rowStates[s.id];
+					const preset = rs && rs.presetId ? state.presets[rs.presetId] : null;
+					rowsById[s.id] = { caps: [preset ? rowCaptionValue(rs, preset) : null, s.text].map((t) => normText(t)).filter(Boolean) };
+				});
+				for (let it = 0; it < 3; it++) {
+					const r = recoverSalt(scan, rowsById, details);
+					if (!r.need.length) {
+						salt = r.salt || "";
+						break;
+					}
+					await _miReadDetails(r.need, details, seqId);
+				}
+			}
+			const idx = scanIndex(scan, salt);
+			const reads = [];
+			subs.forEach((s) => {
+				const c = salt ? idx.current[salt + "-" + s.id] : null;
+				if (c && !details[c.nodeId]) reads.push({ track: c.track, nodeId: c.nodeId });
+			});
+			if (reads.length) {
+				_miShowBusy("검수: 클립 읽는 중… (" + reads.length + "개)");
+				await _miReadDetails(reads, details, seqId);
+			}
+			if (seqTok !== _importSeqToken()) return { ok: false, error: "seq-mismatch", detail: "검수 중에 시퀀스가 바뀌었습니다" };
+			const rowsIn = subs.map((sub) => {
+				const rs = state.rowStates[sub.id] || {};
+				const preset = rs.presetId ? state.presets[rs.presetId] || null : null;
+				const row = { sub, rs, preset, baked: null, bakeWhy: null, oldBaked: null };
+				if (preset && _isNativePreset(preset)) {
+					row.baked = _bakeKeyOnly(sub, rs, preset);
+					if (!row.baked) row.bakeWhy = "원본을 읽지 못함";
+					if (rs.ap && rs.ap.nk && _bakedExists(rs.ap.nk)) row.oldBaked = _bakedPath(rs.ap.nk);
+				}
+				return row;
+			});
+			const trash = {};
+			(state.trashBin || []).forEach((t) => { if (t && t.sub) trash[t.sub.id] = t.why || ""; });
+			const mi = Object.assign({}, state.mi, { salt });
+			const base = _trackValueNum();
+			const plan = planPlacement({ rows: rowsIn, allRows: subs, trash, mi, base: base === null ? 2 : base, scan, details, durs: {}, opts: MI_PF_DEFAULTS });
+			const report = verifyReport({ rows: rowsIn, allRows: state.subtitles, mi, scan, details, plan });
+			report.legacyRows = state.subtitles.length - subs.length;
+			report.seqId = seqId;
+			return { ok: true, report };
+		} catch (e) {
+			console.error("[MOGRT] 검수 멈춤:", e);
+			return { ok: false, error: "exception", detail: (e && e.message) || String(e) };
+		} finally {
+			_miBusy = false;
+			_miHideBusy();
+		}
+	}
+	// 네이티브 줄의 구운 사본 {path, key, durSec}를 굽지 않고 계산한다 (검수의 마른 계획: bakeNativeMogrt와 같은 키). 원본을 읽지 못하면 null
+	function _bakeKeyOnly(sub, rs, preset) {
+		const fs = _nodeRequire("fs");
+		if (!fs || !preset || !preset.mogrtPath) return null;
+		let mtime;
+		try {
+			mtime = fs.statSync(preset.mogrtPath).mtimeMs;
+		} catch (_) {
+			return null;
+		}
+		const key = nativeBakeKey(preset.mogrtPath, mtime, nativeRowTexts(rowSendParams(rs), preset.params, preset.textParamIndex, sub.text));
+		return { path: _bakedPath(key), key, durSec: 0 };
 	}
 	// 계획 요약 (명령 plan·테스트)
 	function _miPlanSummary(plan) {
@@ -13376,7 +14133,7 @@ var modalState = {
 		if (!_keysResolved || _sessionReadFailed) return false;
 		try {
 			const list = _loadHistoryList("safety");
-			const entry = _makeHistoryEntry(label || "안전 지점", false);
+			const entry = _makeHistoryEntry(_aiLabelOf(label || "안전 지점"), false);
 			entry.kind = "safety";
 			if (list.length && _entryHash(list[0]) === entry.hash) return false;
 			list.unshift(entry);
@@ -13647,7 +14404,12 @@ var modalState = {
 	window._mogrtDebug.idleAutosaveTick = _idleAutosaveTick;
 	// 주요 작업 시 히스토리 저장 지점 등록 (SRT 로드, 타임라인 적용)
 	// 이 함수를 호출하는 코드는 아래 srtInput/btnApply 핸들러에서 호출됨
-	function _saveHistoryOnAction(label) { _saveHistory(label, false); }
+	function _saveHistoryOnAction(label) { _saveHistory(_aiLabelOf(label), false); }
+	// 승인한 AI 요청을 실행하는 동안(_aiLabel) 남는 안전 지점·히스토리 이름은 "AI: …" (S3-1)
+	function _aiLabelOf(label) {
+		const s = String(label == null ? "" : label);
+		return _aiLabel && s.indexOf("AI: ") !== 0 ? "AI: " + s : s;
+	}
 	// 히스토리 버튼 초기 상태 업데이트
 	_updateHistoryBtn();
 
