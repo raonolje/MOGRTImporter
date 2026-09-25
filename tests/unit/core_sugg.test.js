@@ -36,7 +36,7 @@ test("거절: 캡션 필드, 없는 필드, 서명 다름(fields-changed), 조�
 	assert.equal(v(x, "T2", "날씨", { sig: "T1=텍스트" }).error, "fields-changed");
 	const miss = v(x, "T2", "날씨$$바다");
 	assert.deepEqual([miss.ok, miss.error, miss.missing], [false, "missing-segment", ["바다"]]);
-	assert.equal(core.suggCheckText(miss), "✕ ‘바다’이 문장에 없습니다");
+	assert.equal(core.suggCheckText(miss), "✕ ‘바다’가 문장에 없습니다");
 	const many = v(x, "T2", "오늘$$날씨$$하늘$$맑다");
 	assert.deepEqual([many.ok, many.error, many.segs.length, many.max], [false, "too-many", 4, 3]);
 	assert.equal(core.suggCheckText(many), "✕ 조각 4개 — 최대 3개");
@@ -60,7 +60,7 @@ test("두 번 나오는 조각은 받되 dup 경고 (첫 번째만 칠해진다)
 	const x = row3("좋다 좋다 날씨");
 	const r = v(x, "T2", "좋다$$날씨");
 	assert.deepEqual([r.ok, r.warn, r.dup], [true, ["dup"], ["좋다"]]);
-	assert.equal(core.suggCheckText(r), "✓ 본문에 있음 · ‘좋다’이 두 번 나와 첫 번째만 칠해집니다");
+	assert.equal(core.suggCheckText(r), "✓ 본문에 있음 · ‘좋다’가 두 번 나와 첫 번째만 칠해집니다");
 });
 
 test("낡은 제안: 제안 때 캡션 해시와 지금 캡션이 다르면 stale, 서명이 다르면 stale(fields-changed)", () => {
@@ -124,4 +124,11 @@ test("uidToId: 다화자는 지금 salt의 'salt-id'만, 단일 화자(salt 없�
 	assert.equal(core.uidToId("k7q2-57", ""), null);
 	assert.equal(core.uidToId("#12", ""), null);
 	assert.equal(core.uidToId(null, ""), null);
+});
+
+test("quoteIga: 끝 글자 받침에 맞춘 조사 ('하늘’이 · ‘날씨’가 · 영문은 이(가))", () => {
+	assert.equal(core.quoteIga(["하늘"]), "‘하늘’이");
+	assert.equal(core.quoteIga(["날씨"]), "‘날씨’가");
+	assert.equal(core.quoteIga(["바다", "하늘"]), "‘바다’, ‘하늘’이", "마지막 낱말을 따른다");
+	assert.equal(core.quoteIga(["AI"]), "‘AI’이(가)");
 });

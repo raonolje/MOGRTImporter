@@ -51,6 +51,8 @@
 	// AI 명령 (src/mi/commands.ts, S3-1). 히스토리 저장(main.ts)이 읽는다.
 	//   _aiLabel  승인한 agent 요청을 실행하는 동안 참: 그 사이 남는 안전 지점·히스토리 이름에 "AI: "를 붙인다
 	var _aiLabel = false;
+	// 표시 필터 (S3-2, src/ui/cast.ts _applyMarkFilter): "" | "warn"(포인트 경고가 있는 줄만) | "sugg"(AI 제안이 있는 줄만)
+	var _markFilter = "";
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -2182,6 +2184,7 @@
 			else delete rs.warn;
 		}
 		if (res.capChanged) delete rs.sugg;
+		else if (touched) pruneStaleSuggs(sub, rs, preset);
 		if (touched) {
 			const mm = _mergeMm(rs, res, sub, res.newCap, restored);
 			if (mm) rs.mm = mm;
@@ -2929,7 +2932,7 @@
 			out.missing = r.missing;
 			out.dup = r.dup;
 			if (!r.segs.length) return fail("empty", "'$$' 조각이 없다");
-			if (r.missing.length) return fail("missing-segment", r.missing.map((s) => "‘" + s + "’").join(", ") + "이 캡션에 없다");
+			if (r.missing.length) return fail("missing-segment", quoteIga(r.missing) + " 캡션에 없다");
 			if (r.tooMany) return fail("too-many", "조각 " + r.segs.length + "개 (최대 " + out.max + "개)");
 			if (r.dup.length) out.warn.push("dup");
 		} else {
@@ -2947,17 +2950,41 @@
 		r.stale = r.error === "stale" || r.error === "fields-changed";
 		return r;
 	}
+	// 낡은 제안(캡션·필드 구조가 바뀜)을 줄에서 지운다 (병합이 건드린 줄). 남은 것이 없으면 rs.sugg도 지운다 → 지운 수.
+	// 서명·캡션 해시가 없는 항목은 낡았는지 알 수 없어 그대로 둔다
+	function pruneStaleSuggs(sub, rs, preset) {
+		if (!rs || !rs.sugg || typeof rs.sugg !== "object") return 0;
+		let n = 0;
+		Object.keys(rs.sugg).forEach((fid) => {
+			const e = rs.sugg[fid];
+			if (!e || typeof e.sig !== "string" || typeof e.cap !== "string") return;
+			if (suggState(sub, rs, preset, fid, e).stale) {
+				delete rs.sugg[fid];
+				n++;
+			}
+		});
+		if (!Object.keys(rs.sugg).length) delete rs.sugg;
+		return n;
+	}
+	// 인용한 낱말 목록 뒤의 조사 '이'/'가' ("‘하늘’이", "‘날씨’가"): 마지막 낱말의 끝 글자에 받침이 있으면 '이'. 한글이 아니면 '이(가)'
+	function quoteIga(words) {
+		const list = (words || []).map((w) => String(w == null ? "" : w));
+		const last = list.length ? list[list.length - 1] : "";
+		const c = last.length ? last.charCodeAt(last.length - 1) : 0;
+		const josa = c >= 0xac00 && c <= 0xd7a3 ? ((c - 0xac00) % 28 ? "이" : "가") : "이(가)";
+		return list.map((w) => "‘" + w + "’").join(", ") + josa;
+	}
 	// 제안 하나의 확인 문구 (.sugg-box): "✓ 본문에 있음" / "! 본문에 없는 문구" / 거절 까닭
 	function suggCheckText(r) {
 		if (!r) return "";
 		if (r.stale) return r.error === "fields-changed" ? "필드 구조가 바뀌어 다시 확인이 필요합니다" : "캡션이 바뀌어 다시 확인이 필요합니다";
 		if (!r.ok) {
-			if (r.error === "missing-segment") return "✕ " + r.missing.map((s) => "‘" + s + "’").join(", ") + "이 문장에 없습니다";
+			if (r.error === "missing-segment") return "✕ " + quoteIga(r.missing) + " 문장에 없습니다";
 			if (r.error === "too-many") return "✕ 조각 " + r.segs.length + "개 — 최대 " + r.max + "개";
 			return "✕ " + (r.detail || r.error);
 		}
 		if (r.warn.indexOf("not-in-caption") !== -1) return "! 본문에 없는 문구";
-		if (r.warn.indexOf("dup") !== -1) return "✓ 본문에 있음 · " + r.dup.map((s) => "‘" + s + "’").join(", ") + "이 두 번 나와 첫 번째만 칠해집니다";
+		if (r.warn.indexOf("dup") !== -1) return "✓ 본문에 있음 · " + quoteIga(r.dup) + " 두 번 나와 첫 번째만 칠해집니다";
 		return "✓ 본문에 있음";
 	}
 
@@ -8437,7 +8464,7 @@ var modalState = {
 	}
 	// 줄이 필터로 숨었는가
 	function _rowHidden(row) {
-		return !!row && (row.classList.contains("search-hidden") || row.classList.contains("preset-filter-hidden") || row.classList.contains("speaker-filter-hidden"));
+		return !!row && (row.classList.contains("search-hidden") || row.classList.contains("preset-filter-hidden") || row.classList.contains("speaker-filter-hidden") || row.classList.contains("mark-filter-hidden"));
 	}
 	// 이 화자 줄 선택: 그 화자의 보이는 줄만 체크하고 나머지는 푼다 (화자 칩이 그 화자를 숨기고 있으면 그 화자만 보이게 바꾼다)
 	function _castSelectRows(K) {
@@ -8564,11 +8591,38 @@ var modalState = {
 			}
 		});
 	}
-	// 검색·화자·프리셋 필터를 다시 건다 (줄의 className을 새로 쓴 뒤, renderAll 뒤). 부팅 중(필터 선언 전)에는 하지 않는다
+	// 표시 필터 (S3-2, _markFilter): "warn"이면 포인트 경고(rs.warn)가 있는 줄만, "sugg"면 AI 제안(rs.sugg)이 있는 줄만 보인다.
+	// 숨긴 줄은 체크를 푼다 (다른 필터와 같다). 보일 줄이 하나도 없으면 필터를 푼다 (마지막 경고·제안을 처리한 뒤)
+	function _markMatch(rs) {
+		if (_markFilter === "warn") return !!rs && Array.isArray(rs.warn) && rs.warn.length > 0;
+		if (_markFilter === "sugg") return !!rs && !!rs.sugg && typeof rs.sugg === "object" && Object.keys(rs.sugg).length > 0;
+		return true;
+	}
+	function _applyMarkFilter() {
+		if (_markFilter && !state.subtitles.some((sub) => _markMatch(state.rowStates[sub.id]))) _markFilter = "";
+		state.subtitles.forEach((sub) => {
+			const row = document.getElementById("row-" + sub.id);
+			if (!row) return;
+			const rs = state.rowStates[sub.id];
+			if (!_markFilter || _markMatch(rs)) {
+				row.classList.remove("mark-filter-hidden");
+				return;
+			}
+			row.classList.add("mark-filter-hidden");
+			if (rs && rs.checked) {
+				rs.checked = false;
+				row.classList.remove("is-checked");
+				const chk = row.querySelector("input[type=checkbox]");
+				if (chk) chk.checked = false;
+			}
+		});
+	}
+	// 검색·화자·표시·프리셋 필터를 다시 건다 (줄의 className을 새로 쓴 뒤, renderAll 뒤). 부팅 중(필터 선언 전)에는 하지 않는다
 	function _reapplyFilters() {
 		if (!_filtersReady) return;
 		_applySubSearch();
 		_applySpeakerFilter();
+		_applyMarkFilter();
 		_applyPresetFilter(); // updateMultiSelect까지 부른다
 	}
 	//#endregion
@@ -8865,9 +8919,137 @@ var modalState = {
 		if (!rs) return false;
 		return setRowFieldValue(rs, rs.presetId ? state.presets[rs.presetId] : null, fid, text);
 	}
-	// 행 머리의 표시 (번호 뒤, 순서대로): 병합 점 · 포인트 경고 · 적용 결과 · 옛 구조 · 못 옮긴 텍스트
+	// 행 머리의 표시 (번호 뒤, 순서대로): 병합 점 · 포인트 경고 · AI 제안 · 적용 결과 · 옛 구조 · 못 옮긴 텍스트
 	function _rowMarkEls(sub, rs) {
-		return [_mmBadge(sub, rs), _warnBadge(rs), _resBadge(sub.id), _structBadge(sub, rs), _orphBadge(sub, rs)].filter(Boolean);
+		return [_mmBadge(sub, rs), _warnBadge(rs), _suggBadge(sub, rs), _resBadge(sub.id), _structBadge(sub, rs), _orphBadge(sub, rs)].filter(Boolean);
+	}
+
+	// ── AI 제안 (S3-2) ──
+	// 제안(rs.sugg)은 행 머리 'AI'와 속성창 필드 아래 .sugg-box로 보인다. [적용]·[무시]만 값을 바꾸거나 지운다 (src/mi/commands.ts _suggApprove·_suggReject).
+	// 캡션·필드 구조가 바뀐 제안은 회색(stale)이고 [적용]이 꺼진다. 속성창에 없는 필드(노출하지 않은 T-ID)의 제안은 속성창 맨 위에 모은다.
+	const SUGG_BY_LABEL = { codex: "Codex", claude: "Claude", ai: "AI", test: "시험", ui: "패널" };
+	function _suggByLabel(by) {
+		const k = String(by || "").toLowerCase();
+		return SUGG_BY_LABEL[k] || String(by || "AI");
+	}
+	// 줄의 제안 [{fid, entry, r: suggState}] (필드 번호 순)
+	function _rowSuggs(sub, rs) {
+		if (!rs || !rs.sugg || typeof rs.sugg !== "object") return [];
+		const preset = rs.presetId ? state.presets[rs.presetId] || null : null;
+		return Object.keys(rs.sugg).filter((fid) => rs.sugg[fid] && typeof rs.sugg[fid] === "object")
+			.sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10))
+			.map((fid) => ({ fid, entry: rs.sugg[fid], r: suggState(sub, rs, preset, fid, rs.sugg[fid]) }));
+	}
+	// 행 머리 'AI' (제안이 있는 줄). 모두 낡았으면 회색. 누르면 속성창을 연다 (속성창이 없는 줄은 확인창에서 적용·무시)
+	function _suggBadge(sub, rs) {
+		const list = _rowSuggs(sub, rs);
+		if (!list.length) return null;
+		const el = document.createElement("span");
+		el.className = "sub-sugg" + (list.every((x) => x.r.stale) ? " stale" : "");
+		el.textContent = "AI";
+		el.title = "AI 제안 " + list.length + "개 — [적용]하기 전에는 바뀌지 않습니다\n" + list.map((x) => x.fid + (x.r.field ? " " + x.r.field : "") + ": " + x.entry.v + " — " + suggCheckText(x.r)).join("\n");
+		el.addEventListener("click", (e) => {
+			e.stopPropagation();
+			_openRowSuggs(sub);
+		});
+		return el;
+	}
+	function _openRowSuggs(sub) {
+		const rs = state.rowStates[sub.id];
+		if (!rs) return;
+		const panel = document.getElementById("params-" + sub.id);
+		if (panel && rs.params && rs.params.length) {
+			if (!rs.open) {
+				rs.open = true;
+				panel.className = "sub-params open";
+				saveSessionToStorage();
+				updateMultiSelect();
+			}
+			const box = panel.querySelector(".sugg-box");
+			if (box && typeof box.scrollIntoView === "function") box.scrollIntoView({ block: "nearest" });
+			return;
+		}
+		// 속성창이 없는 줄 (노출 속성이 없는 프리셋): 확인창에서
+		const list = _rowSuggs(sub, rs);
+		if (!list.length) return;
+		const lines = list.map((x) => x.fid + (x.r.field ? " " + x.r.field : "") + ": " + x.entry.v + "\n   " + suggCheckText(x.r));
+		const targets = list.map((x) => ({ sub, fid: x.fid }));
+		showChoice(rowLabel(sub, _castMode()) + " 줄의 AI 제안 " + list.length + "개:\n\n" + lines.join("\n") + "\n\n확인을 통과한 제안만 적용합니다 (바꾸기 전 상태는 안전 지점에 남습니다).", [
+			{ label: "검증 통과만 적용", run: () => _suggApprove(targets) },
+			{ label: "모두 무시", run: () => _suggReject(targets) },
+			{ label: "닫기", run: () => {} }
+		]);
+	}
+	// 속성창의 제안 칸·필드 경고를 다시 그린다 (필드는 다시 그리지 않는다: 입력 중인 칸이 그대로)
+	//   .sugg-box "AI 제안 (Codex): 날씨$$하늘 — ✓ 본문에 있음" [적용] [무시] — 그 필드 블록의 입력 칸 아래
+	//   .field-warn "‘하늘’이 문장에 없습니다" / "‘날씨’가 두 번 나와 첫 번째만 칠해집니다" (rs.warn, 병합의 포인트 확인)
+	function _renderSuggBoxes(subId) {
+		const panel = document.getElementById("params-" + subId);
+		const rs = state.rowStates[subId];
+		const sub = state.subtitles.find((s) => s.id === subId);
+		if (!panel || !rs || !sub) return;
+		panel.querySelectorAll(".sugg-box, .sugg-extra, .field-warn").forEach((el) => el.parentNode && el.parentNode.removeChild(el));
+		const blockOf = (fid) => {
+			const b = Array.from(panel.querySelectorAll(".fid-badge")).find((x) => x.textContent === fid);
+			const block = b && typeof b.closest === "function" ? b.closest(".mogrt-text-block") : null;
+			return block ? { block, ta: block.querySelector("textarea") } : null;
+		};
+		const after = (at, el) => {
+			const ref = at.ta ? at.ta.nextSibling : null;
+			at.block.insertBefore(el, ref);
+			at.ta = el;
+		};
+		(Array.isArray(rs.warn) ? rs.warn : []).forEach((w) => {
+			const at = blockOf(w.fid);
+			if (!at) return;
+			(w.missing || []).forEach((m) => { const el = document.createElement("div"); el.className = "field-warn"; el.textContent = quoteIga([m]) + " 문장에 없습니다"; after(at, el); });
+			(w.dup || []).forEach((m) => { const el = document.createElement("div"); el.className = "field-warn"; el.textContent = quoteIga([m]) + " 두 번 나와 첫 번째만 칠해집니다"; after(at, el); });
+		});
+		let extra = null;
+		_rowSuggs(sub, rs).forEach((x) => {
+			const box = document.createElement("div");
+			const warn = x.r.ok && x.r.warn.length > 0;
+			box.className = "sugg-box" + (x.r.stale ? " stale" : !x.r.ok ? " bad" : warn ? " warn" : "");
+			box.dataset.fid = x.fid;
+			const txt = document.createElement("span");
+			txt.className = "sugg-text";
+			txt.textContent = "AI 제안 (" + _suggByLabel(x.entry.by) + "): " + x.entry.v + " — " + suggCheckText(x.r);
+			if (x.entry.note) box.title = x.entry.note;
+			const ok = document.createElement("button");
+			ok.className = "sugg-ok";
+			ok.textContent = "적용";
+			ok.disabled = !x.r.ok;
+			ok.addEventListener("click", (e) => {
+				e.stopPropagation();
+				_suggApprove([{ sub, fid: x.fid }]);
+			});
+			const no = document.createElement("button");
+			no.className = "sugg-no";
+			no.textContent = "무시";
+			no.addEventListener("click", (e) => {
+				e.stopPropagation();
+				_suggReject([{ sub, fid: x.fid }]);
+			});
+			box.appendChild(txt);
+			box.appendChild(ok);
+			box.appendChild(no);
+			const at = blockOf(x.fid);
+			if (at) {
+				after(at, box);
+				return;
+			}
+			// 속성창에 없는 필드: 맨 위에 모은다 ("T3 서브 포인트 텍스트")
+			if (!extra) {
+				extra = document.createElement("div");
+				extra.className = "sugg-extra";
+				panel.insertBefore(extra, panel.firstChild);
+			}
+			const lbl = document.createElement("div");
+			lbl.className = "sugg-extra-label";
+			lbl.textContent = x.fid + (x.r.field ? " " + x.r.field : "") + " (속성창에 없는 필드)";
+			extra.appendChild(lbl);
+			extra.appendChild(box);
+		});
 	}
 
 	// ── 구조 맞춤 (S1-10) ──
@@ -8970,7 +9152,14 @@ var modalState = {
 			renderParams(panel, rs.params, (changedParam) => {
 				syncToAllParams(subId, changedParam);
 				saveSessionToStorage();
+				// 캡션을 고치면 그 줄의 AI 제안이 낡는다 → 제안 칸·행 머리 'AI'를 다시 그린다 (S3-2)
+				if (rs.sugg && changedParam && changedParam.type === "text") {
+					_renderSuggBoxes(subId);
+					const sub = state.subtitles.find((s) => s.id === subId);
+					if (sub) _refreshRowMarks(sub);
+				}
 			}, exposedFontFields ?? void 0, _rowFidMap(subId, rs));
+			_renderSuggBoxes(subId);
 		};
 		// 시스템 폰트 캐시가 없으면 먼저 로드 후 렌더링
 		if (!_cachedSystemFonts) {
@@ -9251,6 +9440,31 @@ var modalState = {
 			const n = _staleRowIds().length;
 			staleBtn.textContent = "옛 구조 줄 " + n + "개 맞추기";
 			staleBtn.style.display = n > 0 ? "" : "none";
+		}
+		// "경고 (N)": 포인트 텍스트 경고가 있는 줄 수, "AI 제안 (N)": 대기 중인 제안 수 (있을 때만, S3-2)
+		const warnBtn = document.getElementById("btnWarnFilter");
+		if (warnBtn) {
+			const n = state.subtitles.filter((s) => { const rs = state.rowStates[s.id]; return !!rs && Array.isArray(rs.warn) && rs.warn.length > 0; }).length;
+			warnBtn.textContent = "경고 (" + n + ")";
+			warnBtn.style.display = n > 0 || _markFilter === "warn" ? "" : "none";
+			warnBtn.classList.toggle("active", _markFilter === "warn");
+		}
+		const suggWrap = document.getElementById("suggWrap");
+		if (suggWrap) {
+			let n = 0;
+			state.subtitles.forEach((s) => { const rs = state.rowStates[s.id]; if (rs && rs.sugg && typeof rs.sugg === "object") n += Object.keys(rs.sugg).length; });
+			const btn = document.getElementById("btnSuggestions");
+			if (btn) {
+				btn.textContent = "AI 제안 (" + n + ")";
+				btn.classList.toggle("active", _markFilter === "sugg");
+			}
+			const f = document.getElementById("btnSuggFilter");
+			if (f) {
+				f.textContent = _markFilter === "sugg" ? "모든 줄 보기" : "제안 줄만 보기";
+				f.classList.toggle("active", _markFilter === "sugg");
+			}
+			suggWrap.style.display = n > 0 || _markFilter === "sugg" ? "" : "none";
+			if (!n) document.getElementById("suggDropdown")?.classList.remove("open");
 		}
 		// 화자 표의 줄 수 (줄을 지우거나 되살린 뒤)
 		_updateCastCounts();
@@ -10575,7 +10789,10 @@ var modalState = {
 			if (x.sub.spk && _castMode()) x.rs.mm = !x.rs.mm ? "text" : x.rs.mm === "time" ? "both" : x.rs.mm;
 			if (ids.indexOf(x.sub.id) === -1) ids.push(x.sub.id);
 		});
-		ids.forEach((id) => renderParamsPanel(id));
+		ids.forEach((id) => {
+			const rs = state.rowStates[id];
+			if (rs && rs.params && rs.params.length) renderParamsPanel(id);
+		});
 		saveSessionToStorage();
 		_suggRefresh(ok.map((x) => x.sub));
 		if (n) _saveHistoryOnAction("AI 제안 적용 (" + n + "개)");
@@ -10601,15 +10818,17 @@ var modalState = {
 		}
 		return { removed: n };
 	}
-	// 제안이 바뀐 줄을 다시 그린다 (행 머리 표시·속성창의 제안 칸·선택 바 버튼)
+	// 제안이 바뀐 줄을 다시 그린다 (행 머리 표시·속성창의 제안 칸·선택 바 버튼·제안 줄만 보기 필터)
 	function _suggRefresh(subs) {
 		const done = {};
 		(subs || []).forEach((sub) => {
 			if (!sub || done[sub.id]) return;
 			done[sub.id] = true;
 			_refreshRowMarks(sub);
+			_renderSuggBoxes(sub.id);
 		});
-		updateMultiSelect();
+		if (_markFilter) _reapplyFilters();
+		else updateMultiSelect();
 	}
 	// plan·apply 인자 → {subs, pf} | {error}. 줄: ids(줄 id 배열) | uids(uid 배열) | spk(화자 키) 중 하나, 없으면 화자 줄 전부.
 	// opts: 점검 선택지 (MI_PF_DEFAULTS의 키만)
@@ -10824,7 +11043,7 @@ var modalState = {
 		const hdr = row && row.querySelector(".sub-header");
 		const num = hdr && hdr.querySelector(".sub-num");
 		if (!num) return;
-		hdr.querySelectorAll(".sub-mm, .sub-warn, .sub-res, .sub-struct, .sub-orph").forEach((el) => el.parentNode && el.parentNode.removeChild(el));
+		hdr.querySelectorAll(".sub-mm, .sub-warn, .sub-sugg, .sub-res, .sub-struct, .sub-orph").forEach((el) => el.parentNode && el.parentNode.removeChild(el));
 		let after = num;
 		_rowMarkEls(sub, state.rowStates[sub.id]).forEach((el) => {
 			hdr.insertBefore(el, after.nextSibling);
@@ -13682,6 +13901,44 @@ var modalState = {
 		_reapplyFilters();
 		updateMultiSelect();
 		setStatus("변경 줄 " + n + "개 선택", "ok");
+	});
+	// ── 경고 (N): 포인트 텍스트 경고(!)가 있는 줄만 보기 / 다시 누르면 모두 (S3-2) ──
+	document.getElementById("btnWarnFilter")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		_markFilter = _markFilter === "warn" ? "" : "warn";
+		_reapplyFilters();
+		setStatus(_markFilter === "warn" ? "경고가 있는 줄만 보기" : "모든 줄 보기", "ok");
+	});
+	// ── AI 제안 (N) 드롭다운: 제안 줄만 보기 · 검증 통과만 적용(안전 지점 'AI 제안 적용 전') · 모두 무시 (S3-2) ──
+	document.getElementById("btnSuggestions")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		document.getElementById("suggDropdown")?.classList.toggle("open");
+	});
+	document.getElementById("suggDropdown")?.addEventListener("click", (e) => {
+		e.stopPropagation();
+		const b = e.target && typeof e.target.closest === "function" ? e.target.closest("button") : null;
+		const act = b && b.dataset ? b.dataset.act : "";
+		if (!act) return;
+		document.getElementById("suggDropdown")?.classList.remove("open");
+		if (act === "filter") {
+			_markFilter = _markFilter === "sugg" ? "" : "sugg";
+			_reapplyFilters();
+			setStatus(_markFilter === "sugg" ? "AI 제안이 있는 줄만 보기" : "모든 줄 보기", "ok");
+			return;
+		}
+		const all = _suggAll().map((x) => ({ sub: x.sub, fid: x.fid }));
+		if (!all.length) return;
+		if (act === "apply") {
+			_suggApprove(all);
+			return;
+		}
+		if (act === "reject") {
+			showConfirm("AI 제안 " + all.length + "개를 모두 버립니다.\n속성·타임라인은 그대로입니다.", () => _suggReject(all), null, { yes: "모두 무시" });
+		}
+	});
+	document.addEventListener("click", (e) => {
+		const wrap = document.getElementById("suggWrap");
+		if (wrap && !wrap.contains(e.target)) document.getElementById("suggDropdown")?.classList.remove("open");
 	});
 	// ── 옛 구조 줄 맞추기: 사용자가 누를 때만 (안전 지점 '구조 맞춤 전'), 적용은 부르지 않는다 (S1-10) ──
 	document.getElementById("btnRebaseStale")?.addEventListener("click", () => {

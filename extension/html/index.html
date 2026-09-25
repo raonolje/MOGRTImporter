@@ -1147,6 +1147,38 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 }
 .btn-sel-changed:hover { background: #2a3a5a; }
 
+/* ── AI 제안 (S3-2): 행 머리 'AI'(.sub-sugg), 속성창 제안 칸(.sugg-box), 필드 경고(.field-warn), 선택 바 버튼·드롭다운, 표시 필터 ── */
+.sub-sugg { font-size: 9px; font-weight: 700; color: #b39ddb; border: 1px solid #4a3a6a; border-radius: 3px; padding: 0 4px; flex-shrink: 0; cursor: pointer; }
+.sub-sugg:hover { background: #2a2040; }
+.sub-sugg.stale { color: #777; border-color: #444; }
+.sugg-box { display: flex; align-items: center; gap: 6px; margin: 3px 0 2px; padding: 3px 6px; background: #221c30; border: 1px solid #4a3a6a; border-radius: 3px; font-size: 10px; color: #d1c4e9; }
+.sugg-box .sugg-text { flex: 1; min-width: 0; word-break: break-all; }
+.sugg-box.warn .sugg-text { color: #ffcc80; }
+.sugg-box.bad .sugg-text { color: #ef9a9a; }
+.sugg-box.stale { background: #222; border-color: #3a3a3a; }
+.sugg-box.stale .sugg-text { color: #777; }
+.sugg-box button { font-size: 10px; padding: 1px 8px; border-radius: 3px; cursor: pointer; flex-shrink: 0; }
+.sugg-ok { background: #2a3a1a; border: 1px solid #4a6a2a; color: #aed581; }
+.sugg-ok:hover { background: #3a4a2a; }
+.sugg-ok:disabled { background: #2a2a2a; border-color: #333; color: #555; cursor: not-allowed; }
+.sugg-no { background: #2a2a2a; border: 1px solid #444; color: #aaa; }
+.sugg-no:hover { background: #333; }
+.sugg-extra { margin-bottom: 4px; }
+.sugg-extra-label { font-size: 10px; color: #9e9e9e; }
+.field-warn { font-size: 10px; color: #ffb300; margin: 2px 0; }
+.btn-sel-changed.btn-warn-filter { background: #2a2210; border-color: #6a5a20; color: #ffcc80; }
+.btn-sel-changed.btn-warn-filter.active, .btn-sel-changed.btn-sugg.active { box-shadow: inset 0 0 0 1px #fff3; font-weight: 700; }
+.btn-sel-changed.btn-sugg { background: #221c30; border-color: #4a3a6a; color: #d1c4e9; }
+#suggWrap { position: relative; flex-shrink: 0; }
+#suggDropdown { display: none; position: absolute; left: 0; top: 100%; z-index: 210; min-width: 150px; padding: 3px 0; background: #252525; border: 1px solid #444; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.6); }
+#suggDropdown.open { display: block; }
+#suggDropdown button { display: block; width: 100%; text-align: left; font-size: 11px; padding: 4px 10px; background: none; border: none; color: #ccc; cursor: pointer; white-space: nowrap; }
+#suggDropdown button:hover { background: #333; }
+#suggDropdown button.active { color: #d1c4e9; font-weight: 700; }
+#suggDropdown button.danger { color: #ef9a9a; }
+/* 경고·제안 줄만 보기 (_markFilter) */
+.sub-row.mark-filter-hidden { display: none !important; }
+
 /* ── 화자 표 (#castBar)와 화자 칩 (#speakerChips), S2-3 ── */
 #castBar { flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; padding: 3px 8px 4px; background: #1e1e1e; border-bottom: 1px solid #2e2e2e; max-height: 170px; overflow-y: auto; }
 #castHead { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888; }
@@ -1256,6 +1288,16 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
       <button class="btn-close-all-params" id="btnCloseAllParams" title="열려있는 속성창 모두 닫기" disabled>속성 닫기</button>
       <button class="btn-sel-changed" id="btnSelectChanged" title="병합으로 바뀐 줄(점 표시)만 선택" style="display:none;">변경 줄 (0)</button>
       <button class="btn-sel-changed btn-rebase-stale" id="btnRebaseStale" title="옛 버전 MOGRT로 만든 줄의 속성을 지금 프리셋 구조로 맞춤 (타임라인은 바꾸지 않음)" style="display:none;">옛 구조 줄 0개 맞추기</button>
+      <!-- 포인트 텍스트 경고가 있는 줄만 보기, AI 제안 (S3-2) -->
+      <button class="btn-sel-changed btn-warn-filter" id="btnWarnFilter" title="포인트 텍스트 경고(!)가 있는 줄만 보기 (다시 누르면 모두)" style="display:none;">경고 (0)</button>
+      <div id="suggWrap" style="display:none;">
+        <button class="btn-sel-changed btn-sugg" id="btnSuggestions" title="AI 제안 — [적용]하기 전에는 속성·타임라인이 바뀌지 않습니다">AI 제안 (0)</button>
+        <div id="suggDropdown">
+          <button id="btnSuggFilter" data-act="filter">제안 줄만 보기</button>
+          <button id="btnSuggApplyOk" data-act="apply">검증 통과만 적용</button>
+          <button id="btnSuggRejectAll" data-act="reject" class="danger">모두 무시</button>
+        </div>
+      </div>
       <div style="flex:1;"></div>
       <!-- 화자 칩 (화자가 둘 이상일 때만, S2-3) -->
       <div id="speakerChips" style="display:none;"></div>
