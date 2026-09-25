@@ -282,6 +282,7 @@ test("레거시 목록 + 프리셋 + C번호 없는 파일 (플래그 켜짐): [
 
 test("플래그 꺼짐(운영, S1-9): 프리셋이 있는 목록이면 병합/교체/취소를 묻고, 병합은 후반 작업을 지킨다", async () => {
 	const h = await boot();
+	h.win._mogrtDebug.setMiCast(false); // S2-4부터 플래그가 켜져 있다: 꺼진 경로는 DEV 훅으로
 	await h.dropSrt("interview.srt", CAP.srt(CAP.C1));
 	const id = snap(h).subtitles[1].id;
 	setSel(h, h.$("sel-" + id), "preset_3");
@@ -304,6 +305,7 @@ test("플래그 꺼짐(운영, S1-9): 프리셋이 있는 목록이면 병합/�
 
 test("플래그 꺼짐(운영): 프리셋이 없는 목록·C번호 파일은 선택 창 없이 v27 교체", async () => {
 	const h = await boot();
+	h.win._mogrtDebug.setMiCast(false);
 	await h.dropSrt("interview.srt", CAP.srt(CAP.C1));
 	const first = snap(h).subtitles.map((x) => x.id);
 	await h.dropSrt("interview_v2.srt", CAP.srt(CAP.C1_EDIT));

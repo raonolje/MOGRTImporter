@@ -41,10 +41,12 @@ function setSel(h, el, v) {
 	h.change(el);
 }
 
-// ── 플래그 꺼짐 (운영 = v27) ──
+// ── 플래그 꺼짐 (S2-4 전 운영 = v27. S2-4부터는 DEV 훅 setMiCast(false)로 레거시 경로를 시험한다) ──
 
 test("(a) 플래그 꺼짐: 평범한 SRT 하나 → v27 골든과 같은 줄, mi 없음, multiple 없음", async () => {
 	const h = await boot();
+	assert.equal(h.$("srtInput").multiple, true, "S2-4부터 플래그 켜짐이 기본");
+	assert.equal(h.win._mogrtDebug.setMiCast(false), false);
 	assert.equal(h.$("srtInput").multiple, false, "multiple 속성 없음");
 	await h.dropSrt("golden_crlf.srt", GOLDEN);
 	const s = snap(h);
@@ -61,6 +63,7 @@ test("(a) 플래그 꺼짐: 평범한 SRT 하나 → v27 골든과 같은 줄, m
 
 test("(b) 플래그 꺼짐: 인터뷰_C2.srt·여러 파일도 레거시 (첫 파일 하나, 화자 없음)", async () => {
 	const h = await boot();
+	h.win._mogrtDebug.setMiCast(false);
 	await h.dropSrts([{ name: "인터뷰_C2.srt", content: bytesOf("cap_interview_C2.srt") }, { name: "C1.srt", content: bytesOf("cap_C1.srt") }]);
 	const s = snap(h);
 	assert.equal(s.subtitles.length, 6, "첫 파일(C2)만");
@@ -73,6 +76,7 @@ test("(b) 플래그 꺼짐: 인터뷰_C2.srt·여러 파일도 레거시 (첫 �
 
 test("(c) 플래그 꺼짐: CP949 파일 → 목록을 바꾸기 전에 'CP949로 읽었습니다' + 한글 미리보기, 취소하면 그대로", async () => {
 	const h = await boot();
+	h.win._mogrtDebug.setMiCast(false);
 	await h.dropSrt("old.srt", "1\n00:00:01,000 --> 00:00:02,000\n기존 줄\n");
 	await h.dropSrt("enc_cp949.srt", bytesOf("enc_cp949.srt"));
 	assert.equal(confirmOpen(h), true, "확인창");
@@ -316,7 +320,7 @@ test("플래그 켜짐: 화자 없는 줄이 있는 목록에 C번호 파일 →
 	noErrors(h);
 });
 
-test("화자 줄이 있으면 ▶·↑는 '화자별 배치는 개발 중입니다' (호스트를 부르지 않는다)", async () => {
+test("화자 줄이 있으면 ▶·↑는 화자별 배치: v28 호스트가 없으면(v27 캐시) 다시 시작하라고 알리고 v27 적용 함수를 부르지 않는다", async () => {
 	const h = await bootCast();
 	await h.dropSrts([{ name: "C1.srt", content: bytesOf("cap_C1.srt") }]);
 	h.$("impOk").click();
@@ -324,12 +328,14 @@ test("화자 줄이 있으면 ▶·↑는 '화자별 배치는 개발 중입니�
 	const n = h.host.calls.length;
 	h.$("btnApply").click();
 	await h.flush();
-	assert.equal(h.status().text, "화자별 배치는 개발 중입니다");
+	assert.equal(h.status().text, "다른 버전의 호스트 스크립트가 로드됨 — Premiere를 다시 시작하세요");
 	const id = snap(h).subtitles[0].id;
 	h.$("row-" + id).querySelectorAll("button").find((b) => b.title === "이 자막만 타임라인에 업데이트").click();
 	await h.flush();
-	assert.equal(h.status().text, "화자별 배치는 개발 중입니다");
-	assert.deepEqual(h.host.calls.slice(n).filter((c) => /applyToTimeline|updateClipAtTime/.test(c.fn)), []);
+	assert.equal(h.status().text, "다른 버전의 호스트 스크립트가 로드됨 — Premiere를 다시 시작하세요");
+	assert.deepEqual(h.host.calls.slice(n).map((c) => c.fn).filter((fn) => /applyToTimeline|updateClipAtTime|insertClip/.test(fn)), []);
+	assert.deepEqual(h.host.calls.slice(n).map((c) => c.fn).filter((fn) => /^MI_/.test(fn)), ["MI_ping", "MI_ping"], "ping만 (쓰기 없음)");
+	assert.equal(h.win._mogrtDebug.miBusy(), false);
 	noErrors(h);
 });
 

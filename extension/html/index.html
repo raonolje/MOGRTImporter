@@ -1178,6 +1178,23 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 /* 화자 필터 적용 시 숨김 */
 .sub-row.speaker-filter-hidden { display: none !important; }
 
+/* ── 화자별 배치 (S2-4): 적용 바 트랙 요약, 적용 전 점검, 진행 덮개, 마지막 적용 ── */
+#castTrackSummary { font-size: 10px; color: #90caf9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+.custom-modal-box.pf-box { width: 520px; max-width: 94%; max-height: 88vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.pf-summary { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #ddd; }
+.pf-summary .pf-line.warn { color: #ffb74d; }
+.pf-summary .pf-line.err { color: #ef9a9a; }
+.pf-opts { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid #333; padding-top: 6px; }
+.pf-opt { display: flex; align-items: flex-start; gap: 6px; font-size: 11px; color: #ccc; cursor: pointer; }
+.pf-opt input { margin-top: 1px; accent-color: #64b5f6; }
+#miBusy { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; }
+.mi-busy-box { min-width: 260px; max-width: 90%; padding: 14px 16px; background: #252525; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; align-items: center; box-shadow: 0 6px 20px rgba(0,0,0,0.6); }
+#miBusyText { font-size: 12px; color: #e0e0e0; text-align: center; }
+#miBusyWatch { font-size: 11px; color: #ffb74d; text-align: center; }
+#miBusyStop { font-size: 11px; padding: 3px 14px; }
+.history-item.last-apply { color: #999; cursor: default; }
+.history-item.last-apply.partial .hist-label { color: #ffb74d; }
+
 /* 동기화 버튼 */
 #btnSyncTimeline {
     font-size: 11px; padding: 4px 10px;
@@ -1271,7 +1288,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 
     <!-- 하단 적용 바 -->
     <div id="applyBar">
-      <label>트랙</label>
+      <label id="trackSelLabel">트랙</label>
       <select id="trackSel">
         <option value="1">V2</option>
         <option value="2" selected>V3</option>
@@ -1283,6 +1300,8 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
         <option value="8">V9</option>
         <option value="9">V10</option>
       </select>
+      <!-- 다화자: 화자 → 트랙 미리보기 "C1→V3 · C2→V4 (새)" (S2-4) -->
+      <span id="castTrackSummary" style="display:none;"></span>
       <button id="btnApply">▶ 타임라인에 적용</button>
       <button id="btnApplyStop" title="안전하게 적용을 줄 사이에서 멈춤" style="display:none;">중지</button>
     </div>
@@ -1328,6 +1347,15 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 
   <!-- ── 상태바 ── -->
   <div id="statusBar">준비</div>
+
+  <!-- 화자별 배치 진행 (다화자 적용 중에는 패널을 덮는다, S2-4) -->
+  <div id="miBusy" style="display:none;">
+    <div class="mi-busy-box">
+      <p id="miBusyText">배치 중…</p>
+      <p id="miBusyWatch" style="display:none;"></p>
+      <button id="miBusyStop" class="btn">중지</button>
+    </div>
+  </div>
 
 </div><!-- /#app -->
 
@@ -1425,6 +1453,32 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
     <div class="custom-modal-btns">
       <button id="impOk" class="btn primary">가져오기</button>
       <button id="impCancel" class="btn">취소</button>
+    </div>
+  </div>
+</div>
+
+<!-- 적용 전 점검 (다화자 적용, S2-4): 요약 줄과 선택지. 필요한 선택지만 보인다 -->
+<div id="preflightModal" class="custom-modal-overlay">
+  <div class="custom-modal-box pf-box">
+    <p class="imp-title">적용 전 점검</p>
+    <div id="pfSummary" class="pf-summary"></div>
+    <div id="pfOpts" class="pf-opts">
+      <label class="pf-opt"><input type="checkbox" id="pfAdopt"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfAdoptUncertain"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfAdoptForeign"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfMoveLegacy"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfOrphans"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfOrphansAll"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfCleanupStale"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfReplaceMissing"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfOverwriteEdited"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfRestoreMoved"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfMoveDecorated"><span></span></label>
+      <label class="pf-opt"><input type="checkbox" id="pfUpgradeOld"><span></span></label>
+    </div>
+    <div class="custom-modal-btns">
+      <button id="pfOk" class="btn primary">적용</button>
+      <button id="pfCancel" class="btn">취소</button>
     </div>
   </div>
 </div>

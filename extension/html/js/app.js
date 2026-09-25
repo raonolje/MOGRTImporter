@@ -28,15 +28,13 @@
 	var _keysResolved = false, _filtersReady = false, _sessionReadFailed = false;
 	// 활성 시퀀스 표시(#activeSeqLabel)의 마지막 정보. 세션 읽기 실패 경고를 다시 그릴 때 쓴다
 	var _seqLabelInfo = null;
-	// 여러 SRT 가져오기(다화자) 플래그. S2-4(화자별 배치)까지 false: 운영은 v27처럼 SRT 한 개만 연다.
-	// DEV·하드 테스트는 코드를 고치지 않고 window._mogrtDebug.setMiCast(true)로 켠다 (_miCastEnabled)
-	const MI_CAST_ENABLED = false;
+	// 여러 SRT 가져오기(다화자) 플래그. S2-4(화자별 배치)부터 true.
+	// DEV·하드 테스트는 코드를 고치지 않고 window._mogrtDebug.setMiCast(false)로 레거시(SRT 한 개) 경로를 시험한다 (_miCastEnabled)
+	const MI_CAST_ENABLED = true;
 	// v28 호스트(hostscript.jsx MI_ 구역) 이름 접두사와 이 패널의 빌드. DEV 설치가 둘 다 바꾼다
 	// (접두사 뒤에 D를 붙이고 @@BUILD@@ → dev-<sha>, tools/lib/stamp.js). 호스트 MI_ping의 prefix·build와 같아야 한다
 	const MI_PREFIX = "MI_";
 	const MI_BUILD_PANEL = "@@BUILD@@";
-	// 화자 줄의 ▶·↑ 안내 (화자별 트랙 배치는 S2-4. 그 전에는 v27 한 트랙 경로로 보내지 않는다)
-	const CAST_APPLY_PENDING_MSG = "화자별 배치는 개발 중입니다";
 	// 레거시 적용 (src/mi/apply.ts, S1-9). renderAll이 부팅 중에 읽으므로 여기 둔다.
 	//   _rowRes     줄마다 마지막 적용 결과 문구 {줄 id: "타임라인에 클립 없음" …} (.sub-res). 메모리에만, renderAll이 비운다
 	//   _legacyRun  실행 중인 '안전하게 적용' {stop}. [중지]가 stop을 켜면 줄 사이에서 멈춘다
@@ -45,6 +43,11 @@
 	//   _speakerFilter  화자 칩에서 고른 화자 키 (비면 모두 보인다). 키가 바뀌면(시퀀스 전환) 비운다
 	//   _miNumTracks    마지막으로 호스트에서 읽은 비디오 트랙 수 (모르면 null: 화자 표의 '새로 만듦' 표시)
 	var _speakerFilter = new Set(), _miNumTracks = null;
+	// 화자별 배치 (src/mi/apply.ts, S2-4). 폴러·30초 재스캔이 읽으므로 여기 둔다.
+	//   _miBusy       적용이 도는 중 (폴러·MOGRT 재스캔·SRT 열기·▶·↑를 멈춘다)
+	//   _miCancel     [중지]를 눌렀다 (청크 사이에서 멈춘다)
+	//   _miRowStatus  줄마다 마지막 배치 결과 {줄 id: {st, why, detail}} (runCommand·테스트용. 줄 표시는 .sub-res)
+	var _miBusy = false, _miCancel = false, _miRowStatus = {};
 	//#endregion
 //#region src/storage.ts
 	// ── cep.fs 기반 파일 저장소 ──
@@ -170,6 +173,12 @@
 		const root = _getCacheRoot();
 		if (!root) return null;
 		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/settings.json";
+	}
+	// last_apply.json (S2-4): 화자별 배치 실행 기록. 시작할 때 {complete: false}로 만들고 청크마다 다시 쓴다 (되돌리기는 S2-5)
+	function _getLastApplyPath() {
+		const root = _getCacheRoot();
+		if (!root) return null;
+		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/last_apply.json";
 	}
 	// cast_defaults.json (프로젝트 단위, S2-3): C번호별 이름·기본 프리셋·색·위치의 기본값 {v, C1: {name, presetId, color, pos}, …}
 	function _getCastDefaultsPath() {
@@ -432,8 +441,9 @@
 		// nextId를 내리고 mi 없이 저장한 경우). 줄·휴지통은 위에서 거른 배열로 본다 (파일의 타입이 틀려도 던지지 않게)
 		state.mi = _miForLoadedSession(r.data || null);
 		state.nextId = r.exists ? safeNextId({ nextId: sdata.nextId, subtitles: state.subtitles, trashBin: state.trashBin }, state.mi.hwm) : 1;
-		// 화자 칩 필터는 시퀀스마다 새로 (다른 시퀀스에서 고른 화자로 줄이 숨지 않게)
+		// 화자 칩 필터·배치 결과는 시퀀스마다 새로 (다른 시퀀스에서 고른 화자로 줄이 숨지 않게)
 		_speakerFilter.clear();
+		_miRowStatus = {};
 	}
 	function loadSessionFromStorage() {
 		try {
@@ -3333,6 +3343,677 @@
 			list.forEach((c) => { if (c.g < list[0].g) out.stale.push(c); });
 		});
 		return out;
+	}
+	// ── 화자별 배치 계획 (계획서 §6, spec placement 7~10, S2-4) ──
+	// 패널 _miApply가 호스트 스캔(getTracks)과 되읽기(readClipTexts)를 모아 planPlacement에 넘기고, 나온 작업을 청크로 보낸다.
+	// 여기는 계획만 세운다 (호스트·파일·DOM 없음). 같은 입력이면 같은 계획이다 → 중단 뒤 다시 적용해도 이어서 진행된다.
+
+	// 청크 기본 크기 (S0-3 결정 5), 되읽기 한 번 상한 (결정 8), 스캔 창 여유 (결정 12, 초)
+	const PLACE_CHUNK = 8;
+	const READ_BATCH = 40;
+	const SCAN_PAD_SEC = 30;
+	// 템플릿 길이를 모를 때 쓰는 길이 (초. 설치된 템플릿은 5.005~5.09초)
+	const PLACE_DUR_FALLBACK = 5.1;
+	// 이웃이 망가진 줄을 다시 놓는 횟수 (분기 C)
+	const DAMAGE_ROUNDS = 2;
+	// 경로 비교용 (구분자 /, 대소문자 무시 — Windows)
+	function normPath(p) {
+		return String(p == null ? "" : p).replace(/\\/g, "/").toLowerCase();
+	}
+	// 속성 하나의 값 해시 (applied.fh). 이름·종류·값·raw 값·색 hex
+	function paramHash(p) {
+		const v = (x) => (x === undefined ? null : x);
+		return fnv1a32(stableJson({ t: (p && p.type) || "", d: (p && p.displayName) || "", v: v(p && p.value), r: v(p && p.rawValue), c: v(p && p.colorHex) }));
+	}
+	// 속성 목록 → {index: 값 해시}
+	function paramHashes(params) {
+		const out = {};
+		(params || []).forEach((p) => { if (p && typeof p.index === "number") out[p.index] = paramHash(p); });
+		return out;
+	}
+	// 클립 텍스트 값들의 해시 (applied.rh = 우리가 쓴 직후 되읽은 값). NFC, 줄바꿈 LF. 네이티브 한 글자 이하는 호스트가 이미 ""로 준다
+	function textsHash(texts) {
+		return fnv1a32(JSON.stringify((texts || []).map((t) => {
+			let s = String(t == null ? "" : t);
+			if (s.normalize) s = s.normalize("NFC");
+			return s.replace(/\r\n?/g, "\n");
+		})));
+	}
+	// 줄이 타임라인에 원하는 모습의 해시 (applied.h): 프리셋·필드 서명·쓴 속성 값·트랙·프레임·템플릿·클립 이름·위치
+	function intentHash(o) {
+		return fnv1a32(stableJson({ p: o.presetId || "", s: o.sig || "", f: o.fh || {}, t: o.track, sf: o.sf, ef: o.ef, m: normPath(o.m), n: o.name || "", mo: o.motion || null }));
+	}
+	// 줄 → 프레임 {id: {sf, ef, clamped, zero}}: sf = frameOf(시작), ef = max(sf + 1, frameOf(끝)).
+	// 같은 화자 안에서 겹치면 앞 줄의 끝을 뒤 줄 시작에 맞춘다 (시작 순, 같은 시작이면 목록 순). 길이가 0이 되면 zero
+	function speakerFrames(rows, frameTicks) {
+		const out = {};
+		const by = {};
+		(rows || []).forEach((r, i) => {
+			if (!r) return;
+			const sf = frameOf(r.startSec, frameTicks);
+			const ef = Math.max(sf + 1, frameOf(r.endSec, frameTicks));
+			out[r.id] = { sf, ef, clamped: false, zero: false };
+			const K = r.spk || "";
+			(by[K] = by[K] || []).push({ id: r.id, sf, i });
+		});
+		Object.keys(by).forEach((K) => {
+			const list = by[K].sort((a, b) => a.sf - b.sf || a.i - b.i);
+			for (let k = 0; k + 1 < list.length; k++) {
+				const cur = out[list[k].id];
+				const nx = list[k + 1].sf;
+				if (cur.ef > nx) {
+					cur.ef = nx;
+					cur.clamped = true;
+					if (cur.ef <= cur.sf) cur.zero = true;
+				}
+			}
+		});
+		return out;
+	}
+	// 작업 종류별 단계 (트랙마다 이 순서로): 1 제거 · 2 줄이는 갱신 · 3 이동·교체 · 4 배치 · 5 늘리는 갱신
+	const OP_PHASE = { remove: 1, move: 3, moveRegen: 3, legacyMove: 3, replace: 3, place: 4 };
+	// 새 클립을 만드는 작업 (결과 nodeId가 다른 작업의 이웃 목록에 들어갈 수 있다)
+	function opCreates(op) {
+		return !!op && (op.op === "place" || op.op === "replace" || op.op === "moveRegen" || op.op === "legacyMove");
+	}
+	// 작업이 차지하는 범위 [시작, 끝): 이동은 [sf, ef), 새로 놓기는 템플릿 길이까지 [sf, sf + max(ef − sf, D))
+	function _opReach(op) {
+		if (op.op === "move") return [op.sf, op.ef];
+		return [op.sf, op.sf + Math.max(op.ef - op.sf, op.D || 0)];
+	}
+	// 3단계(이동·교체) 순서: 작업 X의 범위가 다른 작업 Y가 떠날 자리(Y.src)와 겹치면 X는 Y 뒤에 (같은 트랙).
+	// 순환은 하나(시작이 가장 이른 것)를 '먼저 지우고 나중에 놓기'로 끊는다: 그 작업의 옛 클립은 1단계 제거, 새 클립은 4단계 배치
+	// → {ordered: [작업] (단계 순, 단계 안은 의존·시작 순), removals: [순환을 끊으며 생긴 제거]}
+	function orderOps(ops) {
+		const list = (ops || []).filter(Boolean);
+		const byPhase = (p) => list.filter((x) => x.phase === p).sort((a, b) => a.sf - b.sf || a.id - b.id);
+		const p3 = byPhase(3);
+		const extraRemove = [];
+		const after = new Map();
+		p3.forEach((x) => after.set(x, []));
+		p3.forEach((x) => {
+			const r = _opReach(x);
+			p3.forEach((y) => {
+				if (x === y || !y.src || y.src.track !== x.track) return;
+				if (r[0] < y.src.ef && y.src.sf < r[1]) after.get(x).push(y);
+			});
+		});
+		const done = new Set();
+		const out3 = [];
+		const breakers = [];
+		while (out3.length + breakers.length < p3.length) {
+			const ready = p3.filter((x) => !done.has(x) && after.get(x).every((y) => done.has(y)));
+			if (ready.length) {
+				const x = ready[0];
+				done.add(x);
+				out3.push(x);
+				continue;
+			}
+			const x = p3.find((z) => !done.has(z));
+			done.add(x);
+			x.cycle = true;
+			x.phase = 4;
+			if (x.src) extraRemove.push({ uid: x.uid, id: x.id, track: x.src.track, nodeId: x.src.nodeId, expectName: x.src.name || null, g: x.src.g, why: "cycle" });
+			x.op = "place";
+			x.own = null;
+			x.removeAfter = null;
+			breakers.push(x);
+		}
+		const p4 = byPhase(4);
+		return { ordered: byPhase(2).concat(out3, p4, byPhase(5)), removals: extraRemove };
+	}
+	// 청크로 나눈다: size개까지, 그리고 이웃 목록이 같은 청크에서 먼저 만들 클립("new:uid")을 가리키면 그 앞에서 끊는다
+	// (새 클립의 nodeId는 그 청크가 돌아와야 안다) → [[작업]]
+	function chunkOps(ops, size) {
+		const n = size > 0 ? size : PLACE_CHUNK;
+		const chunks = [];
+		let cur = [];
+		let made = {};
+		(ops || []).forEach((op) => {
+			const dep = (op.guard || []).some((g) => String(g).indexOf("new:") === 0 && made[String(g).slice(4)]);
+			if (cur.length && (cur.length >= n || dep)) {
+				chunks.push(cur);
+				cur = [];
+				made = {};
+			}
+			cur.push(op);
+			if (opCreates(op)) made[op.uid] = true;
+		});
+		if (cur.length) chunks.push(cur);
+		return chunks;
+	}
+	// 계획 작업 → 호스트 placeChunk 항목. created: {uid: 이번 실행에서 만든 클립 nodeId} ("new:uid" 이웃을 푼다, 못 풀면 뺀다)
+	function hostItemOf(op, created) {
+		const made = created || {};
+		const guard = [];
+		(op.guard || []).forEach((g) => {
+			const s = String(g);
+			const id = s.indexOf("new:") === 0 ? made[s.slice(4)] : s;
+			if (id && guard.indexOf(id) === -1) guard.push(id);
+		});
+		const item = { key: op.uid, op: op.op, g: op.g, track: op.track, sf: op.sf, ef: op.ef, keepTime: !!op.keepTime, own: op.own || null,
+			mogrtPath: op.m || "", durSec: op.durSec || 0, params: op.params || [], name: op.name === undefined ? null : op.name, guard, motion: null, removeAfter: op.removeAfter || null };
+		return item;
+	}
+	// 검증된 결과 → applied 항목 {g, m, ls, h, fh, rh, k, t, sf, ef, cef}. t·sf·ef는 줄이 원한 자리(제자리 갱신이어도), cef는 클립의 실제 끝
+	function appliedEntryOf(op, r) {
+		return {
+			g: r && typeof r.g === "number" ? r.g : op.g,
+			m: op.m || "",
+			ls: clipLs(r && r.lay),
+			h: op.h,
+			fh: op.fhAll || {},
+			rh: textsHash((r && r.texts) || []),
+			k: (r && r.kind) || op.kind || "",
+			t: op.intent ? op.intent.t : op.track,
+			sf: op.intent ? op.intent.sf : op.sf,
+			ef: op.intent ? op.intent.ef : op.ef,
+			cef: r && typeof r.ef === "number" ? r.ef : op.ef
+		};
+	}
+	// 효과·키프레임이 있는 클립인가 (되읽은 deco: 컴포넌트가 프리셋이 배운 기본 수보다 많거나, Motion·Opacity에 키)
+	function decoratedOf(d, preset) {
+		if (!d || !d.deco) return false;
+		const base = preset && typeof preset.mogrtBaseComps === "number" ? preset.mogrtBaseComps : null;
+		return (base !== null && d.deco.comps > base) || (Array.isArray(d.deco.keyed) && d.deco.keyed.length > 0);
+	}
+	// 배치 계획 (순수). inp:
+	//   rows     대상 줄 [{sub, rs, preset, baked: {path, key, durSec} | null, bakeWhy, oldBaked: 전에 네이티브로 놓은 사본 경로 | null}]
+	//   allRows  살아 있는 줄 전부 [sub] (같은 화자 겹침 맞춤·화자 구간·목록에 없는 클립)
+	//   trash    {줄 id: why} 휴지통 항목 (목록에서 빠진 줄의 클립을 미리 체크할지)
+	//   mi       {salt, cast, castOrder, applied, legacyTrack}
+	//   base     기본 트랙 (#trackSel)
+	//   scan     호스트 getTracks 결과 {frameTicks, numVideoTracks, tracks}
+	//   details  {nodeId: readClipTexts 결과 {kind, pin, texts, lay, deco}}
+	//   durs     {normPath(템플릿): 길이 초}
+	//   opts     {adopt, adoptUncertain, adoptForeign, moveLegacy, orphans: "pre"|"all"|"none", cleanupStale, replaceMissing,
+	//             overwriteEdited, restoreMoved, moveDecorated, upgradeOld, single, forceRegen: {줄 id: true}}
+	// → 계획 {ops (단계 순), removals, tracks, blocked, minCount, needReads (아직 되읽지 않은 클립 — 읽고 다시 계획), 목록·수}
+	function planPlacement(inp) {
+		const o = Object.assign({ adopt: true, adoptUncertain: false, adoptForeign: true, moveLegacy: true, orphans: "pre", cleanupStale: true, replaceMissing: true,
+			overwriteEdited: false, restoreMoved: false, moveDecorated: false, upgradeOld: false, single: false, forceRegen: {} }, (inp && inp.opts) || {});
+		const mi = (inp && inp.mi) || miDefault();
+		const salt = String(mi.salt || "");
+		const cast = mi.cast || {};
+		const applied = mi.applied || {};
+		const scan = (inp && inp.scan) || { tracks: [] };
+		const ft = Number(scan.frameTicks) || 0;
+		const details = (inp && inp.details) || {};
+		const durs = (inp && inp.durs) || {};
+		const base = typeof inp.base === "number" ? inp.base : 2;
+		const legacyTrack = typeof mi.legacyTrack === "number" ? mi.legacyTrack : null;
+		const plan = {
+			frameTicks: ft, tracks: {}, blocked: [], minCount: 0, ops: [], removals: [], rowOps: {}, needReads: [],
+			conflicts: [], edited: [], missing: [], oldVersion: [], decorated: [], unknownTemplate: [], unverifiedTemplate: [],
+			dup: [], noPreset: [], noCaption: [], bakeFailed: [], zeroLength: [], locked: [], none: [], userMoved: [], noSpeaker: [],
+			adopt: { certain: 0, uncertain: 0 }, foreignAdopt: { certain: 0, uncertain: 0 }, legacyMove: 0, legacyKept: [], legacyDecorated: 0,
+			overlaps: 0, staleLayoutRows: 0, oldVersionSkipped: 0, cleanup: [], orphans: [], perSpeaker: {}
+		};
+		const idx = scanIndex(scan, salt);
+		const all = (inp.allRows || (inp.rows || []).map((r) => r.sub)).filter(Boolean);
+		const fr = speakerFrames(all, ft);
+		const rowSpk = {};
+		const spans = {};
+		all.forEach((s) => {
+			if (!s.spk) return;
+			rowSpk[s.id] = s.spk;
+			const f = fr[s.id];
+			if (f && !f.zero) (spans[s.spk] = spans[s.spk] || []).push([f.sf, f.ef]);
+		});
+		// 되읽기: 읽은 값 | false (읽었는데 없다: 스캔 뒤 사라짐) | null (아직 안 읽음 → needReads에 넣는다)
+		const need = {};
+		const detailOf = (c) => {
+			const d = details[c.nodeId];
+			if (d) return d.found === false ? false : d;
+			if (!need[c.nodeId]) {
+				need[c.nodeId] = true;
+				plan.needReads.push({ track: c.track, nodeId: c.nodeId });
+			}
+			return null;
+		};
+		const trackName = (t) => "V" + (t + 1);
+		const secOf = (f) => (ft > 0 ? (f * ft) / TICKS_PER_SEC : 0);
+		// 줄마다 입력 정리
+		const infos = (inp.rows || []).filter((r) => r && r.sub).map((r) => {
+			const sub = r.sub;
+			const rs = r.rs || {};
+			const preset = r.preset || null;
+			const f = fr[sub.id] || { sf: frameOf(sub.startSec, ft), ef: Math.max(frameOf(sub.startSec, ft) + 1, frameOf(sub.endSec, ft)), clamped: false, zero: false };
+			const loc = applyLocate(rs, sub);
+			const cap = preset ? rowCaptionValue(rs, preset) : null;
+			const caps = [];
+			[cap, sub.text, rs.ap && rs.ap.cap, rs.mmPrev && rs.mmPrev.cap].forEach((t) => {
+				const n = normText(t);
+				if (n && caps.indexOf(n) === -1) caps.push(n);
+			});
+			const uid = salt + "-" + sub.id;
+			return { r, sub, rs, preset, K: sub.spk || null, uid, sf: f.sf, ef: f.ef, zero: f.zero, clamped: f.clamped,
+				native: !!(preset && isNativeList(preset.params)), locF: loc.from === "sub" ? null : frameOf(loc.s, ft),
+				caps, cur: idx.current[uid] || null, dup: !!idx.dup[uid], ap: applied[uid] || null };
+		});
+		const wantKind = (x) => (x.native ? "native" : "ae");
+		const textOk = (d, x) => (d.texts || []).some((t) => {
+			const n = normText(t);
+			return !!n && x.caps.some((c) => n.indexOf(c) !== -1);
+		});
+		const apAt = (x, c) => !!(x.rs.ap && typeof x.rs.ap.t === "number" && x.rs.ap.t === c.track && typeof x.rs.ap.s === "number" && Math.abs(frameOf(x.rs.ap.s, ft) - c.sf) <= 1);
+		const framesOf = (x) => [x.sf].concat(x.locF !== null && x.locF !== x.sf ? [x.locF] : []);
+		const nearF = (c, x) => framesOf(x).some((f) => Math.abs(c.sf - f) <= 1);
+		// 다른 salt 태그 클립이 문장까지 맞는 트랙 → 기억한 트랙이 없는 자동 화자가 먼저 쓴다 (복제한 시퀀스)
+		const affCount = {};
+		infos.forEach((x) => {
+			if (x.cur || x.dup || !x.K || !x.preset) return;
+			idx.foreignMi.forEach((c) => {
+				if (!nearF(c, x)) return;
+				const d = detailOf(c);
+				if (d && d.kind === wantKind(x) && textOk(d, x)) {
+					const m = (affCount[x.K] = affCount[x.K] || {});
+					m[c.track] = (m[c.track] || 0) + 1;
+				}
+			});
+		});
+		const affinity = {};
+		Object.keys(affCount).forEach((K) => {
+			let best = null;
+			Object.keys(affCount[K]).forEach((t) => { if (best === null || affCount[K][t] > affCount[K][best]) best = t; });
+			if (best !== null) affinity[K] = Number(best);
+		});
+		const rt = resolveTracks(mi.castOrder, cast, base, { spans, scan, salt, rowSpk, affinity });
+		plan.tracks = rt.tracks;
+		plan.blocked = rt.blocked;
+		plan.minCount = rt.minCount;
+		plan.tracksToAdd = rt.minCount > 0 && typeof scan.numVideoTracks === "number" ? rt.minCount - scan.numVideoTracks : 0;
+		const blocked = {};
+		rt.blocked.forEach((b) => b.keys.forEach((k) => { blocked[k] = b; }));
+		const ownIds = {};
+		Object.keys(idx.current).forEach((u) => { ownIds[idx.current[u].nodeId] = true; });
+		const skip = (x, why, detail) => {
+			plan.rowOps[x.sub.id] = { skip: why, detail: detail || "" };
+		};
+		const conflict = (x, why, detail) => {
+			plan.conflicts.push({ id: x.sub.id, uid: x.uid, why, detail: detail || "" });
+			plan.rowOps[x.sub.id] = { skip: "conflict", why, detail: detail || "" };
+		};
+		const clipText = (c) => trackName(c.track) + " " + secOf(c.sf).toFixed(1) + "~" + secOf(c.ef).toFixed(1) + (c.name ? " " + c.name : "");
+		const ops = [];
+		infos.forEach((x) => {
+			const sub = x.sub;
+			const rs = x.rs;
+			const preset = x.preset;
+			if (!x.K || !cast[x.K]) return skip(x, "no-speaker");
+			const tr = rt.tracks[x.K];
+			if (!preset) {
+				plan.noPreset.push(sub.id);
+				return skip(x, "no-preset");
+			}
+			if (x.native && !(x.r.baked && x.r.baked.path)) {
+				plan.bakeFailed.push({ id: sub.id, why: x.r.bakeWhy || "" });
+				return skip(x, "bake-failed", x.r.bakeWhy || "");
+			}
+			const params = x.native ? [] : rowSendParams(rs).map((p) => Object.assign({}, p));
+			if (!x.native && !params.length) return skip(x, "no-params");
+			const capFid = captionFid(preset);
+			if (!x.native && capFid && !resolveFid(rs._allParams && rs._allParams.length ? rs._allParams : params, capFid, preset.params)) {
+				plan.noCaption.push(sub.id);
+				return skip(x, "no-caption-field");
+			}
+			if (blocked[x.K]) {
+				const b = blocked[x.K];
+				return conflict(x, "pinned-overlap", b.keys.join("과 ") + "가 " + trackName(b.track) + "에서 겹칩니다");
+			}
+			if (tr.locked) {
+				plan.locked.push(sub.id);
+				return skip(x, "locked", trackName(tr.track) + " 잠김");
+			}
+			if (x.zero) {
+				plan.zeroLength.push(sub.id);
+				return skip(x, "zero-length");
+			}
+			if (x.dup) {
+				plan.dup.push(x.uid);
+				return skip(x, "dup", "같은 태그 클립 " + ((idx.dup[x.uid] || []).length) + "개");
+			}
+			if (x.clamped) plan.overlaps++;
+			if (!x.native && rs._allParams && rs._allParams.length && layoutMismatch(rs._allParams, preset.params)) plan.staleLayoutRows++;
+			const T = tr.track;
+			const m = x.native ? x.r.baked.path : preset.mogrtPath;
+			const durSec = x.native ? Number(x.r.baked.durSec) || Number(durs[normPath(m)]) || PLACE_DUR_FALLBACK : Number(preset.mogrtDurSec) || Number(durs[normPath(m)]) || PLACE_DUR_FALLBACK;
+			const D = ft > 0 ? Math.round((durSec * TICKS_PER_SEC) / ft) : 0;
+			const fhAll = paramHashes(params);
+			const nameOf = (g) => (String(cast[x.K].name || "").trim() || x.K) + " " + makeClipTag(salt, sub.id, g);
+			const ap = x.ap && typeof x.ap === "object" ? x.ap : null;
+			const sig = fieldSignature(params);
+			const baseOp = { id: sub.id, uid: x.uid, K: x.K, kind: wantKind(x), m, durSec, D, fhAll, presetId: rs.presetId || "", nk: x.native ? x.r.baked.key : null };
+			const hOf = (g, t, sf, ef) => intentHash({ presetId: rs.presetId, sig, fh: fhAll, track: t, sf, ef, m, name: nameOf(g) });
+			const writes = (op) => opCreates(op) || (op.params || []).some((p) => p && p.type === "text");
+			const cur = x.cur;
+			if (!cur) {
+				// 우리 클립이 없다: 태그 없는 클립·다른 salt 태그 클립을 알아보고(같은 트랙·기본 트랙에 있던 옛 클립), 없으면 새로 놓는다
+				const g = ap && typeof ap.g === "number" ? ap.g + 1 : 1;
+				const cands = [];
+				idx.untagged.forEach((c) => { if ((c.track === T || c.track === legacyTrack) && nearF(c, x)) cands.push({ c, foreign: false }); });
+				idx.foreignMi.forEach((c) => { if ((c.track === T || c.track === legacyTrack) && nearF(c, x)) cands.push({ c, foreign: true }); });
+				let pick = null;
+				let pending = false;
+				cands.forEach((k) => {
+					const d = detailOf(k.c);
+					if (d === null) {
+						pending = true;
+						return;
+					}
+					if (!d) return;
+					const kindOk = d.kind === wantKind(x);
+					const certain = kindOk && (textOk(d, x) || (x.native && !k.foreign && apAt(x, k.c)));
+					const uncertain = kindOk && !certain;
+					if (!certain && !uncertain) return;
+					const score = (certain ? 4 : 0) + (k.c.track === T ? 2 : 0) + (Math.abs(k.c.sf - x.sf) <= 1 ? 1 : 0);
+					if (!pick || score > pick.score) pick = Object.assign({ d, certain, score }, k);
+				});
+				if (pending) return skip(x, "pending");
+				const place = () => {
+					ops.push(Object.assign({}, baseOp, { op: "place", phase: 4, g, track: T, sf: x.sf, ef: x.ef, own: null, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: null }));
+				};
+				if (pick && pick.c.track === T) {
+					const c = pick.c;
+					const bucket = pick.foreign ? plan.foreignAdopt : plan.adopt;
+					if (pick.certain) bucket.certain++;
+					else bucket.uncertain++;
+					const allow = pick.foreign ? o.adoptForeign && pick.certain : pick.certain ? o.adopt : o.adoptUncertain;
+					if (!allow) return conflict(x, "occupied", clipText(c) + (pick.certain ? "" : " (문장이 다름)"));
+					ownIds[c.nodeId] = true;
+					const own = { track: c.track, sf: c.sf, nodeId: c.nodeId };
+					if (Math.abs(c.sf - x.sf) <= 1) {
+						// 제자리 인식: 이름(태그)·속성·끝
+						ops.push(Object.assign({}, baseOp, { op: "adopt", phase: x.ef < c.ef ? 2 : 5, g, track: T, sf: c.sf, ef: x.ef, keepTime: false, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
+							src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, intent: { t: T, sf: x.sf, ef: x.ef } }));
+					} else {
+						// 옛 자리(ap·mmPrev)에 있는 클립: 인식하면서 줄 시간으로 옮긴다 (TrackItem.move: 효과·키가 남는다)
+						ops.push(Object.assign({}, baseOp, { op: "move", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
+							src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, adopting: true }));
+					}
+					return;
+				}
+				if (pick && pick.certain) {
+					// 기본 트랙(legacyTrack)에 있던 옛 클립 (나눈 레거시 목록): 화자 트랙에 새로 놓고 옛 클립은 nodeId로 지운다
+					const c = pick.c;
+					const deco = decoratedOf(pick.d, preset);
+					if (o.moveLegacy && (!deco || o.moveDecorated)) {
+						plan.legacyMove++;
+						ownIds[c.nodeId] = true;
+						ops.push(Object.assign({}, baseOp, { op: "legacyMove", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own: null, removeAfter: { track: c.track, nodeId: c.nodeId },
+							params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name }));
+						return;
+					}
+					if (deco) plan.legacyDecorated++;
+					plan.legacyKept.push(sub.id);
+					return place();
+				}
+				if (ap) {
+					plan.missing.push(sub.id);
+					if (!o.replaceMissing && !o.forceRegen[sub.id]) return skip(x, "missing");
+				}
+				return place();
+			}
+			// 우리 클립이 있다
+			const same = cur.track === T && Math.abs(cur.sf - x.sf) <= 1;
+			const apPos = ap && typeof ap.sf === "number" && typeof ap.t === "number";
+			const moved = apPos ? ap.t !== T || Math.abs(ap.sf - x.sf) > 1 || Math.abs(ap.ef - x.ef) > 1 : rowTimeChanged(rs, sub) || rs.mm === "time" || rs.mm === "both";
+			const retime = moved || o.restoreMoved || !!o.forceRegen[sub.id];
+			const g0 = typeof cur.g === "number" ? cur.g : 1;
+			const cef = ap && typeof ap.cef === "number" ? ap.cef : x.ef;
+			const hNow = hOf(g0, T, x.sf, x.ef);
+			if (!o.forceRegen[sub.id] && ap && ap.h === hNow && ((same && Math.abs(cur.ef - cef) <= 1) || (!same && !retime))) {
+				plan.none.push(sub.id);
+				if (!same) plan.userMoved.push(sub.id);
+				plan.rowOps[sub.id] = { none: true };
+				return;
+			}
+			const d = detailOf(cur);
+			if (d === null) return skip(x, "pending");
+			if (!d) return skip(x, "gone", "스캔 뒤 클립이 사라짐 — 다시 적용");
+			const kindMismatch = d.kind !== wantKind(x);
+			let tChanged = kindMismatch;
+			if (!tChanged && ap && ap.m) tChanged = normPath(ap.m) !== normPath(m);
+			else if (!tChanged && !x.native && preset.mogrtItemName && typeof d.pin === "string") tChanged = d.pin !== preset.mogrtItemName;
+			else if (!tChanged && x.native) tChanged = !(x.r.oldBaked && normPath(x.r.oldBaked) === normPath(m));
+			else if (!tChanged) plan.unverifiedTemplate.push(sub.id);
+			const oldVer = !x.native && !tChanged && !!preset.mogrtLs && Array.isArray(d.lay) && clipLs(d.lay) !== preset.mogrtLs;
+			if (oldVer) plan.oldVersion.push(sub.id);
+			const edited = !!(ap && ap.rh && d.kind === "ae" && textsHash(d.texts) !== ap.rh);
+			if (edited) plan.edited.push(sub.id);
+			const deco = decoratedOf(d, preset);
+			const ownM = (ap && ap.m) || x.r.oldBaked || (!kindMismatch ? preset.mogrtPath : null);
+			const changed = !ap || !ap.fh ? params : params.filter((p) => ap.fh[p.index] !== fhAll[p.index]);
+			const src = { track: cur.track, sf: cur.sf, ef: cur.ef, nodeId: cur.nodeId, name: cur.name, g: g0 };
+			const regenG = Math.max(g0, ap && typeof ap.g === "number" ? ap.g : 0) + 1;
+			const regenOwn = { track: cur.track, sf: cur.sf, nodeId: cur.nodeId };
+			const guardEdited = (op) => {
+				if (edited && writes(op) && !o.overwriteEdited) {
+					skip(x, "edited", "Premiere에서 고친 클립");
+					return true;
+				}
+				return false;
+			};
+			const needRegen = tChanged || (oldVer && o.upgradeOld) || !!o.forceRegen[sub.id];
+			if (needRegen) {
+				// 템플릿이 바뀌었다(또는 옛 버전 교체·이웃 복구): 먼저 지우고 새로 놓기 (replace). 되놓을 템플릿 경로를 모르는 네이티브는 충돌
+				if (!ownM && d.kind !== "ae") {
+					plan.unknownTemplate.push(sub.id);
+					return conflict(x, "template-unknown", clipText(cur));
+				}
+				if (deco && !o.moveDecorated && !o.forceRegen[sub.id]) {
+					plan.decorated.push(sub.id);
+					return skip(x, "decorated", "효과·키프레임이 있는 클립 (다시 놓지 않음)");
+				}
+				// 사용자가 옮긴 클립(시간은 그대로인 줄)은 그 자리·길이 그대로 바꾼다
+				const t = same || retime ? T : cur.track;
+				const sf = same || retime ? x.sf : cur.sf;
+				const ef = same || retime ? x.ef : Math.max(cur.sf + 1, cur.ef);
+				const op = Object.assign({}, baseOp, { op: "replace", phase: 3, g: regenG, track: t, sf, ef, own: Object.assign({ m: ownM || null }, regenOwn), params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), src, intent: { t: T, sf: x.sf, ef: x.ef } });
+				if (!o.forceRegen[sub.id] && guardEdited(op)) return;
+				if (oldVer && o.upgradeOld) plan.oldVersionSkipped++;
+				ops.push(op);
+				return;
+			}
+			if (same) {
+				const op = Object.assign({}, baseOp, { op: "update", phase: x.ef < cur.ef ? 2 : x.ef > cur.ef ? 5 : 2, g: g0, track: cur.track, sf: x.sf, ef: x.ef, keepTime: false, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
+					params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } });
+				if (guardEdited(op)) return;
+				ops.push(op);
+				return;
+			}
+			if (retime) {
+				if (cur.track === T) {
+					const op = Object.assign({}, baseOp, { op: "move", phase: 3, g: g0, track: T, sf: x.sf, ef: x.ef, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
+						params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src });
+					if (guardEdited(op)) return;
+					ops.push(op);
+					return;
+				}
+				if (deco && !o.moveDecorated) {
+					plan.decorated.push(sub.id);
+				} else {
+					const op = Object.assign({}, baseOp, { op: "moveRegen", phase: 3, g: regenG, track: T, sf: x.sf, ef: x.ef, own: regenOwn, params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), src });
+					if (guardEdited(op)) return;
+					ops.push(op);
+					return;
+				}
+			} else {
+				plan.userMoved.push(sub.id);
+			}
+			// 제자리 갱신 (사용자가 옮긴 클립, 또는 효과가 있어 옮기지 않는 클립): 속성·이름만, 시간은 그대로
+			const op = Object.assign({}, baseOp, { op: "update", phase: 2, g: g0, track: cur.track, sf: cur.sf, ef: cur.ef, keepTime: true, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
+				params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } });
+			if (guardEdited(op)) return;
+			ops.push(op);
+		});
+		// 목록 밖: 중단된 적용이 남긴 옛 gen, 목록에서 빠진 줄의 클립 (한 줄 적용에서는 보지 않는다)
+		const removals = [];
+		if (!o.single) {
+			idx.stale.forEach((c) => {
+				plan.cleanup.push({ uid: c.uid, track: c.track, nodeId: c.nodeId, name: c.name, g: c.g });
+				if (o.cleanupStale) removals.push({ uid: c.uid, id: c.id, track: c.track, nodeId: c.nodeId, expectName: c.name, g: c.g, why: "stale" });
+			});
+			const live = {};
+			all.forEach((s) => { live[s.id] = true; });
+			const trashWhy = (inp && inp.trash) || {};
+			Object.keys(idx.current).forEach((uid) => {
+				const c = idx.current[uid];
+				if (live[c.id]) return;
+				const why = trashWhy[c.id];
+				const ap = applied[uid];
+				let pre = false;
+				if ((why === "merge" || why === "replace") && ap && ap.rh) {
+					const d = detailOf(c);
+					pre = !!d && textsHash(d.texts) === ap.rh;
+				}
+				plan.orphans.push({ uid, id: c.id, track: c.track, nodeId: c.nodeId, name: c.name, g: c.g, pre, why: why === undefined ? null : why });
+				if (o.orphans === "all" || (o.orphans !== "none" && pre)) removals.push({ uid, id: c.id, track: c.track, nodeId: c.nodeId, expectName: c.name, g: c.g, why: "orphan" });
+			});
+		}
+		// 순서 (3단계 의존·순환 끊기) → 트랙 점유 흉내 (작업 뒤 범위): 충돌은 빼고, 새로 놓는 작업의 이웃(guard)·끝 맞춤을 정한다
+		const ord = orderOps(ops);
+		const allRemovals = removals.concat(ord.removals);
+		const st = {};
+		(scan.tracks || []).forEach((t) => {
+			st[t.i] = (t.clips || []).map((c) => ({ id: String(c.nodeId), sf: c.sf, ef: c.ef, own: !!ownIds[String(c.nodeId)], name: c.name || "" }));
+		});
+		const stOf = (t) => (st[t] = st[t] || []);
+		const drop = (t, id) => {
+			const L = stOf(t);
+			const i = L.findIndex((c) => c.id === id);
+			if (i !== -1) L.splice(i, 1);
+		};
+		allRemovals.forEach((r) => drop(r.track, String(r.nodeId)));
+		const itemText = (t, c) => trackName(t) + " " + secOf(c.sf).toFixed(1) + "~" + secOf(c.ef).toFixed(1) + (c.name ? " " + c.name : "");
+		// 새로 놓는 자리 확인 (호스트의 자리 확인 occupy와 같은 규칙, 프레임 단위)
+		const checkWindow = (t, sf, ef, D, skipIds) => {
+			const hi = sf + Math.max(ef - sf, D || 0);
+			let efC = ef;
+			let clamped = false;
+			const guard = [];
+			const L = stOf(t).slice().sort((a, b) => a.sf - b.sf);
+			for (let i = 0; i < L.length; i++) {
+				const c = L[i];
+				if (skipIds[c.id]) continue;
+				if (c.ef <= sf || c.sf >= hi) continue;
+				if (c.sf <= sf) {
+					if (c.ef > sf) return { conflict: c.own ? "occupied-own" : "occupied", detail: itemText(t, c) };
+					continue;
+				}
+				if (c.sf < efC) {
+					if (!c.own) return { conflict: "occupied", detail: itemText(t, c) };
+					efC = c.sf;
+					clamped = true;
+					guard.push(c.id);
+					continue;
+				}
+				if (!c.own) return { conflict: "tail", detail: itemText(t, c) + " (템플릿 길이 " + secOf(D).toFixed(1) + "초 안)" };
+				guard.push(c.id);
+			}
+			if (efC - sf < 1) return { conflict: "occupied", detail: "길이 0" };
+			return { ef: efC, clamped, guard };
+		};
+		const final = [];
+		const reject = (op, why, detail) => {
+			plan.conflicts.push({ id: op.id, uid: op.uid, why, detail: detail || "" });
+			plan.rowOps[op.id] = { skip: "conflict", why, detail: detail || "" };
+		};
+		const nextStart = (t, fromSf, selfId) => {
+			let best = null;
+			stOf(t).forEach((c) => { if (c.id !== selfId && c.sf > fromSf && (best === null || c.sf < best)) best = c.sf; });
+			return best;
+		};
+		ord.ordered.forEach((op) => {
+			if (op.op === "update" || op.op === "adopt") {
+				const item = stOf(op.own.track).find((c) => c.id === String(op.own.nodeId));
+				if (item && !op.keepTime) {
+					const nx = nextStart(op.own.track, item.sf, item.id);
+					item.ef = nx !== null && nx < op.ef ? nx : op.ef;
+				}
+				final.push(op);
+				return;
+			}
+			if (op.op === "move") {
+				const item = stOf(op.own.track).find((c) => c.id === String(op.own.nodeId));
+				let ef = op.ef;
+				for (const c of stOf(op.track)) {
+					if (c === item || c.ef <= op.sf || c.sf >= ef) continue;
+					if (c.sf <= op.sf) {
+						if (c.ef > op.sf) return reject(op, c.own ? "occupied-own" : "occupied", itemText(op.track, c));
+						continue;
+					}
+					ef = c.sf;
+				}
+				if (ef - op.sf < 1) return reject(op, "occupied", "길이 0");
+				if (item) {
+					item.sf = op.sf;
+					item.ef = ef;
+				}
+				final.push(op);
+				return;
+			}
+			// place · replace · moveRegen · legacyMove: 템플릿 길이 창을 확인하고 옛 클립을 치운 뒤 새 클립을 더한다
+			const skipIds = {};
+			if (op.own && op.own.track === op.track) skipIds[String(op.own.nodeId)] = true;
+			if (op.removeAfter && op.removeAfter.track === op.track) skipIds[String(op.removeAfter.nodeId)] = true;
+			const w = checkWindow(op.track, op.sf, op.ef, op.D, skipIds);
+			if (w.conflict) return reject(op, w.conflict, w.detail);
+			op.guard = w.guard;
+			if (op.own) drop(op.own.track, String(op.own.nodeId));
+			if (op.removeAfter) drop(op.removeAfter.track, String(op.removeAfter.nodeId));
+			stOf(op.track).push({ id: "new:" + op.uid, sf: op.sf, ef: w.ef, own: true, name: op.name || "" });
+			final.push(op);
+		});
+		plan.ops = final;
+		plan.removals = allRemovals;
+		final.forEach((op) => { plan.rowOps[op.id] = op; });
+		// 화자별 요약
+		(mi.castOrder || []).forEach((K) => {
+			if (!rt.tracks[K]) return;
+			const counts = { place: 0, update: 0, adopt: 0, move: 0, moveRegen: 0, legacyMove: 0, replace: 0, none: 0, skip: 0, rows: 0 };
+			infos.forEach((x) => {
+				if (x.K !== K) return;
+				counts.rows++;
+				const ro = plan.rowOps[x.sub.id];
+				if (!ro) return;
+				if (ro.none) counts.none++;
+				else if (ro.skip) counts.skip++;
+				else if (counts[ro.op] !== undefined) counts[ro.op]++;
+			});
+			plan.perSpeaker[K] = Object.assign({ key: K }, rt.tracks[K], { counts });
+		});
+		return plan;
+	}
+	// 배치 실행 결과 상태 → 검증된 적용(ap·mm 지움)인가 / 썼지만 일부 속성이 빠졌나(partial: mm 남김)
+	const PLACE_OK = { placed: true, updated: true, replaced: true, moved: true, adopted: true };
+	// salt 복구 (계획서 §6.7): salt가 비었을 때(v27이 mi를 버리고 저장했고 cast.json도 쓸 수 없다) 스캔의 태그 클립 중 id가 살아 있는 줄인 것을
+	// salt마다 20개까지 표본으로 되읽어, 80% 이상이 그 줄의 캡션(normText)을 담으면 그 salt를 받는다 (id만으로는 받지 않는다).
+	//   rowsById {id: {caps: [normText 캡션…]}}, details {nodeId: 되읽기}
+	// → {salt: 받을 salt | null, need: [{track, nodeId}] 아직 되읽지 않은 표본 (읽고 다시 부른다)}
+	function recoverSalt(scan, rowsById, details) {
+		const idx = scanIndex(scan, "");
+		const bySalt = {};
+		idx.foreignMi.forEach((c) => { if (rowsById && rowsById[c.id]) (bySalt[c.salt] = bySalt[c.salt] || []).push(c); });
+		const need = [];
+		let best = null;
+		Object.keys(bySalt).sort().forEach((s) => {
+			const sample = bySalt[s].slice(0, 20);
+			let ok = 0;
+			let seen = 0;
+			sample.forEach((c) => {
+				const d = details && details[c.nodeId];
+				if (!d) {
+					need.push({ track: c.track, nodeId: c.nodeId });
+					return;
+				}
+				seen++;
+				const caps = rowsById[c.id].caps || [];
+				if ((d.texts || []).some((t) => { const n = normText(t); return !!n && caps.some((cp) => n.indexOf(cp) !== -1); })) ok++;
+			});
+			if (seen > 0 && seen === sample.length && ok / seen >= 0.8 && (!best || sample.length > best.n)) best = { salt: s, n: sample.length };
+		});
+		return { salt: need.length ? null : best ? best.salt : null, need };
 	}
 	// app.js 원문에서 //#region <name> 본문을 잘라낸다 (표식 줄 제외, 줄바꿈 LF). 없으면 null.
 	// tests/lib/loadRegions.js의 sliceRegion과 같은 규칙: coreHash = fnv1a32(이 region 본문)
@@ -6631,6 +7312,7 @@ var modalState = {
 		box.innerHTML = "";
 		if (!order.length) {
 			bar.style.display = "none";
+			_renderCastTrackSummary(null);
 			return;
 		}
 		bar.style.display = "";
@@ -6644,6 +7326,23 @@ var modalState = {
 		const counts = _castCounts();
 		const choices = _impPresetChoices();
 		order.forEach((K) => box.appendChild(_castRowEl(K, pv, counts[K] || 0, choices)));
+		_renderCastTrackSummary(pv);
+	}
+	// 적용 바: 다화자면 트랙 칸 이름이 '기본 트랙'이고 옆에 "C1→V3 · C2→V4 (새)" (S2-4). 단일 화자는 v27 그대로 '트랙'
+	function _renderCastTrackSummary(pv) {
+		const lbl = document.getElementById("trackSelLabel");
+		const sum = document.getElementById("castTrackSummary");
+		const order = pv ? _castKeys().filter((K) => pv.tracks[K]) : [];
+		if (lbl) lbl.textContent = order.length ? "기본 트랙" : "트랙";
+		if (!sum) return;
+		if (!order.length) {
+			sum.style.display = "none";
+			sum.textContent = "";
+			return;
+		}
+		sum.style.display = "";
+		sum.textContent = order.map((K) => K + "→" + _trackName(pv.tracks[K].track) + (pv.tracks[K].create ? " (새)" : "")).join(" · ");
+		sum.title = order.map((K) => K + " " + _castName(K) + " → " + _trackName(pv.tracks[K].track) + (pv.tracks[K].auto ? " (자동)" : " (고정)")).join("\n");
 	}
 	function _castCounts() {
 		const counts = {};
@@ -7595,9 +8294,9 @@ var modalState = {
 	}
 	async function updateSingleClip(sub) {
 		const rs = state.rowStates[sub.id];
-		// 화자 줄은 v27 한 트랙 경로로 보내지 않는다 (화자별 트랙 배치는 S2-4)
+		// 화자 줄: 한 줄 계획으로 화자 트랙에 (src/mi/apply.ts _miApply, 점검 창은 충돌·고침·옛 버전·새 트랙일 때만)
 		if (sub.spk) {
-			_setStatus(CAST_APPLY_PENDING_MSG, "err");
+			await _miApply([sub], { single: true });
 			return;
 		}
 		if (!rs.presetId) {
@@ -7798,12 +8497,14 @@ var modalState = {
 	//   distribute  C번호 파일 + 화자 없는 기존 줄 → 같은 창의 분배 모드 (기존 목록을 화자로 나누기)
 	// 병합 규칙(짝 맞추기·3-way·휴지통 2차·분배)은 모두 core(importIntoData, buildMergePlan, distributeLegacy)에 있다.
 	// 창은 바꾸기 전 상태의 사본으로 미리 계산해 통계를 보이고, [가져오기]에서 같은 계산을 한 번 더 해 넣는다.
-	// 여러 파일 가져오기는 S2-4까지 플래그(MI_CAST_ENABLED) 뒤에 있다. DEV·하드 테스트는
-	// 코드를 고치지 않고 window._mogrtDebug.setMiCast(true)로 켠다.
+	// 여러 파일 가져오기는 플래그(MI_CAST_ENABLED, S2-4부터 true) 뒤에 있다. DEV·하드 테스트는
+	// 코드를 고치지 않고 window._mogrtDebug.setMiCast(false)로 끈다 (true는 강제로 켬).
 	// 화자 이름은 파일 이름에서 가져오지 않는다 (입력 > 키).
 	// ─────────────────────────────────────────────────────────────
 	function _miCastEnabled() {
-		return MI_CAST_ENABLED || !!(window._mogrtDebug && window._mogrtDebug.miCast === true);
+		const d = window._mogrtDebug ? window._mogrtDebug.miCast : undefined;
+		if (d === false) return false; // setMiCast(false): 레거시 경로 시험 (플래그를 켠 뒤에도)
+		return MI_CAST_ENABLED || d === true;
 	}
 	// #srtInput의 multiple을 플래그에 맞춘다 (플래그가 꺼져 있으면 속성 없음 = v27)
 	function _syncSrtInputMultiple() {
@@ -7811,7 +8512,7 @@ var modalState = {
 		if (input) input.multiple = _miCastEnabled();
 	}
 	window._mogrtDebug.setMiCast = (on) => {
-		window._mogrtDebug.miCast = on === true;
+		window._mogrtDebug.miCast = on === true ? true : on === false ? false : undefined;
 		_syncSrtInputMultiple();
 		return _miCastEnabled();
 	};
@@ -7844,6 +8545,10 @@ var modalState = {
 		// 부팅 게이트: 시퀀스 키가 정해지기 전에는 열지 않는다 (label은 disabled지만 이중으로 막는다)
 		if (!_keysResolved) {
 			setStatus("시퀀스를 열면 SRT를 열 수 있습니다", "err");
+			return null;
+		}
+		if (_miBusy) {
+			setStatus("타임라인 적용 중에는 SRT를 열 수 없습니다", "err");
 			return null;
 		}
 		const list = Array.from(files || []).filter(Boolean);
@@ -8600,7 +9305,7 @@ var modalState = {
 				rows: state.subtitles.length,
 				castMode: _castMode(),
 				speakers,
-				busy: false,
+				busy: _miBusy,
 				coreHash: _coreHash()
 			});
 		},
@@ -8678,6 +9383,25 @@ var modalState = {
 			const rep = importIntoData(data, r.job, { now: Date.now(), salt: state.mi.salt || "prev", presets: state.presets, trackValue: _trackValueNum(), castDefaults: _loadCastDefaults() });
 			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(data) !== before)));
 		},
+		// 화자별 배치 계획 (타임라인을 읽기만 한다. 바꾸지 않는다). args {ids?: [줄 id] (없으면 화자 줄 전부), single?, opts?: 점검 선택지}
+		// → {ok, plan: {ops: {종류: 수}, removals, none, minCount, tracks, conflicts, edited, missing, …}, lines: [점검 요약 줄]}
+		plan: async (args) => {
+			const r = _cmdTargets(args);
+			if (r.error) return _cmdErr("bad-args", r.error);
+			const res = await _miApply(r.subs, { dryRun: true, auto: true, single: args.single === true, pf: r.pf });
+			if (!res || res.ok !== true) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
+			return _cmdOk(_cmdClone({ plan: res.plan, lines: res.lines }));
+		},
+		// 화자별 배치 실행 = ▶(화자 줄)와 같다. 점검 창 없이 opts(없으면 기본 선택지)로. args는 plan과 같다.
+		// agent는 승인 카드(M5.4) 전까지 needs-approval → {created, updated, moved, adopted, replaced, removed, partial, conflict, failed, none, skipped, stopped, runId}
+		apply: async (args, ctx) => {
+			if (ctx.source === "agent") return _cmdErr("needs-approval", "타임라인 적용은 패널에서 승인해야 합니다");
+			const r = _cmdTargets(args);
+			if (r.error) return _cmdErr("bad-args", r.error);
+			const res = await _miApply(r.subs, { auto: true, single: args.single === true, pf: r.pf });
+			if (!res || (res.ok !== true && !res.runId && res.error)) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
+			return _cmdOk(_cmdClone(res));
+		},
 		// 병합(가져오기)을 넣는다: 가져오기 창의 [가져오기]와 같다 (안전 지점 하나 → 적용 → 자동 항목 하나, 변화가 없으면 아무것도 쓰지 않는다).
 		// args는 mergePreview와 같다. agent는 승인 카드(M5.4) 전까지 needs-approval
 		mergeCommit: (args, ctx) => {
@@ -8689,6 +9413,25 @@ var modalState = {
 			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(_sessionClone()) !== before)));
 		}
 	};
+	// plan·apply 인자 → {subs, pf} | {error}. ids: 줄 id 배열 (없으면 화자 줄 전부), opts: 점검 선택지 (MI_PF_DEFAULTS의 키만)
+	function _cmdTargets(args) {
+		let subs = state.subtitles.filter((s) => s.spk);
+		if (args.ids !== undefined) {
+			if (!Array.isArray(args.ids) || !args.ids.every((x) => Number.isInteger(x))) return { error: "ids는 줄 id(정수) 배열" };
+			const want = _idSet(args.ids);
+			subs = state.subtitles.filter((s) => want[s.id]);
+			if (subs.length !== args.ids.length) return { error: "없는 줄 id가 있다" };
+		}
+		const pf = {};
+		if (args.opts !== undefined) {
+			if (!args.opts || typeof args.opts !== "object" || Array.isArray(args.opts)) return { error: "opts는 객체" };
+			for (const k of Object.keys(args.opts)) {
+				if (!Object.prototype.hasOwnProperty.call(MI_PF_DEFAULTS, k)) return { error: "모르는 선택지: " + k };
+				pf[k] = args.opts[k];
+			}
+		}
+		return { subs, pf };
+	}
 	// mergePreview·mergeCommit 인자 → {job} | {error, code}
 	function _cmdImportJob(args) {
 		if (!_keysResolved) return { error: "시퀀스를 열면 SRT를 열 수 있습니다", code: "no-sequence" };
@@ -9600,6 +10343,638 @@ var modalState = {
 	window._mogrtDebug.miHostOk = () => _miHostOk();
 	window._mogrtDebug.callMi = (name, payload) => _callMi(name, payload);
 	window._mogrtDebug.hostMi = host.mi;
+
+	// ─────────────────────────────────────────────────────────────
+	// 화자별 배치 (다화자 ▶·↑, S2-4) — 계획서 §6, spec placement
+	//
+	// _miApply(대상 줄, opts):
+	//   1) 호스트 확인 (_miHostOk: 실행마다 ping, v28·같은 빌드), 활성 시퀀스 = 패널 시퀀스. seqId를 한 번 잡아 모든 호출에 싣는다
+	//   2) 네이티브 줄 굽기(문구를 .mogrt 사본에, S1-11), AE 템플릿 길이(preset.mogrtDurSec, 없으면 definition.json)
+	//   3) getTracks: V1 뺀 비디오 트랙, 대상 줄 자리 ±30초 (+ 템플릿 길이). 시작·끝·nodeId·이름만 (S0-3 결정 12)
+	//   4) salt가 비었으면 복구 (태그 클립 표본의 80%가 줄 문장을 담을 때만, remapped면 하지 않는다), 못 하면 새로
+	//   5) core planPlacement → 되읽기가 필요한 클립(readClipTexts, 40개씩)을 읽고 다시 계획 (최대 4번)
+	//   6) 적용 전 점검 (#preflightModal): 볼 것이 있을 때만. 한 줄(↑)은 충돌·Premiere에서 고침·옛 버전·새 트랙일 때만.
+	//      고른 선택지가 기본값과 다르면 다시 계획한다
+	//   7) ensureVideoTracks (새 트랙은 배치 전에) → last_apply.json {complete: false}
+	//   8) 제거(removeClips: 옛 gen·목록에서 빠진 줄의 클립) → 청크(placeChunk, 8개, 예산 7초: done이 보낸 수보다 적으면 나머지는 다음 청크로)
+	//      청크마다 last_apply를 다시 쓰고, 진행률·[중지](청크 사이)·20초 워치독. 이웃이 망가진 줄(damaged)은 다시 스캔해
+	//      줄 자리에 다시 놓는다 (분기 C, 최대 2번)
+	//   9) 결과 → mi.applied(clipLs·텍스트 해시), rs.ap (검증된 줄은 mm을 지운다. partial은 남긴다), 자동 화자 autoTrack, 프리셋 학습 필드,
+	//      줄 표시(.sub-res), last_apply complete, 히스토리 '타임라인 적용 (n개)'
+	// 실행 중에는 _miBusy: 폴러·30초 MOGRT 재스캔·SRT 열기·▶·↑를 멈추고 #miBusy가 패널을 덮는다.
+	// 빈 응답·EvalScript error.·예외·seq-mismatch 같은 호스트 실패는 그 자리에서 멈춘다 ("중단됨 — 다시 적용하면 이어서 진행").
+	// 계획은 타임라인에서 다시 세우므로 같은 결과가 나온다 (이미 놓은 줄은 그대로 = 보내지 않음).
+	// ─────────────────────────────────────────────────────────────
+	const MI_WATCHDOG_MS = 20000;
+	const MI_WATCHDOG_MSG = "Premiere에 대화상자가 떠 있을 수 있습니다 — Premiere 창을 확인하세요";
+	const MI_BUDGET_MS = 7000;
+	const MI_STOPPED_MSG = "중단됨 — 다시 적용하면 이어서 진행";
+	// 적용 전 점검 선택지 기본값 (계획서 §8 #preflightModal. 사용자 결정: 지운 클립은 다시 놓기, 고친 클립은 건너뛰기,
+	// 나눈 레거시 목록의 옛 클립은 화자 트랙으로 옮기되 효과가 있는 클립은 빼기, 옛 버전 MOGRT 클립은 속성 이름으로 갱신)
+	const MI_PF_DEFAULTS = { adopt: true, adoptUncertain: false, adoptForeign: true, moveLegacy: true, orphans: "pre", cleanupStale: true, replaceMissing: true,
+		overwriteEdited: false, restoreMoved: false, moveDecorated: false, upgradeOld: false };
+	const MI_SKIP_TEXT = {
+		"no-speaker": "화자 없음", "no-preset": "프리셋 없음", "bake-failed": "네이티브 굽기 실패", "no-params": "속성 없음", "no-caption-field": "캡션 필드를 찾지 못함",
+		locked: "잠김", "zero-length": "길이 0 (같은 화자 다음 줄과 시작이 같음)", dup: "중복", missing: "타임라인에 클립 없음 (다시 놓기 끔)",
+		edited: "Premiere에서 고침", decorated: "효과 있어 제자리", pending: "클립을 읽지 못함", gone: "클립이 사라짐"
+	};
+	var _miPfClose = null; // 열린 적용 전 점검을 닫는 함수 (시퀀스 전환 등)
+	function _miShowBusy(text) {
+		const el = document.getElementById("miBusy");
+		if (el) el.style.display = "";
+		const t = document.getElementById("miBusyText");
+		if (t) t.textContent = text;
+	}
+	function _miHideBusy() {
+		const el = document.getElementById("miBusy");
+		if (el) el.style.display = "none";
+		const w = document.getElementById("miBusyWatch");
+		if (w) { w.style.display = "none"; w.textContent = ""; }
+	}
+	document.getElementById("miBusyStop")?.addEventListener("click", () => {
+		if (!_miBusy) return;
+		_miCancel = true;
+		const t = document.getElementById("miBusyText");
+		if (t) t.textContent += " — 지금 청크가 끝나면 멈춥니다";
+	});
+	// 호스트 호출 하나를 20초 워치독과 함께 (대화상자가 Premiere를 막으면 evalScript가 돌아오지 않는다, S0-3 v)
+	async function _miCallWatch(fn) {
+		const w = document.getElementById("miBusyWatch");
+		const timer = setTimeout(() => {
+			if (w) { w.textContent = MI_WATCHDOG_MSG; w.style.display = ""; }
+		}, MI_WATCHDOG_MS);
+		try {
+			return await fn();
+		} finally {
+			clearTimeout(timer);
+			if (w) { w.style.display = "none"; w.textContent = ""; }
+		}
+	}
+	function _miHostFail(name, r) {
+		const e = new Error(name + ": " + ((r && r.error) || "응답 없음") + (r && r.detail ? " (" + r.detail + ")" : ""));
+		e.miHost = r || null;
+		return e;
+	}
+	// 화자(spk) 줄이 있는데 화자 표에 없는 키 (v27이 mi를 버리고 저장하고 cast.json도 없을 때): 화자 표에 다시 만든다
+	function _miEnsureCast() {
+		let n = 0;
+		state.subtitles.forEach((s) => {
+			if (s && s.spk && !state.mi.cast[s.spk]) {
+				_ensureCastEntry(s.spk);
+				n++;
+			}
+		});
+		return n;
+	}
+	// 클립 되읽기 (40개씩) → details[nodeId] = 결과 (찾지 못하면 {found: false})
+	async function _miReadDetails(list, details, seqId) {
+		for (let i = 0; i < list.length; i += READ_BATCH) {
+			const part = list.slice(i, i + READ_BATCH);
+			const r = await _miCallWatch(() => host.mi.readTexts({ seqId, items: part.map((x) => ({ track: x.track, nodeId: x.nodeId })), want: { texts: true, lay: true, deco: true, params: false } }));
+			if (!r || r.ok !== true) throw _miHostFail("readClipTexts", r);
+			(r.results || []).forEach((x) => { if (x && x.nodeId !== undefined) details[String(x.nodeId)] = x.found ? x : { found: false }; });
+			part.forEach((x) => { if (!details[x.nodeId]) details[x.nodeId] = { found: false }; });
+		}
+	}
+	function _writeLastApply(la) {
+		try {
+			if (!_keysResolved || !la) return false;
+			const path = _getLastApplyPath();
+			return path ? _fsWrite(path, la) : false;
+		} catch (_) { return false; }
+	}
+	function _readLastApply() {
+		const path = _getLastApplyPath();
+		const d = path ? _fsRead(path) : null;
+		return d && typeof d === "object" && !Array.isArray(d) ? d : null;
+	}
+	// salt가 비었을 때 (화자 줄은 있다): 스캔의 태그 클립으로 문장까지 확인해 받거나(remapped가 아닐 때만), 새로 만든다
+	async function _miEnsureSalt(scan, all, ctx) {
+		let salt = null;
+		if (!state.mi.remapped) {
+			const rowsById = {};
+			all.forEach((s) => {
+				const rs = state.rowStates[s.id];
+				const preset = rs && rs.presetId ? state.presets[rs.presetId] : null;
+				const cap = preset ? rowCaptionValue(rs, preset) : null;
+				rowsById[s.id] = { caps: [cap, s.text].map((t) => normText(t)).filter(Boolean) };
+			});
+			const dets = {};
+			for (let it = 0; it < 3; it++) {
+				const r = recoverSalt(scan, rowsById, dets);
+				if (!r.need.length) {
+					salt = r.salt;
+					break;
+				}
+				await _miReadDetails(r.need, dets, ctx.seqId);
+			}
+		}
+		state.mi.salt = salt || _mintSalt();
+		ctx.saltRecovered = !!salt;
+		saveSessionToStorage();
+	}
+	// 줄들의 계획: 줄 입력(굽기·템플릿 길이, 줄마다 한 번) → 스캔 → (salt) → planPlacement ↔ 되읽기
+	async function _miPlanFor(subs, pf, ctx) {
+		const rowsIn = [];
+		for (const sub of subs) {
+			if (!ctx.rowIn[sub.id]) {
+				const rs = state.rowStates[sub.id] || {};
+				const preset = rs.presetId ? state.presets[rs.presetId] || null : null;
+				const row = { sub, rs, preset, baked: null, bakeWhy: null, oldBaked: null };
+				if (preset && _isNativePreset(preset)) {
+					_miShowBusy("네이티브 템플릿에 문구 굽는 중… " + rowLabel(sub, true));
+					const bk = await _bakeRow(sub, rs, preset);
+					if (bk.ok) row.baked = { path: bk.path, key: bk.key, durSec: bk.durSec };
+					else row.bakeWhy = _bakeWhy(bk);
+					if (rs.ap && rs.ap.nk && _bakedExists(rs.ap.nk)) row.oldBaked = _bakedPath(rs.ap.nk);
+				} else if (preset && preset.mogrtPath && !(Number(preset.mogrtDurSec) > 0)) {
+					const k = normPath(preset.mogrtPath);
+					if (ctx.durs[k] === undefined) ctx.durs[k] = await _templateDurSec(preset.mogrtPath);
+				}
+				ctx.rowIn[sub.id] = row;
+			}
+			rowsIn.push(ctx.rowIn[sub.id]);
+		}
+		const all = state.subtitles.filter((s) => s && s.spk);
+		const fr = speakerFrames(all, ctx.ft);
+		let lo = Infinity;
+		let hi = -Infinity;
+		const see = (a, b) => {
+			if (isFinite(a) && a < lo) lo = a;
+			if (isFinite(b) && b > hi) hi = b;
+		};
+		subs.forEach((s) => {
+			const f = fr[s.id];
+			if (f) see(f.sf, f.ef);
+			const ap = state.mi.salt ? state.mi.applied[state.mi.salt + "-" + s.id] : null;
+			if (ap && typeof ap.sf === "number") see(ap.sf, typeof ap.cef === "number" ? ap.cef : ap.ef);
+			const rs = state.rowStates[s.id];
+			const loc = rs ? applyLocate(rs, s) : null;
+			if (loc && loc.from !== "sub") see(frameOf(loc.s, ctx.ft), frameOf(loc.e, ctx.ft));
+		});
+		const pad = frameOf(SCAN_PAD_SEC + PLACE_DUR_FALLBACK * 2, ctx.ft);
+		_miShowBusy("타임라인 읽는 중…");
+		const scan = await _miCallWatch(() => host.mi.getTracks({ seqId: ctx.seqId, tracks: null, fromFrame: Math.max(0, lo - pad), toFrame: hi + pad }));
+		if (!scan || scan.ok !== true) throw _miHostFail("getTracks", scan);
+		_miNumTracks = scan.numVideoTracks;
+		if (!state.mi.salt) await _miEnsureSalt(scan, all, ctx);
+		const trash = {};
+		(state.trashBin || []).forEach((t) => { if (t && t.sub) trash[t.sub.id] = t.why || ""; });
+		let plan = null;
+		for (let it = 0; it < 4; it++) {
+			plan = planPlacement({ rows: rowsIn, allRows: all, trash, mi: state.mi, base: ctx.base, scan, details: ctx.details, durs: ctx.durs, opts: pf });
+			const reads = plan.needReads.filter((r) => !ctx.details[r.nodeId]);
+			if (!reads.length) break;
+			_miShowBusy("클립 읽는 중… (" + reads.length + "개)");
+			await _miReadDetails(reads, ctx.details, ctx.seqId);
+		}
+		// nodeId → uid (이웃이 망가진 클립의 줄 찾기): 우리 태그 클립, 인식·옮길 클립
+		const idx = scanIndex(scan, state.mi.salt);
+		Object.keys(idx.own).forEach((uid) => idx.own[uid].forEach((c) => { ctx.nodeToUid[c.nodeId] = uid; }));
+		plan.ops.forEach((op) => {
+			if (op.own) ctx.nodeToUid[String(op.own.nodeId)] = op.uid;
+			if (op.removeAfter) ctx.nodeToUid[String(op.removeAfter.nodeId)] = op.uid;
+		});
+		plan.scanTracks = scan.numVideoTracks;
+		return plan;
+	}
+	// 적용 전 점검이 필요한가 (한 줄 ↑은 충돌·Premiere에서 고침·옛 버전·새 트랙일 때만)
+	function _miNeedsPreflight(plan, single, legacyN) {
+		if (single) return plan.conflicts.length > 0 || plan.edited.length > 0 || plan.oldVersion.length > 0 || plan.minCount > 0;
+		return plan.minCount > 0 || plan.conflicts.length > 0 || plan.edited.length > 0 || plan.missing.length > 0 ||
+			plan.adopt.certain + plan.adopt.uncertain + plan.foreignAdopt.certain + plan.foreignAdopt.uncertain > 0 ||
+			plan.legacyMove > 0 || plan.legacyKept.length > 0 || plan.orphans.length > 0 || plan.cleanup.length > 0 || plan.decorated.length > 0 ||
+			plan.legacyDecorated > 0 || plan.oldVersion.length > 0 || plan.unknownTemplate.length > 0 || plan.dup.length > 0 || plan.locked.length > 0 ||
+			plan.bakeFailed.length > 0 || plan.noCaption.length > 0 || plan.blocked.length > 0 || plan.userMoved.length > 0 || legacyN > 0;
+	}
+	// 적용 전 점검 요약 줄 [[문구, "" | "warn" | "err"]]
+	function _miSummaryLines(plan, ctx) {
+		const lines = [];
+		const tn = (t) => "V" + (t + 1);
+		const parts = [];
+		let target = 0;
+		Object.keys(plan.perSpeaker).forEach((K) => {
+			const p = plan.perSpeaker[K];
+			const n = p.counts.rows - p.counts.none - p.counts.skip;
+			target += p.counts.rows;
+			parts.push(K + " " + _castName(K) + " " + tn(p.track) + " " + n);
+		});
+		lines.push(["배치 " + target + "줄: " + parts.join(" · ") + (plan.none.length ? " (변경 없음 " + plan.none.length + "줄은 보내지 않음)" : ""), ""]);
+		if (plan.minCount > 0) {
+			const made = Object.keys(plan.tracks).filter((K) => plan.tracks[K].create).map((K) => tn(plan.tracks[K].track));
+			const n = Math.max(plan.tracksToAdd, made.length);
+			lines.push(["새 비디오 트랙 " + n + "개" + (made.length ? " (" + made.join(", ") + ")" : "") + (n > 4 ? " — 4개가 넘습니다. 기본 트랙과 화자 트랙을 확인하세요" : ""), n > 4 ? "warn" : ""]);
+		}
+		if (plan.overlaps) lines.push(["같은 화자 겹침 " + plan.overlaps + "곳 → 앞 자막 끝 맞춤", ""]);
+		plan.blocked.forEach((b) => lines.push([b.keys.join("과 ") + "가 " + tn(b.track) + "에서 겹칩니다 — 트랙을 바꾸세요", "err"]));
+		const conflictN = plan.conflicts.filter((c) => c.why !== "pinned-overlap").length;
+		if (conflictN) lines.push(["다른 클립과 겹쳐 건너뜀 " + conflictN + "줄", "err"]);
+		const lockedK = Object.keys(plan.tracks).filter((K) => plan.tracks[K].locked);
+		lockedK.forEach((K) => lines.push(["잠긴 트랙 " + tn(plan.tracks[K].track) + " → " + K + " 건너뜀", "warn"]));
+		if (plan.dup.length) lines.push(["같은 태그 클립 (자르기?) " + plan.dup.length + "개 건너뜀 — 하나를 지우고 다시 적용", "warn"]);
+		if (plan.noPreset.length) lines.push(["프리셋 없는 줄 " + plan.noPreset.length + "개 건너뜀", ""]);
+		if (plan.unverifiedTemplate.length) lines.push(["템플릿 확인 안 됨 " + plan.unverifiedTemplate.length + "개 — 같은 MOGRT로 보고 갱신", ""]);
+		if (plan.staleLayoutRows) lines.push(["옛 구조 줄 " + plan.staleLayoutRows + "개 — 속성 이름으로 맞춰 적용", ""]);
+		if (plan.oldVersion.length) lines.push(["옛 버전 MOGRT로 놓인 클립 " + plan.oldVersion.length + "개 — 속성 이름으로 갱신 (새 버전 전용 속성은 적용 안 됨)", "warn"]);
+		if (plan.decorated.length + plan.legacyDecorated) lines.push(["효과·키프레임이 있는 클립 " + (plan.decorated.length + plan.legacyDecorated) + "개는 자리를 옮기지 않음", "warn"]);
+		if (plan.legacyKept.length) lines.push(["기본 트랙의 옛 클립을 남긴 줄 " + plan.legacyKept.length + "개 — 화면에 두 번 나옵니다", "warn"]);
+		if (plan.unknownTemplate.length) lines.push(["템플릿을 알 수 없는 네이티브 클립 " + plan.unknownTemplate.length + "개 건너뜀", "warn"]);
+		if (plan.bakeFailed.length) lines.push(["네이티브 문구를 굽지 못한 줄 " + plan.bakeFailed.length + "개 건너뜀", "err"]);
+		if (plan.noCaption.length) lines.push(["캡션 필드를 찾지 못한 줄 " + plan.noCaption.length + "개 건너뜀", "warn"]);
+		if (plan.zeroLength.length) lines.push(["길이가 0인 줄 " + plan.zeroLength.length + "개 건너뜀 (같은 화자 다음 줄과 시작이 같다)", "warn"]);
+		if (ctx && ctx.legacyN) lines.push(["화자 없는 줄 " + ctx.legacyN + "개는 건너뜀", "warn"]);
+		return lines;
+	}
+	// #preflightModal → 고른 선택지(MI_PF_DEFAULTS 모양) | null (취소)
+	function _miPreflight(plan, ctx) {
+		return new Promise((resolve) => {
+			const modal = document.getElementById("preflightModal");
+			const okBtn = document.getElementById("pfOk");
+			const noBtn = document.getElementById("pfCancel");
+			if (!modal || !okBtn || !noBtn) {
+				resolve(Object.assign({}, MI_PF_DEFAULTS));
+				return;
+			}
+			const box = document.getElementById("pfSummary");
+			if (box) {
+				box.innerHTML = "";
+				_miSummaryLines(plan, ctx).forEach(([text, cls]) => {
+					const el = document.createElement("div");
+					el.className = "pf-line" + (cls ? " " + cls : "");
+					el.textContent = text;
+					box.appendChild(el);
+				});
+			}
+			const tn = (t) => "V" + (t + 1);
+			const opt = (id, count, label, def) => {
+				const cb = document.getElementById(id);
+				if (!cb) return;
+				const row = cb.closest("label");
+				if (row) row.style.display = count > 0 ? "" : "none";
+				const sp = row && row.querySelector("span");
+				if (sp) sp.textContent = label;
+				cb.checked = def;
+			};
+			const pre = plan.orphans.filter((x) => x.pre).length;
+			const decoN = plan.decorated.length + plan.legacyDecorated;
+			opt("pfAdopt", plan.adopt.certain, "태그 없는 기존 클립 " + plan.adopt.certain + "개를 이 목록 클립으로 인식", MI_PF_DEFAULTS.adopt);
+			opt("pfAdoptUncertain", plan.adopt.uncertain, "같은 자리에 있지만 문장이 다른 태그 없는 클립 " + plan.adopt.uncertain + "개도 인식 (그 클립의 문장을 덮어씁니다)", MI_PF_DEFAULTS.adoptUncertain);
+			opt("pfAdoptForeign", plan.foreignAdopt.certain, "다른 시퀀스에서 온 태그 클립 " + plan.foreignAdopt.certain + "개를 이 목록 클립으로 인식", MI_PF_DEFAULTS.adoptForeign);
+			opt("pfMoveLegacy", plan.legacyMove + plan.legacyKept.length, "기본 트랙(" + tn(typeof state.mi.legacyTrack === "number" ? state.mi.legacyTrack : ctx.base) + ")에 있던 옛 클립 " + (plan.legacyMove + plan.legacyKept.length - plan.legacyDecorated) + "개를 화자 트랙으로 옮기기" + (plan.legacyDecorated ? " (효과가 있는 " + plan.legacyDecorated + "개는 빼고)" : ""), MI_PF_DEFAULTS.moveLegacy);
+			opt("pfOrphans", pre, "목록에서 빠진 줄의 클립 " + pre + "개 지우기 (병합·교체로 빠졌고 Premiere에서 고치지 않은 것)", true);
+			opt("pfOrphansAll", plan.orphans.length - pre, "목록에 없는 다른 클립 " + (plan.orphans.length - pre) + "개도 지우기 (Premiere에서 고쳤거나 사용자가 지운 줄)", false);
+			opt("pfCleanupStale", plan.cleanup.length, "중단된 적용이 남긴 옛 클립 " + plan.cleanup.length + "개 지우기", MI_PF_DEFAULTS.cleanupStale);
+			opt("pfReplaceMissing", plan.missing.length, "Premiere에서 지운 클립 " + plan.missing.length + "개 다시 놓기", MI_PF_DEFAULTS.replaceMissing);
+			opt("pfOverwriteEdited", plan.edited.length, "Premiere에서 고친 클립 " + plan.edited.length + "개 덮어쓰기", MI_PF_DEFAULTS.overwriteEdited);
+			opt("pfRestoreMoved", plan.userMoved.length, "Premiere에서 옮긴 클립 " + plan.userMoved.length + "개를 자막 시간으로 되돌리기", MI_PF_DEFAULTS.restoreMoved);
+			opt("pfMoveDecorated", decoN, "효과·키프레임이 있는 클립 " + decoN + "개도 다시 놓기 (효과가 사라짐)", MI_PF_DEFAULTS.moveDecorated);
+			opt("pfUpgradeOld", plan.oldVersion.length, "옛 버전 MOGRT 클립 " + plan.oldVersion.length + "개를 새 버전으로 교체 (Premiere에서 고친 값 사라짐)", MI_PF_DEFAULTS.upgradeOld);
+			const chk = (id) => { const cb = document.getElementById(id); return !!(cb && cb.checked); };
+			const done = (v) => {
+				modal.classList.remove("open");
+				okBtn.onclick = null;
+				noBtn.onclick = null;
+				_miPfClose = null;
+				resolve(v);
+			};
+			okBtn.onclick = () => done({
+				adopt: chk("pfAdopt"), adoptUncertain: chk("pfAdoptUncertain"), adoptForeign: chk("pfAdoptForeign"), moveLegacy: chk("pfMoveLegacy"),
+				orphans: chk("pfOrphansAll") ? "all" : chk("pfOrphans") ? "pre" : "none", cleanupStale: chk("pfCleanupStale"), replaceMissing: chk("pfReplaceMissing"),
+				overwriteEdited: chk("pfOverwriteEdited"), restoreMoved: chk("pfRestoreMoved"), moveDecorated: chk("pfMoveDecorated"), upgradeOld: chk("pfUpgradeOld")
+			});
+			noBtn.onclick = () => done(null);
+			_miPfClose = () => done(null);
+			modal.classList.add("open");
+		});
+	}
+	function _miSkipText(ro) {
+		if (ro.skip === "conflict") return "충돌: " + (ro.detail || ro.why || "");
+		const t = MI_SKIP_TEXT[ro.skip] || ro.skip;
+		return ro.detail && ro.skip !== "edited" && ro.skip !== "decorated" ? t + ": " + ro.detail : t;
+	}
+	function _miResultText(st, r) {
+		if (st === "conflict") return "충돌: " + (r.reason === "tail" ? "뒤 클립 " : "") + (r.detail || r.reason || "");
+		if (st === "locked") return "잠김";
+		if (st === "ambiguous") return "중복 (" + (r.detail || "같은 태그 클립") + ")";
+		if (st === "stale-plan") return "계획 뒤 타임라인이 바뀜 — 다시 적용";
+		if (st === "misplaced") return "다른 트랙에 놓여 지움";
+		return "실패: " + (r.reason || st || "응답 없음") + (r.detail ? " " + r.detail : "");
+	}
+	// 계획에서 건너뛴 줄에 까닭을 적고, 보낼 줄·그대로인 줄의 지난 표시는 지운다
+	function _miMarkRows(plan) {
+		Object.keys(plan.rowOps).forEach((k) => {
+			const id = Number(k);
+			const ro = plan.rowOps[k];
+			if (ro && ro.skip) {
+				_setRowRes(id, _miSkipText(ro));
+				_miRowStatus[id] = { st: ro.skip, why: ro.why || "", detail: ro.detail || "" };
+			} else {
+				_setRowRes(id, null);
+				if (ro && ro.none) _miRowStatus[id] = { st: "none", why: "", detail: "" };
+			}
+			const sub = state.subtitles.find((s) => s.id === id);
+			// 그대로인 줄(applied의 의도 해시가 같고 클립이 그 자리)은 타임라인이 이미 이 줄과 같다 → 병합 표시(mm)를 지운다
+			if (sub && ro && ro.none) {
+				const rs = state.rowStates[id];
+				const t = sub.spk && plan.tracks[sub.spk] ? plan.tracks[sub.spk].track : null;
+				if (rs && rs.mm && t !== null) markApplied(rs, sub, rs.presetId ? state.presets[rs.presetId] || null : null, t, rs.ap && rs.ap.nk ? rs.ap.nk : null);
+			}
+			if (sub) _refreshRowMarks(sub);
+		});
+	}
+	// 첫 새 배치에서 프리셋 학습 필드 (AE만): mogrtItemName(= capsule 이름), mogrtDurSec(D), mogrtLs(지금 버전), mogrtBaseComps
+	function _miLearn(preset, op, r, res, ctx) {
+		if (ctx.learned[op.presetId]) return;
+		const upd = {};
+		if (typeof r.pin === "string" && r.pin) upd.mogrtItemName = r.pin;
+		const dur = res.dur && res.dur[op.m];
+		if (typeof dur === "number" && dur > 0) upd.mogrtDurSec = dur;
+		const ls = clipLs(r.lay);
+		if (ls) upd.mogrtLs = ls;
+		const comps = res.comps && typeof res.comps[op.m] === "number" ? res.comps[op.m] : r.deco && typeof r.deco.comps === "number" ? r.deco.comps : null;
+		if (comps !== null) upd.mogrtBaseComps = comps;
+		Object.keys(upd).forEach((k) => {
+			if (preset[k] !== upd[k]) {
+				preset[k] = upd[k];
+				ctx.presetsDirty = true;
+			}
+		});
+		if (upd.mogrtLs && upd.mogrtDurSec) ctx.learned[op.presetId] = true;
+	}
+	// 청크 결과 하나 → applied·ap·줄 표시·last_apply·학습 필드
+	function _miOnResult(op, r, res, ctx) {
+		const st = String((r && r.status) || "");
+		const ok = !!PLACE_OK[st];
+		const partial = st === "partial";
+		const sub = ctx.byId[op.id] || null;
+		const rs = sub ? state.rowStates[sub.id] : null;
+		const preset = rs && rs.presetId ? state.presets[rs.presetId] || null : null;
+		ctx.spkDone[op.K] = (ctx.spkDone[op.K] || 0) + 1;
+		ctx.doneOps++;
+		_miRowStatus[op.id] = { st, why: (r && r.reason) || "", detail: (r && r.detail) || "" };
+		if (!ok && !partial) {
+			if (st === "conflict" || st === "locked" || st === "ambiguous") ctx.stats.conflict++;
+			else ctx.stats.failed++;
+			_setRowRes(op.id, _miResultText(st, r || {}));
+			if (sub) _refreshRowMarks(sub);
+			return;
+		}
+		if (r.nodeId) {
+			if (opCreates(op)) ctx.created[op.uid] = String(r.nodeId);
+			ctx.nodeToUid[String(r.nodeId)] = op.uid;
+		}
+		state.mi.applied[op.uid] = appliedEntryOf(op, r);
+		const T = op.intent ? op.intent.t : op.track;
+		if (sub && rs) {
+			if (ok) markApplied(rs, sub, preset, T, op.nk);
+			else rs.ap = apRecord(sub, rs, preset, T, op.nk);
+			_setRowRes(op.id, partial ? "속성 " + ((r.skipped || []).length + (r.keyed || []).length) + "개 적용 안 됨" + ((r.keyed || []).length ? " (키프레임)" : " (옛 버전)") : null);
+			_refreshRowMarks(sub);
+		}
+		if (opCreates(op) && preset && !isNativeList(preset.params)) _miLearn(preset, op, r, res, ctx);
+		ctx.spkOk[op.K] = true;
+		const base = { key: op.uid, g: typeof r.g === "number" ? r.g : op.g, track: r.track, sf: r.sf, nodeId: String(r.nodeId || ""), rh: textsHash(r.texts || []) };
+		const cat = op.op === "place" ? "created" : op.op === "update" ? "updated" : op.op === "adopt" ? "adopted" : op.op === "replace" ? "replaced" : "moved";
+		if (cat === "created") ctx.la.created.push(base);
+		else if (cat === "updated") ctx.la.updated.push(Object.assign(base, { before: r.before || null }));
+		else if (cat === "adopted") ctx.la.adopted.push(Object.assign(base, { from: { name: op.srcName || "", params: r.before || [] } }));
+		else ctx.la[cat].push(Object.assign(base, { from: Object.assign({ nodeId: op.own ? String(op.own.nodeId) : op.removeAfter ? String(op.removeAfter.nodeId) : "" }, r.before || {}) }));
+		ctx.stats[cat]++;
+		if (partial) ctx.stats.partial++;
+	}
+	function _miProgress(op, ctx) {
+		const K = op && op.K;
+		const spk = K ? K + " " + _castName(K) + " " + (ctx.spkDone[K] || 0) + "/" + (ctx.spkTotal[K] || 0) + " · " : "";
+		_miShowBusy("배치 중… " + spk + "전체 " + ctx.doneOps + "/" + ctx.totalOps);
+	}
+	// 계획 실행: 제거(removeClips) → 청크(placeChunk). ctx.stopped([중지])·ctx.aborted(시퀀스 바뀜)면 청크 사이에서 멈춘다
+	async function _miExecute(plan, ctx) {
+		for (let i = 0; i < plan.removals.length; i += 200) {
+			if (_miCancel) { ctx.stopped = true; return; }
+			const part = plan.removals.slice(i, i + 200);
+			_miShowBusy("옛 클립 지우는 중… (" + part.length + "개)");
+			const res = await _miCallWatch(() => host.mi.removeClips({ seqId: ctx.seqId, items: part.map((x) => ({ key: x.uid, track: x.track, nodeId: x.nodeId, expectName: x.expectName || null })) }));
+			if (!res || res.ok !== true) throw _miHostFail("removeClips", res);
+			(res.results || []).forEach((r, k) => {
+				const rm = part[k];
+				if (!rm) return;
+				if (r && r.status === "removed") {
+					ctx.stats.removed++;
+					ctx.la.removed.push(Object.assign({ key: rm.uid, g: rm.g }, r.before || {}, { nodeId: String(rm.nodeId), why: rm.why }));
+					if (rm.why === "orphan") delete state.mi.applied[rm.uid];
+				} else ctx.stats.removeFailed++;
+			});
+			ctx.la.chunksDone++;
+			_writeLastApply(ctx.la);
+		}
+		let queue = plan.ops.slice();
+		while (queue.length) {
+			if (_miCancel) { ctx.stopped = true; return; }
+			if (ctx.seqTok !== _importSeqToken()) { ctx.aborted = true; return; }
+			const chunk = chunkOps(queue, PLACE_CHUNK)[0];
+			queue = queue.slice(chunk.length);
+			const items = chunk.map((op) => hostItemOf(op, ctx.created));
+			_miProgress(chunk[0], ctx);
+			const res = await _miCallWatch(() => host.mi.placeChunk({ seqId: ctx.seqId, frameTicks: ctx.ft, budgetMs: MI_BUDGET_MS, items }));
+			if (!res || res.ok !== true) throw _miHostFail("placeChunk", res);
+			const done = Math.max(0, Math.min(chunk.length, parseInt(res.done, 10) || 0));
+			if (!done) throw _miHostFail("placeChunk", { error: "done 0", detail: "호스트가 작업을 하나도 하지 않았다" });
+			for (let k = 0; k < done; k++) _miOnResult(chunk[k], (res.results || [])[k] || {}, res, ctx);
+			// 예산(7초)이 다 됐다: 나머지는 다음 청크로 (첫 importMGT는 ≈9초라 혼자 끝날 수 있다)
+			if (done < chunk.length) queue = chunk.slice(done).concat(queue);
+			(res.damaged || []).forEach((id) => { if (ctx.damaged.indexOf(String(id)) === -1) ctx.damaged.push(String(id)); });
+			ctx.la.chunksDone++;
+			_writeLastApply(ctx.la);
+		}
+	}
+	// 적용 결과 요약 (상태 줄·명령)
+	function _miReport(ctx, plan) {
+		const s = ctx.stats;
+		return { ok: !ctx.error && !ctx.aborted, stopped: !!ctx.stopped, error: ctx.error || null, created: s.created, updated: s.updated, moved: s.moved, adopted: s.adopted,
+			replaced: s.replaced, removed: s.removed, partial: s.partial, conflict: s.conflict, failed: s.failed, none: plan ? plan.none.length : 0,
+			skipped: plan ? Object.keys(plan.rowOps).filter((k) => plan.rowOps[k] && plan.rowOps[k].skip).length : 0,
+			ops: plan ? plan.ops.length + plan.removals.length : 0, tracksAdded: ctx.tracksAdded || 0, runId: ctx.la ? ctx.la.runId : null, saltRecovered: !!ctx.saltRecovered };
+	}
+	function _miStatusText(rep) {
+		const parts = [];
+		[["created", "놓음"], ["updated", "갱신"], ["moved", "옮김"], ["adopted", "인식"], ["replaced", "교체"], ["removed", "지움"]].forEach(([k, t]) => { if (rep[k]) parts.push(t + " " + rep[k]); });
+		if (rep.none) parts.push("그대로 " + rep.none);
+		if (rep.partial) parts.push("일부 속성 빠짐 " + rep.partial);
+		if (rep.conflict) parts.push("충돌 " + rep.conflict);
+		if (rep.failed) parts.push("실패 " + rep.failed);
+		if (rep.skipped) parts.push("건너뜀 " + rep.skipped);
+		if (rep.tracksAdded) parts.push("새 트랙 " + rep.tracksAdded);
+		return "화자별 배치: " + (parts.join(" · ") || "보낸 줄 없음");
+	}
+	// 화자별 배치. opts:
+	//   single  한 줄 (↑): 옛 gen·목록 밖 클립은 보지 않고, 점검 창은 충돌·고침·옛 버전·새 트랙일 때만
+	//   auto    점검 창 없이 pf(선택지, 없으면 기본값)로 (명령 apply)
+	//   pf      선택지 (MI_PF_DEFAULTS 모양)
+	//   dryRun  계획만 세우고 요약을 돌려준다 (명령 plan)
+	// → 결과 요약 {ok, stopped, error, created, updated, …} (_miReport) | {ok: false, error}
+	async function _miApply(targetSubs, opts) {
+		const o = opts || {};
+		if (_miBusy || _legacyRun) {
+			setStatus("타임라인 적용이 이미 실행 중입니다", "err");
+			return { ok: false, error: "busy" };
+		}
+		if (!_keysResolved) {
+			setStatus("시퀀스를 열면 적용할 수 있습니다", "err");
+			return { ok: false, error: "no-sequence" };
+		}
+		_miBusy = true;
+		_miCancel = false;
+		let ctx = null;
+		let plan = null;
+		try {
+			const hk = await _miHostOk();
+			if (!hk.ok) {
+				setStatus(hk.msg, "err");
+				return { ok: false, error: hk.why === "build" ? "build-mismatch" : "no-host", detail: hk.msg };
+			}
+			const ping = hk.ping;
+			if (ping.isPreview) {
+				setStatus("프리뷰 시퀀스가 활성입니다 — 작업 시퀀스를 연 뒤 다시 적용하세요", "err");
+				return { ok: false, error: "preview-active" };
+			}
+			if (!ping.seqId || String(ping.seqId) !== String(state.currentSequenceId)) {
+				setStatus("Premiere의 활성 시퀀스가 패널의 시퀀스와 다릅니다 — 패널이 따라간 뒤 다시 적용하세요", "err");
+				return { ok: false, error: "seq-mismatch" };
+			}
+			const ft = Number(ping.frameTicks);
+			if (!(ft > 0)) {
+				setStatus("시퀀스 프레임 정보를 읽지 못했습니다", "err");
+				return { ok: false, error: "exception", detail: "frameTicks" };
+			}
+			_miEnsureCast();
+			const live = _idSet(state.subtitles.map((s) => s.id));
+			const subs = (targetSubs || []).filter((s) => s && s.spk && live[s.id]);
+			const legacyN = (targetSubs || []).filter((s) => s && !s.spk).length;
+			if (!subs.length) {
+				setStatus("적용할 화자 줄이 없습니다", "err");
+				return { ok: false, error: "no-rows" };
+			}
+			const base = _trackValueNum();
+			ctx = {
+				seqId: String(ping.seqId), ft, seqTok: _importSeqToken(), base: base === null ? 2 : base, legacyN, rowIn: {}, durs: {}, details: {}, created: {}, nodeToUid: {},
+				damaged: [], byId: {}, stats: { created: 0, updated: 0, moved: 0, adopted: 0, replaced: 0, removed: 0, removeFailed: 0, partial: 0, conflict: 0, failed: 0 },
+				spkDone: {}, spkTotal: {}, spkOk: {}, doneOps: 0, totalOps: 0, learned: {}, presetsDirty: false, la: null, stopped: false, aborted: false, error: null
+			};
+			state.subtitles.forEach((s) => { ctx.byId[s.id] = s; });
+			_miShowBusy("타임라인 읽는 중…");
+			const pfBase = Object.assign({}, MI_PF_DEFAULTS, o.single ? { single: true } : {});
+			plan = await _miPlanFor(subs, o.auto ? Object.assign({}, pfBase, o.pf || {}) : pfBase, ctx);
+			if (o.dryRun) return { ok: true, plan: _miPlanSummary(plan), lines: _miSummaryLines(plan, ctx).map((l) => l[0]) };
+			if (!o.auto && _miNeedsPreflight(plan, !!o.single, legacyN)) {
+				_miHideBusy();
+				const chosen = await _miPreflight(plan, ctx);
+				if (!chosen) {
+					setStatus("타임라인 적용 취소", "");
+					return { ok: false, error: "cancelled" };
+				}
+				if (ctx.seqTok !== _importSeqToken()) {
+					setStatus("시퀀스가 바뀌어 적용을 취소했습니다", "err");
+					return { ok: false, error: "seq-mismatch" };
+				}
+				if (stableJson(chosen) !== stableJson(MI_PF_DEFAULTS)) {
+					_miShowBusy("다시 계획하는 중…");
+					plan = await _miPlanFor(subs, Object.assign({}, chosen, o.single ? { single: true } : {}), ctx);
+				}
+			}
+			_miMarkRows(plan);
+			if (!plan.ops.length && !plan.removals.length && !(plan.minCount > 0)) {
+				// 그대로인 줄의 병합 표시를 지웠을 수 있다 (_miMarkRows) → 저장
+				saveSessionToStorage();
+				updateMultiSelect();
+				const rep = _miReport(ctx, plan);
+				setStatus("변경 없음 — 보낼 줄이 없습니다 (" + plan.none.length + "줄 그대로" + (rep.skipped ? " · 건너뜀 " + rep.skipped : "") + ")", rep.skipped ? "err" : "ok");
+				return rep;
+			}
+			if (plan.minCount > 0) {
+				_miShowBusy("비디오 트랙 만드는 중…");
+				const r = await _miCallWatch(() => host.mi.ensureTracks({ seqId: ctx.seqId, minCount: plan.minCount }));
+				if (!r || r.ok !== true) throw _miHostFail("ensureVideoTracks", r);
+				ctx.tracksAdded = r.added || 0;
+				_miNumTracks = r.after;
+			}
+			ctx.la = { v: 1, runId: "r" + Date.now(), ts: Date.now(), seqId: ctx.seqId, salt: state.mi.salt, complete: false, chunksDone: 0, rows: subs.length, superseded: false,
+				created: [], updated: [], moved: [], adopted: [], replaced: [], removed: [] };
+			_writeLastApply(ctx.la);
+			ctx.totalOps = plan.ops.length;
+			plan.ops.forEach((op) => { ctx.spkTotal[op.K] = (ctx.spkTotal[op.K] || 0) + 1; });
+			await _miExecute(plan, ctx);
+			// 이웃이 통째로 덮였거나 머리를 되돌리지 못한 줄: 다시 스캔해 줄 자리에 다시 놓는다 (최대 2번)
+			for (let round = 0; round < DAMAGE_ROUNDS && ctx.damaged.length && !ctx.stopped && !ctx.aborted; round++) {
+				const uids = {};
+				ctx.damaged.splice(0).forEach((n) => { if (ctx.nodeToUid[n]) uids[ctx.nodeToUid[n]] = true; });
+				const again = state.subtitles.filter((s) => s.spk && uids[state.mi.salt + "-" + s.id]);
+				if (!again.length) break;
+				ctx.details = {};
+				const force = _idSet(again.map((s) => s.id));
+				const p2 = await _miPlanFor(again, Object.assign({}, MI_PF_DEFAULTS, { single: true, forceRegen: force }), ctx);
+				ctx.totalOps += p2.ops.length;
+				p2.ops.forEach((op) => { ctx.spkTotal[op.K] = (ctx.spkTotal[op.K] || 0) + 1; });
+				_miMarkRows(p2);
+				await _miExecute(p2, ctx);
+				ctx.repaired = (ctx.repaired || 0) + p2.ops.length;
+			}
+		} catch (e) {
+			if (ctx) ctx.error = (e && e.message) || String(e);
+			console.error("[MOGRT] 화자별 배치 멈춤:", e);
+			setStatus(MI_STOPPED_MSG + ": " + ((e && e.message) || e), "err");
+			if (!ctx || !ctx.la) return { ok: false, error: "exception", detail: (e && e.message) || String(e) };
+		} finally {
+			try {
+				if (ctx && ctx.la) _miFinish(ctx, plan);
+			} finally {
+				_miBusy = false;
+				_miCancel = false;
+				_miHideBusy();
+			}
+		}
+		return ctx && plan ? _miReport(ctx, plan) : { ok: false, error: "exception" };
+	}
+	// 실행 뒤 정리: 자동 화자 트랙 기억, last_apply complete, session.json·presets.json 저장, 히스토리, 상태 줄
+	function _miFinish(ctx, plan) {
+		if (plan) {
+			Object.keys(plan.tracks).forEach((K) => {
+				const t = plan.tracks[K];
+				const hadNone = plan.none.some((id) => ctx.byId[id] && ctx.byId[id].spk === K);
+				if (t.auto && state.mi.cast[K] && (ctx.spkOk[K] || hadNone)) state.mi.cast[K].autoTrack = t.track;
+			});
+		}
+		ctx.la.complete = !ctx.stopped && !ctx.error && !ctx.aborted;
+		_writeLastApply(ctx.la);
+		if (ctx.seqTok === _importSeqToken()) {
+			saveSessionToStorage();
+			if (ctx.presetsDirty) savePresetsToStorage();
+			const n = ctx.stats.created + ctx.stats.updated + ctx.stats.moved + ctx.stats.adopted + ctx.stats.replaced + ctx.stats.removed;
+			if (n) _saveHistoryOnAction("타임라인 적용 (" + n + "개)");
+			renderCastBar();
+			updateMultiSelect();
+		}
+		const rep = _miReport(ctx, plan);
+		const text = _miStatusText(rep);
+		if (ctx.error) setStatus(MI_STOPPED_MSG + ": " + ctx.error + " — " + text, "err");
+		else if (ctx.aborted) setStatus("시퀀스가 바뀌어 멈췄습니다 — " + text, "err");
+		else if (ctx.stopped) setStatus("중지함 — 다시 적용하면 이어서 진행 · " + text, "err");
+		else setStatus(text, rep.conflict || rep.failed || rep.skipped || rep.partial ? "err" : "ok");
+	}
+	// 계획 요약 (명령 plan·테스트)
+	function _miPlanSummary(plan) {
+		const count = {};
+		plan.ops.forEach((op) => { count[op.op] = (count[op.op] || 0) + 1; });
+		return {
+			ops: count, removals: plan.removals.length, none: plan.none.length, minCount: plan.minCount, tracks: plan.tracks, blocked: plan.blocked,
+			conflicts: plan.conflicts, edited: plan.edited, missing: plan.missing, oldVersion: plan.oldVersion, decorated: plan.decorated, userMoved: plan.userMoved,
+			adopt: plan.adopt, foreignAdopt: plan.foreignAdopt, legacyMove: plan.legacyMove, legacyKept: plan.legacyKept, cleanup: plan.cleanup.length,
+			orphans: plan.orphans.map((x) => ({ uid: x.uid, id: x.id, pre: x.pre })), dup: plan.dup, noPreset: plan.noPreset, perSpeaker: plan.perSpeaker,
+			skipped: Object.keys(plan.rowOps).filter((k) => plan.rowOps[k] && plan.rowOps[k].skip).map((k) => ({ id: Number(k), why: plan.rowOps[k].skip, detail: plan.rowOps[k].detail || "" }))
+		};
+	}
+	// DEV·하드 테스트 훅: [중지]와 같다
+	window._mogrtDebug.miStop = () => { if (_miBusy) _miCancel = true; return _miBusy; };
+	window._mogrtDebug.miBusy = () => _miBusy;
 	//#endregion
 	//#region src/main.ts
 	function setStatus(msg, cls) {
@@ -9628,6 +11003,7 @@ var modalState = {
 	var _scanInProgress = false;
 	function doScanMogrt(silent) {
 		if (_scanInProgress) return; // 이미 스캔 중이면 스킵
+		if (_miBusy) return; // 화자별 배치 중에는 30초 재스캔을 쉰다 (호스트 호출이 끼어들지 않게, S2-4)
 		_scanInProgress = true;
 		const mogrtStatus = document.getElementById("mogrtStatus");
 		if (!silent) {
@@ -9799,6 +11175,8 @@ var modalState = {
 		if (_seqPollingActive) return;
 		_seqPollingActive = true;
 		setInterval(async () => {
+			// 화자별 배치 중에는 시퀀스 전환을 따라가지 않는다 (목록·키가 바뀌면 결과를 다른 시퀀스에 적는다, S2-4)
+			if (_miBusy) return;
 			let info;
 			try {
 				info = await host.getActiveSequenceInfo();
@@ -10125,18 +11503,19 @@ var modalState = {
 			setStatus("먼저 SRT 파일을 열어주세요.", "err");
 			return;
 		}
-		// 화자 줄이 있으면 v27 한 트랙 경로로 보내지 않는다 (화자마다 전용 트랙에 놓는 것은 S2-4)
-		if (state.subtitles.some((s) => s.spk)) {
-			setStatus(CAST_APPLY_PENDING_MSG, "err");
+		if (_miBusy) {
+			setStatus("타임라인 적용이 이미 실행 중입니다", "err");
 			return;
 		}
 		const checkedIds = Object.entries(state.rowStates).filter(([, rs]) => rs.checked).map(([id]) => parseInt(id, 10));
 		if (checkedIds.length > 0) showConfirm(checkedIds.length + "개 자막이 선택되어 있습니다.\n\n확인: 선택된 " + checkedIds.length + "개만 적용\n취소: 전체 " + state.subtitles.length + "개 적용", () => doApplyToTimeline(state.subtitles.filter((sub) => checkedIds.includes(sub.id))), () => doApplyToTimeline(state.subtitles));
 		else doApplyToTimeline(state.subtitles);
 	});
-	// ▶ 적용 (화자 줄은 위 처리기에서 막았다 → 화자 표 없는 레거시 목록). 병합으로 바뀐 줄이나 v27 index 쓰기가
-	// 위험한 줄이 있으면 [안전하게 적용] 확인창을 먼저 띄우고, 없으면 v27 본문 그대로 (src/mi/apply.ts)
+	// ▶ 적용. 화자 줄이 있는 목록(다화자) → 화자별 배치 _miApply (화자마다 전용 트랙, S2-4).
+	// 화자 표 없는 레거시 목록: 병합으로 바뀐 줄이나 v27 index 쓰기가 위험한 줄이 있으면 [안전하게 적용] 확인창을 먼저 띄우고,
+	// 없으면 v27 본문 그대로 (src/mi/apply.ts) — 단일 화자 ▶는 바꾸지 않은 v27 applyToTimeline을 부른다
 	async function doApplyToTimeline(targetSubs) {
+		if (_castMode() || state.subtitles.some((s) => s.spk)) return _miApply(targetSubs);
 		const flagged = _legacyFlagged(targetSubs);
 		if (!flagged.length) return _legacyApply(targetSubs);
 		_legacyApplyChoice(targetSubs, flagged);
@@ -10583,6 +11962,19 @@ var modalState = {
 			const autoList = _loadHistoryList(false);
 			const manualList = _loadHistoryList(true);
 			const safetyList = _loadHistoryList("safety");
+			// ── 마지막 화자별 배치 (last_apply.json, S2-4): 맨 위에 기록만 보인다. 타임라인 되돌리기는 다음 단계(S2-5)에서 켠다 ──
+			const la = _readLastApply();
+			if (la && la.seqId && String(la.seqId) === String(state.currentSequenceId) && !la.superseded) {
+				const d = new Date(la.ts || 0);
+				const hm = d.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+				const item = document.createElement("div");
+				item.id = "btnUndoApply";
+				item.className = "history-item last-apply" + (la.complete ? "" : " partial");
+				item.title = "마지막 화자별 배치 기록 (last_apply.json). 타임라인만 되돌리는 기능은 아직 쓸 수 없습니다";
+				item.innerHTML = '<span class="hist-label">' + escapeHtml("↶ 마지막 적용 되돌리기 (" + hm + " · " + (la.rows || 0) + "줄)" + (la.complete ? "" : " (중단된 적용)")) + '</span>';
+				item.addEventListener("click", (e) => e.stopPropagation());
+				dropdown.appendChild(item);
+			}
 			// ── 수동저장 섹션 (항상 표시) ──
 			const manualSection = document.createElement("div");
 			manualSection.style.cssText = "border-bottom:1px solid #333;padding:5px 10px 6px;";

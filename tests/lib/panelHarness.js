@@ -161,7 +161,14 @@ class FakeEl {
 		else if (k.indexOf("data-") === 0) this.dataset[k.slice(5).replace(/-([a-z])/g, (m, c) => c.toUpperCase())] = String(v);
 		else if (k === "value" && this.tagName !== "OPTION") this.value = String(v);
 	}
-	getAttribute(k) { return k === "id" ? this.id : k === "class" ? this.className : this._attrs[k] !== undefined ? this._attrs[k] : null; }
+	getAttribute(k) {
+		// data-* 는 dataset과 같은 값 (브라우저처럼: el.dataset.key = "C2" → [data-key=C2] 선택자)
+		if (String(k).indexOf("data-") === 0) {
+			const dk = String(k).slice(5).replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+			if (this.dataset[dk] !== undefined) return String(this.dataset[dk]);
+		}
+		return k === "id" ? this.id : k === "class" ? this.className : this._attrs[k] !== undefined ? this._attrs[k] : null;
+	}
 	hasAttribute(k) { return this.getAttribute(k) !== null; }
 	removeAttribute(k) { delete this._attrs[k]; if (k === "disabled") this.disabled = false; }
 	addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); }
@@ -610,17 +617,18 @@ async function bootPanel(opts = {}) {
 	win.navigator = { language: "ko-KR", clipboard: { writeText: (t) => { clipboard.push(String(t)); return Promise.resolve(); } } };
 	win.CSInterface = function CSInterface() {};
 	win.CSInterface.prototype.getSystemPath = () => EXT_DIR;
+	// 처리기는 글자를 돌려주거나, 약속(느린 호출 흉내: 워치독 시험)을 돌려준다
 	win.CSInterface.prototype.evalScript = (script, cb) => {
 		const { fn, args } = parseCall(script);
 		host.calls.push({ fn, args, script });
 		let res = "";
 		try {
 			const h = host.handlers[fn];
-			res = h ? String(h(...args)) : "";
+			res = h ? h(...args) : "";
 		} catch (e) {
 			res = "EvalScript error.";
 		}
-		Promise.resolve().then(() => cb && cb(res));
+		Promise.resolve(res).then((v) => cb && cb(String(v)), () => cb && cb("EvalScript error."));
 	};
 	win.FileReader = class {
 		readAsText(file) { Promise.resolve().then(() => { this.result = file._text; this.onload && this.onload({ target: this }); }); }

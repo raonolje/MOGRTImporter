@@ -165,6 +165,7 @@ test("cast.json에서 되살린 hwm이 파일의 nextId보다 크면 nextId를 h
 	const h = await boot({ files: { [P.session(PROJ, A.seqId)]: v27, [P.cast(PROJ, A.seqId)]: side } });
 	let s = h.snapshot();
 	assert.deepEqual([s.mi.salt, s.mi.hwm, s.nextId], ["k7q2", 64, 65]);
+	h.win._mogrtDebug.setMiCast(false); // 레거시(v27 교체) 경로로 id를 받는다 (플래그가 켜져 있으면 화자 표가 있어 가져오기 창)
 	await h.dropSrt("새.srt", "1\n00:00:01,000 --> 00:00:02,000\n가\n");
 	s = h.snapshot();
 	assert.ok(s.subtitles.every((x) => x.id > 64), "새 id " + JSON.stringify(s.subtitles.map((x) => x.id)));
