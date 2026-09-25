@@ -534,6 +534,9 @@ async function bootPanel(opts = {}) {
 	const win = vm.runInContext("this", ctx);
 	win.window = win;
 	win.cep = { fs: cfs, encoding: { UTF8: "UTF-8", Base64: "Base64" } };
+	// 클립보드 (T-ID 배지 복사, S1-6): 쓴 글자를 h.clipboard에 남긴다. 지우면 execCommand 대체 경로를 탄다
+	const clipboard = [];
+	win.navigator = { language: "ko-KR", clipboard: { writeText: (t) => { clipboard.push(String(t)); return Promise.resolve(); } } };
 	win.CSInterface = function CSInterface() {};
 	win.CSInterface.prototype.getSystemPath = () => EXT_DIR;
 	win.CSInterface.prototype.evalScript = (script, cb) => {
@@ -563,7 +566,7 @@ async function bootPanel(opts = {}) {
 
 	const paths = cachePaths;
 	const h = {
-		win, doc, fs: cfs, host, clock, logs, pageErrors, paths,
+		win, doc, fs: cfs, host, clock, logs, pageErrors, paths, clipboard,
 		flush,
 		advance: (ms) => clock.advance(ms, flush),
 		snapshot: () => JSON.parse(JSON.stringify(win._mogrtDebug.snapshot())),

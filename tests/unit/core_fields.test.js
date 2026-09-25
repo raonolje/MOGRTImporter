@@ -228,3 +228,26 @@ test("nextFreePresetId: 실제 데이터 모양 → preset_9, 다음은 preset_1
 	// 배열 입력
 	assert.equal(core.nextFreePresetId(["preset_3", { id: "preset_5" }], [], [], 1).id, "preset_6");
 });
+
+// ── S1-6: 네이티브 텍스트 필드 이름 (S0-3 결정 4) ──
+
+test("nativeTextLabels: TextLayer(type 6) 순서대로 기본 문구, UI 로캘 → en_US → 첫 항목, 개수가 다르면 null", () => {
+	const layer = (en, ko) => ({ type: 6, uiName: "TextLayer", value: { strDB: [{ localeString: "en_US", str: en }].concat(ko ? [{ localeString: "ko_KR", str: ko }] : []) } });
+	const def = { clientControls: [layer("Insert Name Here", "이름을 넣으세요"), { type: 2, uiName: "Color" }, layer("ADD TITLE HERE")] };
+	assert.deepEqual(plain(core.nativeTextLabels(def, 2, "")), ["Insert Name Here", "ADD TITLE HERE"]);
+	assert.deepEqual(plain(core.nativeTextLabels(def, 2, "ko_KR")), ["이름을 넣으세요", "ADD TITLE HERE"], "UI 로캘 우선, 없으면 en_US");
+	assert.deepEqual(plain(core.nativeTextLabels(def, 2, "ko-KR")), ["이름을 넣으세요", "ADD TITLE HERE"], "ko-KR도 같다");
+	assert.equal(core.nativeTextLabels(def, 3, ""), null, "개수가 다르면 일반 이름 그대로");
+	assert.equal(core.nativeTextLabels(def, 0, ""), null);
+	assert.equal(core.nativeTextLabels({}, 2, ""), null);
+	assert.equal(core.nativeTextLabels(null, 2, ""), null);
+	// en_US가 없으면 첫 항목, 줄바꿈은 " / ", 빈 문구는 '텍스트 k', 같은 이름은 (2), 40자에서 자른다
+	const odd = { clientControls: [
+		{ type: 6, value: { strDB: [{ localeString: "fr_FR", str: "Ligne 1\rLigne 2" }] } },
+		{ type: "6", value: { strDB: [{ localeString: "en_US", str: "  " }] } },
+		{ type: 6, value: "Title" },
+		{ type: 6, value: { strDB: [{ localeString: "en_US", str: "Title" }] } },
+		{ type: 6, value: { strDB: [{ localeString: "en_US", str: "x".repeat(60) }] } }
+	] };
+	assert.deepEqual(plain(core.nativeTextLabels(odd, 5, "")), ["Ligne 1 / Ligne 2", "텍스트 2", "Title", "Title (2)", "x".repeat(39) + "…"]);
+});

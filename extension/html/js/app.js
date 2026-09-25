@@ -971,6 +971,32 @@
 	function resolveFid(rowParams, fid, presetParams) {
 		return resolveFields(rowParams, presetParams)[fid] || null;
 	}
+	// 네이티브 템플릿의 텍스트 필드 이름 (S0-3 결정 4). 호스트는 '텍스트 N'으로만 알려 준다.
+	// definition.json clientControls 중 type 6(TextLayer)을 순서대로 쓰고(= Source Text·컴포넌트 순서,
+	// 화면 위아래 순서와는 다를 수 있다), 이름은 각 컨트롤의 기본 문구(value.strDB에서 UI 로캘, 없으면 en_US,
+	// 없으면 첫 항목)다. TextLayer 개수가 count와 다르면 null → 일반 이름을 그대로 둔다.
+	// 줄바꿈은 " / "로 잇고 40자에서 자른다. 빈 문구는 '텍스트 k', 같은 이름이 또 나오면 " (2)"를 붙인다.
+	function nativeTextLabels(def, count, locale) {
+		const ctrls = def && Array.isArray(def.clientControls) ? def.clientControls.filter((c) => c && Number(c.type) === 6) : [];
+		if (!(count > 0) || ctrls.length !== count) return null;
+		const loc = String(locale == null ? "" : locale).replace("-", "_");
+		const seen = {};
+		return ctrls.map((c, k) => {
+			const v = c.value;
+			let str = "";
+			if (typeof v === "string") str = v;
+			else if (v && Array.isArray(v.strDB)) {
+				const db = v.strDB.filter((e) => e && typeof e.str === "string");
+				const hit = db.find((e) => loc && e.localeString === loc) || db.find((e) => e.localeString === "en_US") || db[0];
+				str = hit ? hit.str : "";
+			}
+			let name = str.replace(/\r\n?|\n|[\u2028\u2029]/g, " / ").replace(/\s+/g, " ").trim();
+			if (!name) name = "텍스트 " + (k + 1);
+			if (name.length > 40) name = name.slice(0, 39) + "…";
+			seen[name] = (seen[name] || 0) + 1;
+			return seen[name] > 1 ? name + " (" + seen[name] + ")" : name;
+		});
+	}
 
 	// ── 속성 구조 서명 ──
 
@@ -1646,7 +1672,8 @@
 	}
 	//#endregion
 	//#region src/ui/paramEditor.ts
-	function renderParams(panel, list, onChange, exposedFontFields) {
+	// fids (선택): {param.index: {fid, caption, title, onClick}} — 텍스트 필드 라벨 앞에 T-ID 배지를 단다 (S1-6)
+	function renderParams(panel, list, onChange, exposedFontFields, fids) {
 		panel.innerHTML = "";
 		if (!list || list.length === 0) {
 			const p = document.createElement("p");
@@ -1655,9 +1682,9 @@
 			panel.appendChild(p);
 			return;
 		}
-		renderParamList(panel, list, onChange, exposedFontFields);
+		renderParamList(panel, list, onChange, exposedFontFields, fids);
 	}
-	function renderParamList(container, list, onChange, exposedFontFields) {
+	function renderParamList(container, list, onChange, exposedFontFields, fids) {
 		const groupStates = {};
 		let currentGroupEl = container;
 		let currentGroupKey = "";
@@ -1721,10 +1748,10 @@
 				currentGroupEl.appendChild(cmtEl);
 				continue;
 			}
-			currentGroupEl.appendChild(buildParamControl(param, onChange, exposedFontFields));
+			currentGroupEl.appendChild(buildParamControl(param, onChange, exposedFontFields, fids));
 		}
 	}
-	function buildParamControl(param, onChange, exposedFontFields) {
+	function buildParamControl(param, onChange, exposedFontFields, fids) {
 		const t = param.type;
 		if (t === "text") {
 			// exposedFontFields가 있으면 해당 인덱스 값 사용
@@ -1732,7 +1759,7 @@
 			const ef = exposedFontFields
 				? (exposedFontFields[param.index] !== undefined ? exposedFontFields[param.index] : undefined)
 				: undefined;
-			return buildMogrtTextBlock(param, onChange, ef);
+			return buildMogrtTextBlock(param, onChange, ef, fids ? fids[param.index] : null);
 		}
 		const rowEl = document.createElement("div");
 		rowEl.className = "mogrt-prop-row";
@@ -2050,7 +2077,22 @@
 		angleWrap.appendChild(axisWrap);
 		rowEl.appendChild(angleWrap);
 	}
-	function buildMogrtTextBlock(param, onChange, exposedFields = null) {
+	// T-ID 배지 (S1-6): <span class="fid-badge[ cap]">T2</span>. onClick이 있으면 누를 수 있다 (주소 복사)
+	function makeFidBadge(info) {
+		const badge = document.createElement("span");
+		badge.className = "fid-badge" + (info.caption ? " cap" : "");
+		badge.textContent = info.fid;
+		if (info.title) badge.title = info.title;
+		if (typeof info.onClick === "function") {
+			badge.addEventListener("click", (e) => {
+				e.stopPropagation();
+				info.onClick();
+			});
+		}
+		return badge;
+	}
+	// fidInfo (선택): {fid, caption, title, onClick} → 라벨 앞 배지
+	function buildMogrtTextBlock(param, onChange, exposedFields = null, fidInfo = null) {
 		// exposedFields가 undefined인 경우: param.fontExposed 기반으로 결정
 		// fontExposed === true → null (전체 표시)
 		// fontExposed === false → [] (텍스트만)
@@ -2080,7 +2122,10 @@
 		const showAnyStyle = showBold || showItalic || showAllCaps || showSmallCaps;
 		const lbl = document.createElement("div");
 		lbl.className = "mogrt-text-block-label";
-		lbl.textContent = param.displayName;
+		if (fidInfo && fidInfo.fid) {
+			lbl.appendChild(makeFidBadge(fidInfo));
+			lbl.appendChild(document.createTextNode(param.displayName == null ? "" : String(param.displayName)));
+		} else lbl.textContent = param.displayName;
 		block.appendChild(lbl);
 		const textarea = document.createElement("textarea");
 		textarea.className = "mogrt-text-area";
@@ -2952,13 +2997,18 @@
 		}
 		const guide = document.createElement("p");
 		guide.className = "modal-guide";
-		guide.innerHTML = "<b>☑ 노출</b>: SRT 편집 시 이 속성을 표시합니다. &nbsp; <b style=\"color:#4caf50\">T</b>: SRT 자막 텍스트가 자동 입력됩니다.";
+		guide.innerHTML = "<b>☑ 노출</b>: SRT 편집 시 이 속성을 표시합니다. &nbsp; <b style=\"color:#4caf50\">T</b>: SRT 자막 텍스트가 자동 입력됩니다." +
+			"<br><b>T1·T2…</b>: 위에서부터 매긴 텍스트 필드 번호 (후반 작업·AI 지정용)";
 		container.appendChild(guide);
 		renderModalParams(container, list, mogrtPath);
 	}
 	function renderModalParams(container, list, mogrtPath) {
 		const groupBodies = {};
 		let currentGroupEl = container;
+		// T-ID (위에서부터 매긴 텍스트 필드 번호). 캡션 표시(초록)는 T 버튼(modalState.textParamIndex)을 따른다
+		const fids = {};
+		const generic = isNativeList(list) && textFields(list).every((t) => /^텍스트 \d+$/.test(t.displayName));
+		fieldIdMap(list, -1).forEach((f) => { fids[f.index] = { fid: f.fid, generic }; });
 		for (let pi = 0; pi < list.length; pi++) {
 			const param = list[pi];
 			const t = param.type;
@@ -2996,15 +3046,15 @@
 				continue;
 			}
 			const targetEl = param.group ? groupBodies[param.group] || currentGroupEl : currentGroupEl;
-			const rowEl = buildModalParamRow(param, pi, list, mogrtPath, container);
+			const rowEl = buildModalParamRow(param, pi, list, mogrtPath, container, fids[param.index] || null);
 			targetEl.appendChild(rowEl);
 		}
 	}
-	function buildModalParamRow(param, pi, list, mogrtPath, container) {
+	function buildModalParamRow(param, pi, list, mogrtPath, container, fidInfo) {
 		const t = param.type;
 		const val = param.value ?? "";
 		const isExposed = modalState.exposedIndices.includes(param.index);
-		if (t === "text") return buildModalTextBlock(param, pi, list, mogrtPath, container);
+		if (t === "text") return buildModalTextBlock(param, pi, list, mogrtPath, container, fidInfo);
 		const rowEl = document.createElement("div");
 		rowEl.className = "modal-mogrt-row";
 		const chkExpose = document.createElement("input");
@@ -3346,7 +3396,11 @@
 		rowEl.appendChild(ctrl);
 		return rowEl;
 	}
-	function buildModalTextBlock(param, pi, list, mogrtPath, container) {
+	// 모달 T-ID 배지 제목 (캡션 여부는 T 버튼을 따라 바뀐다)
+	function _modalFidTitle(fid, caption, generic) {
+		return (generic ? "네이티브 템플릿: 순서 미확인 · " : "") + (caption ? "캡션 필드 (SRT 문장) " + fid : "텍스트 필드 " + fid + " (위에서부터 매긴 번호, 후반 작업·AI 지정용)");
+	}
+	function buildModalTextBlock(param, pi, list, mogrtPath, container, fidInfo) {
 		const block = document.createElement("div");
 		block.className = "mogrt-text-block modal-text-block";
 		let parsed = {};
@@ -3389,7 +3443,19 @@
 				modalState.textParamIndex = param.index;
 				textBtn.classList.add("active");
 			}
+			// 캡션 배지(초록)도 T 버튼을 따라 옮긴다
+			container.querySelectorAll(".fid-badge").forEach((b) => {
+				const cap = Number(b.dataset.idx) === modalState.textParamIndex;
+				b.classList.toggle("cap", cap);
+				b.title = _modalFidTitle(b.textContent, cap, b.dataset.generic === "1");
+			});
 		});
+		let fidBadge = null;
+		if (fidInfo && fidInfo.fid) {
+			fidBadge = makeFidBadge({ fid: fidInfo.fid, caption: isTextTarget, title: _modalFidTitle(fidInfo.fid, isTextTarget, fidInfo.generic) });
+			fidBadge.dataset.idx = String(param.index);
+			if (fidInfo.generic) fidBadge.dataset.generic = "1";
+		}
 		const lbl = document.createElement("span");
 		lbl.className = "modal-mogrt-label";
 		lbl.textContent = param.displayName;
@@ -3400,6 +3466,7 @@
 		resetBtn.style.marginLeft = "auto";
 		headerRow.appendChild(chkExpose);
 		headerRow.appendChild(textBtn);
+		if (fidBadge) headerRow.appendChild(fidBadge);
 		headerRow.appendChild(lbl);
 		headerRow.appendChild(resetBtn);
 		block.appendChild(headerRow);
@@ -3852,6 +3919,23 @@ var modalState = {
 				// capFontEdit === null: hostscript.jsx의 fontExposed 값 유지
 			}
 		});
+
+		// 네이티브 템플릿: 호스트의 일반 이름('텍스트 N')을 definition.json TextLayer 기본 문구로 바꾼다
+		// (S0-3 결정 4: TextLayer 순서 = Source Text 순서). 개수가 다르면 일반 이름을 그대로 둔다.
+		if (isNativeList(params)) {
+			const texts = params.filter((p) => p && p.type === "text");
+			const labels = nativeTextLabels(def, texts.length, _uiLocale());
+			if (labels) texts.forEach((p, k) => { p.displayName = labels[k]; });
+		}
+	}
+	// Premiere UI 로캘 ("ko_KR" 등, CSInterface hostEnvironment). 모르면 ""
+	function _uiLocale() {
+		try {
+			const cs = window.CSInterface ? new window.CSInterface() : null;
+			const env = cs && cs.hostEnvironment;
+			if (env && env.appUILocale) return String(env.appUILocale);
+		} catch (_) {}
+		return "";
 	}
 
 	// 모달 파라미터 읽기 요청 번호 (프리뷰 시퀀스를 준비하는 사이 다른 MOGRT를 고르면 이전 요청은 버린다)
@@ -3908,12 +3992,15 @@ var modalState = {
 					if (!state.mogrtOriginals[mogrtPath]) state.mogrtOriginals[mogrtPath] = pristine;
 				};
 				const existingPreset = presetId ? state.presets[presetId] : null;
+				const nativeList = isNativeList(freshList);
 				if (existingPreset) freshList.forEach((p) => {
 					const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
 					if (ep) {
 						p.value = ep.value;
 						if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
 						if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
+						// 네이티브는 필드 이름도 프리셋 것 (아래 definition 패치가 이름을 읽으면 그것으로 바뀐다)
+						if (nativeList && ep.displayName) p.displayName = ep.displayName;
 					}
 				});
 				modalState.paramList = freshList;
@@ -4012,12 +4099,15 @@ var modalState = {
 		// 깊은 복사로 원본 캐시 보호
 		const freshList = JSON.parse(JSON.stringify(cachedList));
 		const existingPreset = presetId ? state.presets[presetId] : null;
+		const nativeList = isNativeList(freshList);
 		if (existingPreset) freshList.forEach((p) => {
 			const ep = existingPreset.params.find((ep2) => ep2.index === p.index);
 			if (ep) {
 				p.value = ep.value;
 				if (ep.rawValue !== void 0) p.rawValue = ep.rawValue;
 				if (ep.colorHex !== void 0) p.colorHex = ep.colorHex;
+				// 네이티브는 필드 이름도 프리셋 것 (definition을 못 읽은 캐시로 열어 다시 저장해도 이름이 '텍스트 N'으로 돌아가지 않게)
+				if (nativeList && ep.displayName) p.displayName = ep.displayName;
 			}
 		});
 		modalState.paramList = freshList;
@@ -4569,7 +4659,7 @@ var modalState = {
 			renderParams(panel, rs.params, (changedParam) => {
 				syncToAllParams(subId, changedParam);
 				saveSessionToStorage();
-			}, exposedFontFields ?? void 0);
+			}, exposedFontFields ?? void 0, _rowFidMap(subId, rs));
 		};
 		// 시스템 폰트 캐시가 없으면 먼저 로드 후 렌더링
 		if (!_cachedSystemFonts) {
@@ -4580,6 +4670,58 @@ var modalState = {
 		} else {
 			doRender();
 		}
+	}
+	// 줄 속성창의 T-ID 배지: 줄 자신의 _allParams를 프리셋의 T-ID로 해석한다 (resolveFields).
+	// 해석되지 않은 필드에는 배지를 달지 않는다 (그 ID로는 쓰지 않는다). → {param.index: {fid, caption, title, onClick}}
+	function _rowFidMap(subId, rs) {
+		const all = rs && Array.isArray(rs._allParams) ? rs._allParams : [];
+		if (!all.length) return null;
+		const sub = state.subtitles.find((s) => s.id === subId);
+		if (!sub) return null;
+		const preset = rs.presetId ? state.presets[rs.presetId] : null;
+		const res = resolveFields(all, preset ? preset.params : null);
+		const capFid = preset ? captionFid(preset) : null;
+		const generic = isNativeList(all) && textFields(all).every((t) => /^텍스트 \d+$/.test(t.displayName));
+		const map = {};
+		Object.keys(res).forEach((fid) => {
+			const f = res[fid];
+			const addr = rowLabel(sub, _castMode()) + " " + fid;
+			const caption = fid === capFid;
+			const what = caption ? "캡션 필드 (SRT 문장)" : "텍스트 필드 " + fid + " (위에서부터 매긴 번호)";
+			map[f.index] = {
+				fid,
+				caption,
+				title: (generic ? "네이티브 템플릿: 순서 미확인 · " : "") + what + " — 누르면 '" + addr + "' 복사",
+				onClick: () => _copyFieldAddress(addr, f.displayName)
+			};
+		});
+		return map;
+	}
+	// 필드 주소("#12 T2" / "C2·12 T2")를 클립보드에 넣고 상태 줄에 알린다.
+	// navigator.clipboard가 없거나 거부되면 숨긴 textarea + execCommand("copy")로 한 번 더 시도한다.
+	function _copyFieldAddress(addr, displayName) {
+		const ok = () => _setStatus("복사됨: " + addr + (displayName ? " (" + displayName + ")" : "") + " — AI에게 붙여 넣으면 됩니다", "ok");
+		const fallback = () => {
+			let copied = false;
+			try {
+				const ta = document.createElement("textarea");
+				ta.value = addr;
+				ta.style.cssText = "position:fixed;left:-1000px;top:0;opacity:0;";
+				document.body.appendChild(ta);
+				ta.select();
+				copied = typeof document.execCommand === "function" && document.execCommand("copy") === true;
+				document.body.removeChild(ta);
+			} catch (_) { copied = false; }
+			if (copied) ok();
+			else _setStatus("클립보드에 넣지 못했습니다: " + addr, "err");
+		};
+		try {
+			if (window.navigator && window.navigator.clipboard && typeof window.navigator.clipboard.writeText === "function") {
+				window.navigator.clipboard.writeText(addr).then(ok, fallback);
+				return;
+			}
+		} catch (_) {}
+		fallback();
 	}
 	function syncToAllParams(subId, changedParam) {
 		const rs = state.rowStates[subId];
