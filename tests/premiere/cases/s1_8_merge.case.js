@@ -64,7 +64,11 @@ module.exports = {
 				assert.ok(Tp, "속성창에 캡션이 아닌 텍스트 필드가 노출되어 있어야 한다 (배지: " + badges.join(",") + ")");
 				const tpIdx = P.fields.find((f) => f.fid === Tp).index;
 				const vals = { 0: "인터뷰", 1: "날씨", 4: "산책" };
-				for (const k of Object.keys(vals)) assert.equal(await panel(pageTypeField(ids[k], Tp, vals[k])), true, "#" + k + " " + Tp);
+				for (const k of Object.keys(vals)) {
+					// 속성창은 줄마다 차례로 그려진다 → 그 줄의 배지가 생길 때까지 기다린 뒤 쓴다
+					await H.waitFor(panel, "document.querySelectorAll('#params-" + ids[k] + " .fid-badge').length > 0", { timeoutMs: 60000, what: "#" + k + " 속성창 배지" });
+					assert.equal(await panel(pageTypeField(ids[k], Tp, vals[k])), true, "#" + k + " " + Tp);
+				}
 				await H.waitFor(panel, "(() => { const s = " + SNAP + "; const p = s.rowStates[" + ids[1] + "]._allParams.find((x) => x.index === " + tpIdx + "); return p && p.value === '날씨'; })()", { what: Tp + " 값" });
 				const prior = await panel(SNAP);
 				log("(A) C1 7줄 + " + Tp + " 세 줄 (" + P.id + ")");
