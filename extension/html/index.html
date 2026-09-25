@@ -1130,6 +1130,13 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 .sub-mm.mm-restored { background: #26a69a; }
 .sub-mm.mm-undone { background: #ab47bc; }
 .sub-warn { font-size: 10px; font-weight: 700; color: #ffb300; flex-shrink: 0; cursor: help; padding: 0 2px; }
+/* 옛 구조 줄(.sub-struct)·못 옮긴 텍스트(.sub-orph), 옛 구조 줄 맞추기 버튼 (S1-10) */
+.sub-struct { font-size: 9px; color: #ffcc80; border: 1px solid #6a4a20; border-radius: 3px; padding: 0 4px; flex-shrink: 0; white-space: nowrap; cursor: pointer; }
+.sub-struct:hover { background: #3a2a10; }
+.sub-orph { font-size: 9px; color: #ce93d8; border: 1px solid #4a2a5a; border-radius: 3px; padding: 0 4px; flex-shrink: 0; white-space: nowrap; cursor: pointer; }
+.sub-orph:hover { background: #2a1a3a; }
+.btn-sel-changed.btn-rebase-stale { background: #2a2210; border-color: #6a4a20; color: #ffcc80; }
+.btn-sel-changed.btn-rebase-stale:hover { background: #3a2a10; }
 /* 마지막 적용 결과 (안전하게 적용이 건너뛴 까닭·클립 없음, S1-9) */
 .sub-res { font-size: 9px; color: #ef9a9a; border: 1px solid #5a3030; border-radius: 3px; padding: 0 4px; flex-shrink: 0; white-space: nowrap; max-width: 150px; overflow: hidden; text-overflow: ellipsis; cursor: help; }
 #btnApplyStop { padding: 6px 10px; font-size: 11px; background: #4a1a1a; border: 1px solid #8a2a2a; color: #ef9a9a; border-radius: 4px; cursor: pointer; }
@@ -1198,6 +1205,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
       </div>
       <button class="btn-close-all-params" id="btnCloseAllParams" title="열려있는 속성창 모두 닫기" disabled>속성 닫기</button>
       <button class="btn-sel-changed" id="btnSelectChanged" title="병합으로 바뀐 줄(점 표시)만 선택" style="display:none;">변경 줄 (0)</button>
+      <button class="btn-sel-changed btn-rebase-stale" id="btnRebaseStale" title="옛 버전 MOGRT로 만든 줄의 속성을 지금 프리셋 구조로 맞춤 (타임라인은 바꾸지 않음)" style="display:none;">옛 구조 줄 0개 맞추기</button>
       <div style="flex:1;"></div>
       <div id="historyWrap">
         <button id="btnHistory" title="자막 히스토리">히스토리</button>

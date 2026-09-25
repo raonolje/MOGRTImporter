@@ -357,6 +357,8 @@ test("노출 속성이 없는 줄의 _allParams가 프리셋과 다른 구조면
 	assert.deepEqual(all.map((p) => [p.index, p.displayName]), cur.map((p) => [p.index, p.displayName]), "지금 프리셋 구조");
 	assert.equal(all[4].value, "캡션 문장");
 	assert.match(h.snapshot().rowStates[1].psOld, /^[0-9a-f]{8}$/, "다시 채우기 전 서명 (S1-9)");
+	assert.equal(h.$("row-1").querySelector(".sub-struct"), null, "다시 채운 줄은 '구조' 표시가 없다 (S1-10)");
+	assert.equal(h.$("btnRebaseStale").style.display, "none");
 	h.$("btnApply").click();
 	await h.flush();
 	// psOld → v27에 위험한 줄 → 확인창. '지금 방식으로 전체 적용'도 이 줄은 이름으로 보낸다

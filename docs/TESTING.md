@@ -99,6 +99,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - `npm run hard` (`tests/premiere/suite.js`): 가드 → `smoke.expr.txt` → `cases/*.case.js`(이름순). `npm run hard -- s1_9`처럼 이름 일부로 거른다.
 - 스모크(`tests/premiere/smoke.expr.txt`, 읽기 전용): `window._mogrtDebug`가 object, `getActiveSequenceInfo()`가 seqId를 돌려준다.
 - 케이스 공용 도우미 `tests/premiere/lib/hard.js`: `waitFor`(페이지 표현식이 참이 될 때까지), 트랙 읽기·비우기 JSX(`jsxReadVideoTrack`, `jsxClearVideoTrack` — 스크래치 사본의 V2 이상만), 스크래치 시퀀스(`withScratchSequence` — 활성 T_ 시퀀스를 `Sequence.clone()`해 `T_scratch_<tag>`로 돌리고 끝나면 `deleteSequence`·DEV 세션 폴더 정리. 원본 T_23976에는 S0-3 수동 확인용 클립이 있어 타임라인을 바꾸는 케이스는 반드시 여기서 돈다), `#srtInput`에 파일 넣기(`pageDropSrt`), 행 요약(`PAGE_ROWS`), 새로 고침 예외 검사(`reloadClean`), 프리셋이 없을 때 모달로 만들기(`ensurePreset` — 먼저 `setupPreviewSequence`로 프리뷰 시퀀스를 만들어 V1을 지킨다).
+  - 적용·구조 맞춤 케이스용(S1-9, S1-10): 클립 속성 되읽기(`jsxTrackProps` — 클립마다 시작·끝·nodeId와 [이름, 값], 텍스트는 `T:`+textEditValue, `propValue`), MOGRT 직접 놓기(`jsxPlaceMogrt`, 스크래치 사본만), 확인창 기다리기(`waitConfirm`), `PAGE_CLEAR_STATUS`, `pageSelectTrack`, `pageCheckRow`, `pageTypeField`, 합성 SRT(`srtOf`), MOGRT로 프리셋 찾기·만들기(`pickPresetForMogrt`), 빈 목록에 SRT + 프리셋(`loadRowsWithPreset`), ▶ → [안전하게 적용 (N)](`safeApplyClick`).
 
 ### 테스트 프로젝트
 

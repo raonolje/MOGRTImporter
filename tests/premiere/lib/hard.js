@@ -325,6 +325,112 @@ async function waitStatus(panel, re, opts = {}) {
 	return waitFor(panel, "(() => { const s = " + PAGE_STATUS + "; return s && " + re.toString() + ".test(s.text) ? s : null; })()", { timeoutMs: opts.timeoutMs || 30000, what: "상태 " + re });
 }
 
+// ── 적용·구조 맞춤 케이스 공용 (S1-9, S1-10) ──
+
+const TPS = 254016000000;
+
+/**
+ * 활성 스크래치 사본의 트랙 idx 클립마다 {s, e, nodeId, props: [[이름, 값]]} (JSON 문자열).
+ * 텍스트 값은 "T:" + textEditValue, 나머지는 getValue() 문자열. MGT 컴포넌트가 없으면 props는 빈 배열
+ */
+function jsxTrackProps(idx) {
+	return "(function(){var seq=app.project.activeSequence;if(!seq)return JSON.stringify({error:'no-seq'});" +
+		"if(String(seq.name).indexOf('" + SCRATCH_PREFIX + "')!==0)return JSON.stringify({error:'not-scratch'});" +
+		"var t=seq.videoTracks[" + Number(idx) + "];var out=[];" +
+		"for(var k=0;k<t.clips.numItems;k++){var c=t.clips[k];var o={s:String(c.start.ticks),e:String(c.end.ticks),nodeId:String(c.nodeId),props:[]};" +
+		"var comp=null;try{comp=c.getMGTComponent();}catch(e){}" +
+		"if(comp){var ps=comp.properties;for(var j=0;j<ps.numItems;j++){var p=ps[j];var v='';try{v=String(p.getValue());}catch(e){v='?';}" +
+		"if(v.indexOf('\"textEditValue\"')!==-1){try{v='T:'+JSON.parse(v).textEditValue;}catch(e){}}" +
+		"o.props.push([String(p.displayName),v]);}}out.push(o);}return JSON.stringify(out);})()";
+}
+/** jsxTrackProps 클립의 이름 name 속성 값 (없으면 undefined) */
+function propValue(clip, name) {
+	const p = (clip.props || []).find((x) => x[0] === name);
+	return p ? p[1] : undefined;
+}
+/** MOGRT 하나를 활성 스크래치 사본의 트랙 idx, s초에 importMGT로 놓고 끝을 e초로 → "ok" | 까닭 */
+function jsxPlaceMogrt(mogrtPath, idx, s, e) {
+	return "(function(){var seq=app.project.activeSequence;if(String(seq.name).indexOf('" + SCRATCH_PREFIX + "')!==0)return 'not-scratch';" +
+		"var c=seq.importMGT(" + JSON.stringify(mogrtPath) + "," + JSON.stringify(String(Math.round(s * TPS))) + "," + Number(idx) + ",0);" +
+		"if(!c)return 'null';var t=new Time();t.seconds=" + Number(e) + ";c.end=t;return 'ok';})()";
+}
+/** 확인창이 열릴 때까지 기다린다 → {msg, yes, alt (숨김이면 null), no} */
+async function waitConfirm(panel, opts = {}) {
+	return waitFor(panel, "(() => { const m = document.getElementById('confirmModal'); if (!m || !m.classList.contains('open')) return null;" +
+		" const alt = document.getElementById('confirmAlt');" +
+		" return { msg: document.getElementById('confirmMessage').textContent, yes: document.getElementById('confirmYes').textContent," +
+		"  alt: alt && alt.style.display !== 'none' ? alt.textContent : null, no: document.getElementById('confirmNo').textContent }; })()", { timeoutMs: opts.timeoutMs || 15000, what: "확인창" });
+}
+/** 상태 줄을 비운다 (이전 문구를 다음 결과로 오인하지 않게, 테스트 전용 DOM 조작) */
+const PAGE_CLEAR_STATUS = "(() => { const s = document.getElementById('statusBar'); s.textContent = ''; s.className = ''; return true; })()";
+/** #trackSel 값을 바꾸고 change → 값 */
+function pageSelectTrack(v) {
+	return "(() => { const t = document.getElementById('trackSel'); t.value = " + JSON.stringify(String(v)) + "; t.dispatchEvent(new Event('change')); return t.value; })()";
+}
+/** 줄 체크박스를 켠다 → true | false(행 없음) */
+function pageCheckRow(id) {
+	return "(() => { const c = document.querySelector('#row-" + Number(id) + " input[type=checkbox]'); if (!c) return false; c.checked = true; c.dispatchEvent(new Event('change')); return true; })()";
+}
+/** 줄 속성창의 T-ID 필드 textarea에 쓴다 (사용자가 치는 것과 같다). 그 필드가 속성창에 없으면 false */
+function pageTypeField(id, fid, text) {
+	return "(() => { const b = Array.from(document.querySelectorAll('#params-" + Number(id) + " .fid-badge')).find((x) => x.textContent === " + JSON.stringify(fid) + ");" +
+		" if (!b) return false; const ta = b.parentNode.parentNode.querySelector('textarea'); if (!ta) return false;" +
+		" ta.value = " + JSON.stringify(text) + "; ta.dispatchEvent(new Event('input')); return true; })()";
+}
+
+/** [[시작, 끝(초), 문장]] → SRT 문자열 (합성 픽스처용) */
+function srtOf(cues) {
+	const tc = (sec) => {
+		const ms = Math.round(sec * 1000);
+		const p = (n, w) => String(n).padStart(w, "0");
+		return p(Math.floor(ms / 3600000), 2) + ":" + p(Math.floor((ms % 3600000) / 60000), 2) + ":" + p(Math.floor((ms % 60000) / 1000), 2) + "," + p(ms % 1000, 3);
+	};
+	return cues.map(([s, e, t], i) => (i + 1) + "\n" + tc(s) + " --> " + tc(e) + "\n" + t + "\n").join("\n");
+}
+/** mogrtPath(파일 이름으로 비교)를 쓰는 프리셋 {id, …프리셋} — 없으면 모달로 만든다 */
+async function pickPresetForMogrt(api, mogrtPath) {
+	const { panel, log } = api;
+	const base = (p) => String(p || "").replace(/\\/g, "/").split("/").pop();
+	const find = async () => {
+		const s = await panel("window._mogrtDebug.snapshot()");
+		const id = Object.keys(s.presets).find((k) => base(s.presets[k].mogrtPath) === base(mogrtPath));
+		return id ? Object.assign({}, s.presets[id], { id }) : null;
+	};
+	let p = await find();
+	if (!p) {
+		const mogrts = await waitMogrts(panel, 1);
+		const m = mogrts.find((x) => base(x[0]) === base(mogrtPath));
+		if (!m) throw new Error("MOGRT 목록에 " + base(mogrtPath) + "이 없다");
+		if (log) log("프리셋 만들기: " + m[1]);
+		await createPresetViaModal(api, m[0]);
+		p = await find();
+	}
+	return p;
+}
+/** 빈 목록에 SRT([[시작, 끝, 문장]])를 열고 모든 줄에 프리셋을 건다 (속성이 채워질 때까지) → 줄 id */
+async function loadRowsWithPreset(api, name, cues, presetId) {
+	const { panel, assert } = api;
+	const SNAP = "window._mogrtDebug.snapshot()";
+	assert.equal(await panel(pageDropSrt(name, srtOf(cues))), "sent");
+	await waitFor(panel, "document.querySelectorAll('#listWrap .sub-row').length === " + cues.length, { what: cues.length + "줄" });
+	const ids = (await panel(SNAP)).subtitles.map((s) => s.id);
+	for (const id of ids) assert.equal(await panel(pageSetRowPreset(id, presetId)), presetId);
+	await waitFor(panel, "(() => { const s = " + SNAP + "; return s.subtitles.every((x) => (s.rowStates[x.id]._allParams || []).length > 0); })()", { timeoutMs: 60000, what: "줄 속성" });
+	return ids;
+}
+/** ▶ → 확인창 [안전하게 적용 (wantN)] → 결과 상태 (S1-9) → {confirm, status} */
+async function safeApplyClick(api, wantN) {
+	const { panel, assert } = api;
+	await panel(PAGE_CLEAR_STATUS);
+	await panel("document.getElementById('btnApply').click(), true");
+	const c = await waitConfirm(panel);
+	assert.equal(c.yes, "안전하게 적용 (" + wantN + ")", c.msg);
+	assert.deepEqual([c.alt, c.no], ["지금 방식으로 전체 적용", "취소"]);
+	await panel("document.getElementById('confirmYes').click(), true");
+	const st = await waitStatus(panel, /^(중지함 — )?안전하게 적용: /, { timeoutMs: 120000 });
+	return { confirm: c, status: st };
+}
+
 /** DEV 캐시 루트인지 확인한다 (운영 캐시에는 절대 쓰지 않는다) → 루트 */
 async function devCacheRoot(panel) {
 	const root = await panel("window._mogrtDebug.getCacheRoot()");
@@ -337,5 +443,7 @@ module.exports = {
 	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed, jsxDeletePreviewSequence, jsxCloneActiveAsScratch, jsxDropScratch, withScratchSequence, SCRATCH_PREFIX,
 	pageDropSrt, pageDropSrts, pageSetMiCast, pageLoadWork, pageCmd, pageSetRowPreset, pageImportPresetsText,
 	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS, PAGE_RECORD_HOST_CALLS, PAGE_IMPORT_MODAL,
-	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot
+	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot,
+	jsxTrackProps, propValue, jsxPlaceMogrt, waitConfirm, PAGE_CLEAR_STATUS, pageSelectTrack, pageCheckRow, pageTypeField,
+	srtOf, pickPresetForMogrt, loadRowsWithPreset, safeApplyClick
 };

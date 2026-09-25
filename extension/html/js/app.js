@@ -2348,6 +2348,111 @@
 		});
 	}
 
+	// ── 구조 맞춤 (T-ID 기준, S1-10) ──
+	// 프리셋을 다시 저장하거나(MOGRT를 다시 읽어 구조가 바뀔 수 있다) 옛 구조 줄을 '현재 구조로 맞추기' 할 때
+	// 줄의 속성 목록을 프리셋의 지금 구조로 옮긴다. v27은 프리셋에서 통째로 다시 채워 후반 작업을 지웠다.
+	// 타임라인은 건드리지 않는다: 맞춘 줄의 클립은 옛 구조일 수 있어 psOld를 남기고 ▶·↑가 이름으로 쓴다 (S1-9).
+
+	// 비교용 속성 종류. 숫자 계열(number·angle·dropdown)은 같은 것으로 본다 (definition 패치가 number를 dropdown으로 바꾼다)
+	function _paramKind(p) {
+		const t = p && p.type;
+		return t === "number" || t === "angle" || t === "dropdown" ? "num" : String(t || "");
+	}
+	// 텍스트 필드 이름이 모두 네이티브 기본 이름('텍스트 N')인가
+	function _genericTextNames(params) {
+		const tf = textFields(params);
+		return tf.length > 0 && tf.every((t) => /^텍스트 \d+$/.test(t.displayName));
+	}
+	// 값으로 옮기지 않는 종류 (구조·설명)
+	const REBASE_SKIP_TYPES = { group: true, comment: true, textsetting: true };
+	// 배치에서 배우는 프리셋 선택 필드 (계획서 §2.3). 프리셋을 다시 저장해도 MOGRT가 같으면 가져간다
+	const PRESET_LEARNED_FIELDS = ["mogrtItemName", "mogrtDurSec", "mogrtLs", "mogrtBaseComps"];
+	// 줄 속성 목록 rowAll → 프리셋의 지금 구조 (순수). → {params: 새 _allParams, orphanFields: [{displayName, value}]}
+	//   텍스트 필드: 프리셋의 T-ID마다 줄에서 같은 ID를 찾아(resolveFields: 서수+이름, 이름, 네이티브는 서수;
+	//     한쪽이 '텍스트 N'이고 개수가 같으면 서수) 줄의 문장을 옮긴다. 스타일은 프리셋 것이다
+	//     (프리셋에서 글꼴을 바꾸면 줄에도 간다). 줄에서 글꼴을 바꿀 수 있던 필드(노출 + 프리셋 exposedFontFields)는
+	//     줄의 rawValue를 그대로 쓴다.
+	//     캡션 필드(프리셋 'T')에는 opts.caption(지금 캡션 문장)이 있으면 그것을 쓴다 ('T'를 옮겼거나 이름이 바뀌어도).
+	//   텍스트가 아닌 노출 속성: 줄에서 고칠 수 있었던(opts.rowExposed, 없으면 모두) 같은 종류·같은 이름의 유일한 속성 값
+	//   노출하지 않은 속성: 프리셋 값 (프리셋에서 바꾼 값이 줄에도 간다)
+	//   자리를 찾지 못한 줄 텍스트(비어 있지 않고, opts.oldParams의 같은 자리 기본값과 다른 것) → orphanFields
+	function rebaseRowParams(rowAll, preset, opts) {
+		const o = opts || {};
+		const row = rowAll || [];
+		const pp = (preset && preset.params) || [];
+		const out = JSON.parse(JSON.stringify(pp));
+		const exposed = preset && Array.isArray(preset.exposedIndices) ? preset.exposedIndices : [];
+		const fontFields = (preset && preset.exposedFontFields) || {};
+		const rowExp = Array.isArray(o.rowExposed) ? o.rowExposed : null;
+		const canEdit = (p) => !rowExp || rowExp.some((x) => x && x.index === p.index && x.type === p.type && (x.displayName || "") === (p.displayName || ""));
+		const caption = typeof o.caption === "string" ? o.caption : null;
+		const capFid = captionFid(preset);
+		const used = {};
+		let res = resolveFields(row, pp);
+		const preT = textFields(pp);
+		if (Object.keys(res).length < preT.length && (_genericTextNames(row) || _genericTextNames(pp)) && textFields(row).length === preT.length) res = resolveFields(row, null);
+		preT.forEach((t) => {
+			const target = out[t.pos];
+			const r = res[t.fid];
+			const rp = r && r.param ? r.param : null;
+			const isCap = t.fid === capFid && caption !== null;
+			if (!rp && !isCap) return;
+			const text = isCap ? caption : String(rp.value == null ? "" : rp.value);
+			if (rp && (!isCap || String(rp.value == null ? "" : rp.value) === caption)) used[row.indexOf(rp)] = true;
+			if (rp && canEdit(rp) && Array.isArray(fontFields[t.index]) && fontFields[t.index].length > 0 && typeof rp.rawValue === "string") target.rawValue = rp.rawValue;
+			setTextValue(target, text);
+		});
+		// 캡션 문장을 가진 줄 텍스트(옛 캡션 필드)는 옮긴 것으로 친다
+		if (capFid && caption !== null) {
+			const k = row.findIndex((p, i) => p && p.type === "text" && !used[i] && String(p.value == null ? "" : p.value) === caption);
+			if (k !== -1) used[k] = true;
+		}
+		out.forEach((q) => {
+			if (!q || q.type === "text" || REBASE_SKIP_TYPES[q.type] || !q.displayName || exposed.indexOf(q.index) === -1) return;
+			const cands = row.filter((p) => p && p.type !== "text" && _paramKind(p) === _paramKind(q) && (p.displayName || "") === q.displayName);
+			if (cands.length !== 1 || !canEdit(cands[0])) return;
+			const rp = cands[0];
+			q.value = rp.value;
+			if (rp.rawValue !== undefined) q.rawValue = rp.rawValue;
+			if (rp.colorHex !== undefined) q.colorHex = rp.colorHex;
+			else delete q.colorHex;
+		});
+		const defaults = Array.isArray(o.oldParams) ? o.oldParams : null;
+		const orphanFields = [];
+		row.forEach((p, i) => {
+			if (!p || p.type !== "text" || used[i]) return;
+			const v = String(p.value == null ? "" : p.value);
+			if (!v.trim()) return;
+			if (defaults && defaults.some((d) => d && d.index === p.index && (d.displayName || "") === (p.displayName || "") && String(d.value == null ? "" : d.value) === v)) return;
+			orphanFields.push({ displayName: p.displayName || "", value: v });
+		});
+		return { params: out, orphanFields };
+	}
+	// 못 옮긴 텍스트 목록 합치기 (이름·값이 같으면 하나) → {list, added: 새로 더한 수}
+	function mergeOrphanFields(a, b) {
+		const list = (Array.isArray(a) ? a : []).slice();
+		let added = 0;
+		(b || []).forEach((x) => {
+			if (!x || list.some((y) => y && y.displayName === x.displayName && y.value === x.value)) return;
+			list.push({ displayName: x.displayName, value: x.value });
+			added++;
+		});
+		return { list, added };
+	}
+	// 줄을 구조 맞춤 결과로 바꾼다 (제자리). exposedIndices로 노출 목록을 다시 고르고(같은 객체), 못 옮긴 텍스트를 더한다.
+	// 적용 기록(ap)이 없고 서명이 바뀌면 이전 서명을 psOld로 남긴다 (이미 있으면 가장 오래된 것을 둔다) → 새로 더한 못 옮긴 텍스트 수
+	function applyRebase(rs, preset, result) {
+		const oldSig = paramSig(rs._allParams || []);
+		const newSig = paramSig(result.params);
+		const exposed = preset && Array.isArray(preset.exposedIndices) ? preset.exposedIndices : [];
+		rs._allParams = result.params;
+		rs.params = result.params.filter((p) => exposed.indexOf(p.index) !== -1);
+		if (!rs.ap && !rs.psOld && oldSig !== newSig) rs.psOld = oldSig;
+		const m = mergeOrphanFields(rs.orphanFields, result.orphanFields);
+		if (m.list.length) rs.orphanFields = m.list;
+		return m.added;
+	}
+
 	// ── 명령(runCommand)용 주소·요약 ──
 
 	// 사람이 쓴 줄 주소 → {spk: "C2"|null, index: 12, fid: "T2"|null}. 형식이 아니면 null
@@ -5517,10 +5622,10 @@ var modalState = {
 			let presetId = modalState.presetId;
 			if (!presetId) presetId = _allocPresetId();
 			const usedBy = Object.entries(state.rowStates).filter(([, rs]) => rs.presetId === presetId).map(([id]) => parseInt(id, 10));
-			const doSave = () => {
-				// 이 프리셋을 쓰는 줄의 속성을 다시 채우기 전에 안전 지점을 남긴다
-				if (usedBy.length > 0) _saveSafety("프리셋 저장 전: " + presetName);
-				state.presets[presetId] = {
+			// 저장 전 프리셋 (줄의 캡션 찾기·기본값 거르기, 학습 필드)
+			const oldPreset = state.presets[presetId] ? JSON.parse(JSON.stringify(state.presets[presetId])) : null;
+			const buildPreset = () => {
+				const next = {
 					id: presetId,
 					name: presetName,
 					mogrtPath,
@@ -5530,19 +5635,38 @@ var modalState = {
 					exposedFontFields: JSON.parse(JSON.stringify(modalState.exposedFontFields)),
 					thumbnailData: _lastPreviewSrc || (state.presets[presetId]?.thumbnailData ?? null)
 				};
+				// 배치에서 배운 필드는 MOGRT가 그대로일 때만 가져간다 (v27은 이 필드를 모른다)
+				if (oldPreset && oldPreset.mogrtPath === mogrtPath) PRESET_LEARNED_FIELDS.forEach((k) => { if (oldPreset[k] !== undefined) next[k] = oldPreset[k]; });
+				return next;
+			};
+			const rowsOf = () => usedBy.map((subId) => state.subtitles.find((s) => s.id === subId)).filter(Boolean);
+			const doSave = () => {
+				// 이 프리셋을 쓰는 줄의 속성을 맞추기 전에 안전 지점을 남긴다
+				if (usedBy.length > 0) _saveSafety("프리셋 저장 전: " + presetName);
+				state.presets[presetId] = buildPreset();
 				savePresetsToStorage();
 				renderPresetList();
-				if (usedBy.length > 0) usedBy.forEach((subId) => {
-					const sub = state.subtitles.find((s) => s.id === subId);
-					if (sub) loadParamsFromPreset(subId, presetId, sub.text, false);
+				// 줄은 T-ID 기준으로 새 구조에 맞춘다 (텍스트 필드·줄마다 바꾼 노출 속성 유지, 못 옮긴 텍스트는 줄에 남김).
+				// 속성이 없던 줄은 v27처럼 프리셋에서 채운다 (S1-10)
+				rowsOf().forEach((sub) => {
+					if (!_rebaseRowTo(sub, state.rowStates[sub.id], state.presets[presetId], oldPreset, false)) loadParamsFromPreset(sub.id, presetId, sub.text, false);
 				});
+				if (usedBy.length > 0) saveSessionToStorage();
 				refreshAllSelects();
+				updateMultiSelect();
 				closePresetEdit();
 				closeModal();
 				_setStatus$1("프리셋 저장: " + presetName, "ok");
 			};
-			if (usedBy.length > 0 && modalState.presetId) showConfirm(`이 프리셋은 현재 ${usedBy.length}개의 자막에 사용 중입니다.\n저장하면 해당 자막의 속성이 업데이트됩니다.\n계속하시겠습니까?`, doSave);
-			else doSave();
+			if (usedBy.length > 0 && modalState.presetId) {
+				const next = buildPreset();
+				const orphans = rowsOf().reduce((n, sub) => {
+					const r = _rebaseRowTo(sub, state.rowStates[sub.id], next, oldPreset, true);
+					return n + (r ? r.added : 0);
+				}, 0);
+				showConfirm(`이 프리셋은 현재 ${usedBy.length}개의 자막에 사용 중입니다.\n저장하면 해당 자막의 속성이 업데이트됩니다.\n텍스트 필드와 줄마다 바꾼 노출 속성은 유지됩니다.` +
+					(orphans ? `\n자리를 찾지 못한 텍스트 ${orphans}개는 줄에 따로 남깁니다.` : "") + "\n계속하시겠습니까?", doSave);
+			} else doSave();
 		});
 	}
 	//#endregion
@@ -5607,6 +5731,7 @@ var modalState = {
 		if (rs.presetId && noExposed && (!hasAll || stale)) {
 			if (stale && !rs.ap && !rs.psOld) rs.psOld = paramSig(rs._allParams);
 			loadParamsFromPreset(sub.id, rs.presetId, sub.text, rs.open !== false);
+			if (stale) _refreshRowMarks(sub); // makeRow가 단 '구조' 표시를 뗀다
 			if (tBtn) { tBtn.style.display = ""; tBtn.textContent = rs.open ? "▲" : "▼"; }
 			return;
 		}
@@ -5762,14 +5887,8 @@ var modalState = {
 		});
 		hdr.appendChild(chkWrap);
 		hdr.appendChild(numEl);
-		// 병합 표시 (있을 때만 → 병합한 적 없는 목록의 행 DOM은 v27 그대로)
-		const mmEl = _mmBadge(sub, rowState);
-		if (mmEl) hdr.appendChild(mmEl);
-		const warnEl = _warnBadge(rowState);
-		if (warnEl) hdr.appendChild(warnEl);
-		// 마지막 적용 결과 (안전하게 적용이 건너뛰었거나 클립을 찾지 못한 까닭, 메모리에만)
-		const resEl = _resBadge(sub.id);
-		if (resEl) hdr.appendChild(resEl);
+		// 병합·적용·구조 표시 (있을 때만 → 병합한 적 없는 목록의 행 DOM은 v27 그대로)
+		_rowMarkEls(sub, rowState).forEach((el) => hdr.appendChild(el));
 		hdr.appendChild(timeEl);
 		hdr.appendChild(textEl);
 		hdr.appendChild(sel);
@@ -5831,6 +5950,101 @@ var modalState = {
 		const rs = state.rowStates[subId];
 		if (!rs) return false;
 		return setRowFieldValue(rs, rs.presetId ? state.presets[rs.presetId] : null, fid, text);
+	}
+	// 행 머리의 표시 (번호 뒤, 순서대로): 병합 점 · 포인트 경고 · 적용 결과 · 옛 구조 · 못 옮긴 텍스트
+	function _rowMarkEls(sub, rs) {
+		return [_mmBadge(sub, rs), _warnBadge(rs), _resBadge(sub.id), _structBadge(sub, rs), _orphBadge(sub, rs)].filter(Boolean);
+	}
+
+	// ── 구조 맞춤 (S1-10) ──
+	// 프리셋 저장(btnSaveDefault)은 그 프리셋을 쓰는 줄을, '현재 구조로 맞추기'는 옛 구조 줄을 core rebaseRowParams로
+	// 옮긴다 (텍스트는 T-ID로, 노출 속성은 줄 값, 나머지는 프리셋 값, 못 옮긴 텍스트는 rs.orphanFields).
+	// 사용자가 누를 때만 하고, 적용(▶·↑)은 부르지 않는다. 맞춘 줄의 클립은 옛 구조일 수 있어 psOld가 남고
+	// ▶·↑는 그 줄을 이름으로 쓴다 (S1-9).
+
+	// 줄 하나를 preset 구조로 맞춘다. oldPreset은 저장 전 프리셋(캡션 찾기·기본값 거르기, 없으면 preset).
+	// _allParams가 없는 줄은 맞출 것이 없다 → null (호출부가 v27처럼 프리셋에서 채운다).
+	// dry면 바꾸지 않고 {added: 새로 생길 못 옮긴 텍스트 수}만 → 아니면 {added}
+	function _rebaseRowTo(sub, rs, preset, oldPreset, dry) {
+		if (!rs || !preset || !rs._allParams || !rs._allParams.length) return null;
+		const cap = rowCaptionValue(rs, oldPreset || preset);
+		const result = rebaseRowParams(rs._allParams, preset, { rowExposed: rs.params || [], caption: cap !== null ? cap : sub.text, oldParams: oldPreset ? oldPreset.params : null });
+		if (dry) return { added: mergeOrphanFields(rs.orphanFields, result.orphanFields).added };
+		const added = applyRebase(rs, preset, result);
+		if (!rs.params.length) rs.open = false;
+		const tBtn = document.getElementById("toggle-" + sub.id);
+		if (tBtn) {
+			tBtn.style.display = rs.params.length > 0 ? "" : "none";
+			tBtn.textContent = rs.open ? "▲" : "▼";
+		}
+		const panel = document.getElementById("params-" + sub.id);
+		if (panel) panel.className = "sub-params" + (rs.open && rs.params.length ? " open" : "");
+		renderParamsPanel(sub.id);
+		_refreshRowMarks(sub);
+		return { added };
+	}
+	// 옛 구조 줄: 프리셋이 있고 _allParams의 구조가 프리셋과 다르다 (옛 버전 MOGRT로 만든 줄) → 줄 id
+	function _staleRowIds() {
+		return state.subtitles.filter((sub) => {
+			const rs = state.rowStates[sub.id];
+			const preset = rs && rs.presetId ? state.presets[rs.presetId] : null;
+			return !!preset && !!rs._allParams && rs._allParams.length > 0 && layoutMismatch(rs._allParams, preset.params);
+		}).map((sub) => sub.id);
+	}
+	const REBASE_CONFIRM_MSG = "속성을 지금 프리셋 구조로 맞춥니다.\n\n텍스트 필드는 T1·T2… 번호로 옮기고, 줄마다 바꾼 노출 속성은 유지합니다. 자리를 찾지 못한 텍스트는 줄에 따로 남깁니다.\n타임라인의 클립은 바꾸지 않습니다 (옛 구조 클립은 ▶·↑가 속성 이름으로 씁니다).";
+	// 옛 구조 줄 ids를 맞춘다: 안전 지점 '구조 맞춤 전' → 줄마다 맞춤 → 저장 → 몇 줄
+	function _rebaseStale(ids) {
+		const want = {};
+		(ids || []).forEach((id) => { want[id] = true; });
+		const subs = state.subtitles.filter((sub) => want[sub.id]);
+		if (!subs.length) return 0;
+		_saveSafety("구조 맞춤 전");
+		let n = 0;
+		let orphans = 0;
+		subs.forEach((sub) => {
+			const rs = state.rowStates[sub.id];
+			const r = _rebaseRowTo(sub, rs, rs && rs.presetId ? state.presets[rs.presetId] : null, null, false);
+			if (!r) return;
+			n++;
+			orphans += r.added;
+		});
+		saveSessionToStorage();
+		_updateMultiSelect();
+		_setStatus("구조 맞춤: " + n + "줄" + (orphans ? " · 자리를 찾지 못한 텍스트 " + orphans + "개는 줄에 남겼습니다" : ""), "ok");
+		return n;
+	}
+	// '구조' 표시: 옛 구조 줄. 누르면 이 줄만 맞춘다 (확인 후)
+	function _structBadge(sub, rs) {
+		const preset = rs && rs.presetId ? state.presets[rs.presetId] : null;
+		if (!preset || !rs._allParams || !rs._allParams.length || !layoutMismatch(rs._allParams, preset.params)) return null;
+		const el = document.createElement("span");
+		el.className = "sub-struct";
+		el.textContent = "구조";
+		el.title = "속성 구조가 프리셋과 다릅니다 (옛 버전 MOGRT로 만든 줄). 누르면 현재 구조로 맞춥니다 — 타임라인 클립은 바꾸지 않습니다";
+		el.addEventListener("click", (e) => {
+			e.stopPropagation();
+			showConfirm(rowLabel(sub, _castMode()) + " 줄의 " + REBASE_CONFIRM_MSG, () => _rebaseStale([sub.id]), null, { yes: "현재 구조로 맞추기" });
+		});
+		return el;
+	}
+	// 못 옮긴 텍스트 (rs.orphanFields): 구조를 맞출 때 자리를 찾지 못한 텍스트. 누르면 보여 주고 지울 수 있다
+	function _orphBadge(sub, rs) {
+		const list = rs && Array.isArray(rs.orphanFields) ? rs.orphanFields : [];
+		if (!list.length) return null;
+		const lines = list.map((x) => (x.displayName || "(이름 없음)") + ": " + x.value);
+		const el = document.createElement("span");
+		el.className = "sub-orph";
+		el.textContent = "못 옮김 " + list.length;
+		el.title = "구조를 맞출 때 자리를 찾지 못한 텍스트\n" + lines.join("\n");
+		el.addEventListener("click", (e) => {
+			e.stopPropagation();
+			showConfirm("구조를 맞출 때 자리를 찾지 못한 텍스트 " + list.length + "개:\n\n" + lines.join("\n") + "\n\n필요하면 속성창에 옮겨 적은 뒤 목록에서 지우세요.", () => {
+				delete rs.orphanFields;
+				_refreshRowMarks(sub);
+				saveSessionToStorage();
+			}, null, { yes: "목록에서 지우기", no: "그대로 두기" });
+		});
+		return el;
 	}
 	function renderParamsPanel(subId) {
 		const panel = document.getElementById("params-" + subId);
@@ -6100,6 +6314,13 @@ var modalState = {
 			const n = state.subtitles.filter((s) => state.rowStates[s.id] && state.rowStates[s.id].mm).length;
 			changedBtn.textContent = "변경 줄 (" + n + ")";
 			changedBtn.style.display = n > 0 ? "" : "none";
+		}
+		// "옛 구조 줄 N개 맞추기": 속성 구조가 프리셋과 다른 줄이 있을 때만 보인다 (S1-10)
+		const staleBtn = document.getElementById("btnRebaseStale");
+		if (staleBtn) {
+			const n = _staleRowIds().length;
+			staleBtn.textContent = "옛 구조 줄 " + n + "개 맞추기";
+			staleBtn.style.display = n > 0 ? "" : "none";
 		}
 	}
 	async function syncFromTimeline() {
@@ -7249,11 +7470,9 @@ var modalState = {
 		const hdr = row && row.querySelector(".sub-header");
 		const num = hdr && hdr.querySelector(".sub-num");
 		if (!num) return;
-		hdr.querySelectorAll(".sub-mm, .sub-warn, .sub-res").forEach((el) => el.parentNode && el.parentNode.removeChild(el));
-		const rs = state.rowStates[sub.id];
+		hdr.querySelectorAll(".sub-mm, .sub-warn, .sub-res, .sub-struct, .sub-orph").forEach((el) => el.parentNode && el.parentNode.removeChild(el));
 		let after = num;
-		[_mmBadge(sub, rs), _warnBadge(rs), _resBadge(sub.id)].forEach((el) => {
-			if (!el) return;
+		_rowMarkEls(sub, state.rowStates[sub.id]).forEach((el) => {
 			hdr.insertBefore(el, after.nextSibling);
 			after = el;
 		});
@@ -7954,6 +8173,12 @@ var modalState = {
 		});
 		updateMultiSelect();
 		setStatus("변경 줄 " + n + "개 선택", "ok");
+	});
+	// ── 옛 구조 줄 맞추기: 사용자가 누를 때만 (안전 지점 '구조 맞춤 전'), 적용은 부르지 않는다 (S1-10) ──
+	document.getElementById("btnRebaseStale")?.addEventListener("click", () => {
+		const ids = _staleRowIds();
+		if (!ids.length) return;
+		showConfirm("옛 구조 줄 " + ids.length + "개의 " + REBASE_CONFIRM_MSG, () => _rebaseStale(ids), null, { yes: "현재 구조로 맞추기" });
 	});
 	document.getElementById("btnMultiDel")?.addEventListener("click", () => {
 		Object.entries(state.rowStates).filter(([, rs]) => rs.checked).map(([id]) => parseInt(id, 10)).forEach((id) => deleteSubtitle(id));

@@ -17,52 +17,16 @@
  *       줄에 '근처에 다른 줄이 있어 건너뜀', mm 유지
  * 실행: npm run hard -- s1_9
  */
-const path = require("node:path");
 const H = require("../lib/hard");
 const MOGRT = require("../../fixtures/mogrt/make_old_mogrt");
 
-const TPS = 254016000000;
 const TRACK = 2; // V3
 const SNAP = "window._mogrtDebug.snapshot()";
 
-const tc = (sec) => {
-	const ms = Math.round(sec * 1000);
-	const p = (n, w) => String(n).padStart(w, "0");
-	return p(Math.floor(ms / 3600000), 2) + ":" + p(Math.floor((ms % 3600000) / 60000), 2) + ":" + p(Math.floor((ms % 60000) / 1000), 2) + "," + p(ms % 1000, 3);
-};
-const srtOf = (cues) => cues.map(([s, e, t], i) => (i + 1) + "\n" + tc(s) + " --> " + tc(e) + "\n" + t + "\n").join("\n");
+const { jsxTrackProps, jsxPlaceMogrt, waitConfirm, PAGE_CLEAR_STATUS, pageSelectTrack, pageCheckRow, srtOf, pickPresetForMogrt, loadRowsWithPreset, safeApplyClick } = H;
 const base = (p) => String(p || "").replace(/\\/g, "/").split("/").pop();
-
-// 트랙 idx의 클립마다 {s, e, nodeId, props: [[이름, 값]]} (텍스트 값은 "T:" + textEditValue). 스크래치 사본에서만
-function jsxTrackProps(idx) {
-	return "(function(){var seq=app.project.activeSequence;if(!seq)return JSON.stringify({error:'no-seq'});" +
-		"if(String(seq.name).indexOf('" + H.SCRATCH_PREFIX + "')!==0)return JSON.stringify({error:'not-scratch'});" +
-		"var t=seq.videoTracks[" + Number(idx) + "];var out=[];" +
-		"for(var k=0;k<t.clips.numItems;k++){var c=t.clips[k];var o={s:String(c.start.ticks),e:String(c.end.ticks),nodeId:String(c.nodeId),props:[]};" +
-		"var comp=null;try{comp=c.getMGTComponent();}catch(e){}" +
-		"if(comp){var ps=comp.properties;for(var j=0;j<ps.numItems;j++){var p=ps[j];var v='';try{v=String(p.getValue());}catch(e){v='?';}" +
-		"if(v.indexOf('\"textEditValue\"')!==-1){try{v='T:'+JSON.parse(v).textEditValue;}catch(e){}}" +
-		"o.props.push([String(p.displayName),v]);}}out.push(o);}return JSON.stringify(out);})()";
-}
-// MOGRT 하나를 트랙 idx의 s초에 importMGT로 놓고 끝을 e초로 → "ok" | 까닭 (스크래치 사본에서만)
-function jsxPlaceMogrt(mogrtPath, idx, s, e) {
-	return "(function(){var seq=app.project.activeSequence;if(String(seq.name).indexOf('" + H.SCRATCH_PREFIX + "')!==0)return 'not-scratch';" +
-		"var c=seq.importMGT(" + JSON.stringify(mogrtPath) + "," + JSON.stringify(String(Math.round(s * TPS))) + "," + Number(idx) + ",0);" +
-		"if(!c)return 'null';var t=new Time();t.seconds=" + Number(e) + ";c.end=t;return 'ok';})()";
-}
-const valOf = (clip, name) => { const p = clip.props.find((x) => x[0] === name); return p ? p[1] : undefined; };
-
-// 확인창 {msg, yes, alt, no} (열릴 때까지 기다린다)
-async function waitConfirm(panel) {
-	return H.waitFor(panel, "(() => { const m = document.getElementById('confirmModal'); if (!m || !m.classList.contains('open')) return null;" +
-		" const alt = document.getElementById('confirmAlt');" +
-		" return { msg: document.getElementById('confirmMessage').textContent, yes: document.getElementById('confirmYes').textContent," +
-		"  alt: alt && alt.style.display !== 'none' ? alt.textContent : null, no: document.getElementById('confirmNo').textContent }; })()", { timeoutMs: 15000, what: "확인창" });
-}
+const valOf = H.propValue;
 const click = (id) => "document.getElementById(" + JSON.stringify(id) + ").click(), true";
-const PAGE_CLEAR_STATUS = "(() => { const s = document.getElementById('statusBar'); s.textContent = ''; s.className = ''; return true; })()";
-const pageSelectTrack = (v) => "(() => { const t = document.getElementById('trackSel'); t.value = " + JSON.stringify(String(v)) + "; t.dispatchEvent(new Event('change')); return t.value; })()";
-const pageCheckRow = (id) => "(() => { const c = document.querySelector('#row-" + Number(id) + " input[type=checkbox]'); if (!c) return false; c.checked = true; c.dispatchEvent(new Event('change')); return true; })()";
 const pageRowRes = (id) => "(() => { const el = document.querySelector('#row-" + Number(id) + " .sub-res'); return el ? el.textContent : null; })()";
 
 /**
@@ -80,35 +44,6 @@ function pageStubApply(mode) {
 }
 const PAGE_UNSTUB = "(() => { if (window.__s19orig) { CSInterface.prototype.evalScript = window.__s19orig; delete window.__s19orig; } return true; })()";
 
-// 자동 줄바꿈 박스 자막(15속성) 프리셋 {id, …} — 없으면 모달로 만든다
-async function pickPreset(api, fx) {
-	const { panel, log } = api;
-	const find = async () => {
-		const s = await panel(SNAP);
-		const id = Object.keys(s.presets).find((k) => base(s.presets[k].mogrtPath) === base(fx.newPath));
-		return id ? Object.assign({}, s.presets[id], { id }) : null;
-	};
-	let p = await find();
-	if (!p) {
-		const mogrts = await H.waitMogrts(panel, 1);
-		const m = mogrts.find((x) => base(x[0]) === base(fx.newPath));
-		if (!m) throw new Error("MOGRT 목록에 " + base(fx.newPath) + "이 없다");
-		log("프리셋 만들기: " + m[1]);
-		await H.createPresetViaModal(api, m[0]);
-		p = await find();
-	}
-	return p;
-}
-// 빈 목록에 SRT를 열고 모든 줄에 프리셋 → 줄 id
-async function loadRows(api, name, cues, presetId) {
-	const { panel, assert } = api;
-	assert.equal(await panel(H.pageDropSrt(name, srtOf(cues))), "sent");
-	await H.waitFor(panel, "document.querySelectorAll('#listWrap .sub-row').length === " + cues.length, { what: cues.length + "줄" });
-	const ids = (await panel(SNAP)).subtitles.map((s) => s.id);
-	for (const id of ids) assert.equal(await panel(H.pageSetRowPreset(id, presetId)), presetId);
-	await H.waitFor(panel, "(() => { const s = " + SNAP + "; return s.subtitles.every((x) => (s.rowStates[x.id]._allParams || []).length > 0); })()", { timeoutMs: 60000, what: "줄 속성" });
-	return ids;
-}
 // 평소 ▶ (체크 없음) → v27 결과 상태
 async function applyPlain(api) {
 	const { panel } = api;
@@ -127,19 +62,6 @@ async function mergeLegacy(api, name, cues) {
 	await panel(click("confirmYes"));
 	return H.waitStatus(panel, /^SRT 병합: /);
 }
-// 안전하게 적용 버튼을 누르고 결과 상태를 기다린다
-async function safeApply(api, wantN) {
-	const { panel, assert } = api;
-	await panel(PAGE_CLEAR_STATUS);
-	await panel(click("btnApply"));
-	const c = await waitConfirm(panel);
-	assert.equal(c.yes, "안전하게 적용 (" + wantN + ")", c.msg);
-	assert.deepEqual([c.alt, c.no], ["지금 방식으로 전체 적용", "취소"]);
-	await panel(click("confirmYes"));
-	const st = await H.waitStatus(panel, /^(중지함 — )?안전하게 적용: /, { timeoutMs: 120000 });
-	return { confirm: c, status: st };
-}
-
 module.exports = {
 	name: "S1-9 레거시 안전 적용 (v27 호스트 그대로)",
 	run: async (api) => {
@@ -148,7 +70,7 @@ module.exports = {
 		assert.equal(await panel(H.pageSetMiCast(false)), false, "운영처럼 플래그를 끈다");
 		const fx = MOGRT.makeOldLayoutMogrt({});
 		log("옛 구조 MOGRT: " + base(fx.source) + " → " + fx.path + " (" + fx.oldNames.length + "속성, 새 버전 " + fx.newNames.length + "속성)");
-		const P = await pickPreset(api, fx);
+		const P = await pickPresetForMogrt(api, fx.newPath);
 		const capParam = P.params.find((x) => x.index === P.textParamIndex);
 		assert.ok(capParam, "프리셋 " + P.id + "에 캡션 필드가 있어야 한다");
 		const CAP = capParam.displayName;
@@ -160,7 +82,7 @@ module.exports = {
 				assert.equal(await host(H.jsxClearVideoTrack(TRACK)), "0", "V3 비우기");
 				assert.equal(await panel(pageSelectTrack(TRACK)), String(TRACK));
 				const cues = Array.from({ length: 20 }, (_, i) => [1 + 2 * i, 2.5 + 2 * i, "S19 합성 줄 " + (i + 1)]);
-				const ids = await loadRows(api, "s1_9_twenty.srt", cues, P.id);
+				const ids = await loadRowsWithPreset(api, "s1_9_twenty.srt", cues, P.id);
 				const st0 = await applyPlain(api);
 				assert.equal(st0.cls, "ok", st0.text);
 				const before = JSON.parse(await host(jsxTrackProps(TRACK)));
@@ -171,7 +93,7 @@ module.exports = {
 				await mergeLegacy(api, "s1_9_twenty_v2.srt", v2);
 				let s = await panel(SNAP);
 				assert.deepEqual(ids.map((id) => s.rowStates[id].mm || "").filter(Boolean), ["text", "text", "text"], "문장 3개만 mm");
-				const r1 = await safeApply(api, 3);
+				const r1 = await safeApplyClick(api, 3);
 				assert.match(r1.confirm.msg, /^바뀐 줄 3개가 있습니다\./);
 				assert.equal(r1.status.text, "안전하게 적용: 갱신 3", r1.status.text);
 				const after = JSON.parse(await host(jsxTrackProps(TRACK)));
@@ -221,7 +143,7 @@ module.exports = {
 			assert.equal(await host(H.jsxClearVideoTrack(TRACK)), "0", "V3 비우기");
 			assert.equal(await panel(pageSelectTrack(TRACK)), String(TRACK));
 			const cues = [[2, 4, "S19 옛 구조 하나"], [6, 8, "S19 옛 구조 둘"]];
-			const ids = await loadRows(api, "s1_9_old.srt", cues, P.id);
+			const ids = await loadRowsWithPreset(api, "s1_9_old.srt", cues, P.id);
 			for (const c of cues) assert.equal(await host(jsxPlaceMogrt(fx.path, TRACK, c[0], c[1])), "ok", "옛 구조 클립 놓기");
 			const before = JSON.parse(await host(jsxTrackProps(TRACK)));
 			assert.equal(before.length, 2);
@@ -229,7 +151,7 @@ module.exports = {
 			assert.notEqual(before[0].props.map((p) => p[0]).indexOf(CAP), P.textParamIndex, "캡션 자리가 프리셋 index와 다르다 (index로 쓰면 틀린 속성)");
 			const v2 = [[2, 4, "S19 옛 구조 하나 고침"], cues[1]];
 			await mergeLegacy(api, "s1_9_old_v2.srt", v2);
-			const r = await safeApply(api, 1);
+			const r = await safeApplyClick(api, 1);
 			assert.equal(r.status.text, "안전하게 적용: 갱신 1");
 			const after = JSON.parse(await host(jsxTrackProps(TRACK)));
 			assert.equal(after.length, 2);
@@ -250,7 +172,7 @@ module.exports = {
 				assert.equal(await host(H.jsxClearVideoTrack(TRACK)), "0", "V3 비우기");
 				assert.equal(await panel(pageSelectTrack(TRACK)), String(TRACK));
 				const cues = [[2, 3.8, "S19 근처 가"], [2.3, 4, "S19 근처 나"], [6, 7.5, "S19 근처 다"]];
-				const ids = await loadRows(api, "s1_9_near.srt", cues, P.id);
+				const ids = await loadRowsWithPreset(api, "s1_9_near.srt", cues, P.id);
 				// (5)
 				await panel(pageStubApply("fake"));
 				await panel(PAGE_CLEAR_STATUS);
@@ -279,7 +201,7 @@ module.exports = {
 				const v2 = [[2, 3.8, "S19 근처 가 고침"], cues[1], [6, 7.5, "S19 근처 다 고침"]];
 				await mergeLegacy(api, "s1_9_near_v2.srt", v2);
 				await panel(H.PAGE_RECORD_HOST_CALLS);
-				const r = await safeApply(api, 1);
+				const r = await safeApplyClick(api, 1);
 				assert.match(r.confirm.msg, /0\.5초 안에 다른 줄이 있는 1개는 건너뜁니다/);
 				assert.equal(r.status.text, "안전하게 적용: 갱신 1 · 근처 줄 1");
 				const calls = await panel("window.__hostCalls.slice()");

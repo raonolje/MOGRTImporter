@@ -225,3 +225,36 @@ test("운영 캐시 (S1-9): 병합으로 문장을 바꾼 줄은 안전 적용�
 	}
 	t.diagnostic("안전 적용으로 보낼 줄 " + text + "개 (캡션 이름 쓰기 " + named + "개, 옛 구조 " + staleRows + "개), 건너뜀 " + JSON.stringify(skips));
 });
+
+test("운영 캐시 (S1-10): 옛 구조 줄을 지금 프리셋 구조로 맞추면 구조가 같아지고 캡션·텍스트 필드 값이 T-ID대로 옮겨진다", { skip }, (t) => {
+	const core = loadRegions(["src/mi/core.ts"]);
+	let stale = 0;
+	let orphans = 0;
+	let rebasedAll = 0;
+	for (const s of sequences()) {
+		const raw = readText(path.join(s.dir, "session.json"));
+		if (!raw || !s.presets) continue;
+		let sess;
+		let presets;
+		try { sess = JSON.parse(raw); presets = JSON.parse(s.presets).presets || {}; } catch (_) { continue; }
+		for (const sub of sess.subtitles || []) {
+			const rs = (sess.rowStates || {})[sub.id];
+			const preset = rs && rs.presetId ? presets[rs.presetId] : null;
+			if (!preset || !Array.isArray(rs._allParams) || !rs._allParams.length) continue;
+			const cap = core.rowCaptionValue(rs, preset);
+			const r = core.rebaseRowParams(rs._allParams, preset, { rowExposed: rs.params || [], caption: cap !== null ? cap : sub.text });
+			const where = tag(s) + " id " + sub.id;
+			assert.equal(core.layoutMismatch(r.params, preset.params), false, where + ": 지금 구조");
+			const res = core.resolveFields(rs._allParams, preset.params);
+			Object.keys(res).forEach((fid) => {
+				const got = core.resolveFid(r.params, fid, preset.params);
+				assert.equal(String(got.param.value), String(res[fid].param.value), where + " " + fid);
+			});
+			if (cap !== null) assert.equal(core.rowCaptionValue({ _allParams: r.params }, preset), cap, where + ": 캡션");
+			if (core.layoutMismatch(rs._allParams, preset.params)) stale++;
+			orphans += r.orphanFields.length;
+			rebasedAll++;
+		}
+	}
+	t.diagnostic("맞춘 줄 " + rebasedAll + "개 (옛 구조 " + stale + "개), 못 옮긴 텍스트 " + orphans + "개");
+});
