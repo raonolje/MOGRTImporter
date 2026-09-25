@@ -1,0 +1,144 @@
+"use strict";
+/**
+ * 하드 케이스(tests/premiere/cases/*.case.js) 공용 도우미.
+ * Premiere·패널에는 케이스가 넘겨준 panel()/host()로만 닿는다. 이 파일 자체는 아무 데도 붙지 않는다.
+ *
+ *   const H = require("../lib/hard");
+ *   await H.waitFor(panel, "document.querySelectorAll('#listWrap .sub-row').length === 3", { what: "행 3개" });
+ *   const v3 = JSON.parse(await host(H.jsxReadVideoTrack(2)));
+ *
+ * - JSX 문자열은 ES3로 쓴다 (host()가 ASCII로 바꿔 evalScript에 넘긴다).
+ * - 트랙 비우기는 T_ 시퀀스의 V2 이상에서만 한다. V1(영상)은 절대 건드리지 않는다.
+ */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 페이지 표현식이 참이 될 때까지 기다린다. 참 값을 돌려준다 */
+async function waitFor(panel, expr, opts = {}) {
+	const timeoutMs = opts.timeoutMs || 30000;
+	const stepMs = opts.stepMs || 250;
+	const t0 = Date.now();
+	let last;
+	while (Date.now() - t0 < timeoutMs) {
+		try {
+			last = await panel(expr);
+			if (last) return last;
+		} catch (e) {
+			last = "예외: " + e.message;
+		}
+		await sleep(stepMs);
+	}
+	throw new Error("시간 초과(" + timeoutMs + "ms): " + (opts.what || expr) + " — 마지막 값: " + JSON.stringify(last));
+}
+
+// ── 호스트(JSX, ES3) ──
+
+/** 활성 시퀀스의 비디오 트랙 idx 클립 목록 → JSON {seqName, timebase, clips:[{s, e, name, nodeId}]} (ticks 문자열) */
+function jsxReadVideoTrack(idx) {
+	const i = Number(idx);
+	if (!(i >= 0)) throw new Error("트랙 번호가 이상하다: " + idx);
+	return "(function(){var seq=app.project.activeSequence;if(!seq)return JSON.stringify({error:'no-seq'});" +
+		"var t=seq.videoTracks[" + i + "];if(!t)return JSON.stringify({error:'no-track'});var out=[];" +
+		"for(var k=0;k<t.clips.numItems;k++){var c=t.clips[k];out.push({s:String(c.start.ticks),e:String(c.end.ticks),name:String(c.name),nodeId:String(c.nodeId)});}" +
+		"return JSON.stringify({seqName:String(seq.name),timebase:String(seq.timebase),clips:out});})()";
+}
+
+/** 활성 T_ 시퀀스의 비디오 트랙 idx(1 이상)를 비운다 → 남은 클립 수 문자열 */
+function jsxClearVideoTrack(idx) {
+	const i = Number(idx);
+	if (!(i >= 1)) throw new Error("V1(트랙 0)은 비우지 않는다: " + idx);
+	return "(function(){var seq=app.project.activeSequence;if(!seq)return 'no-seq';" +
+		"if(String(seq.name).indexOf('T_')!==0)return 'not-T';" +
+		"var t=seq.videoTracks[" + i + "];if(!t)return 'no-track';" +
+		"for(var k=t.clips.numItems-1;k>=0;k--){try{t.clips[k].remove(false,false);}catch(e){}}" +
+		"return String(t.clips.numItems);})()";
+}
+
+/** 이름이 있는 시퀀스가 프로젝트에 있는가 → "true"/"false" */
+function jsxHasSequenceNamed(name) {
+	return "(function(){var n=" + JSON.stringify(String(name)) + ";var p=app.project;for(var k=0;k<p.sequences.numSequences;k++){if(String(p.sequences[k].name)===n)return 'true';}return 'false';})()";
+}
+
+/** ticks 문자열 → 프레임 (timebase = 프레임당 ticks) */
+function ticksToFrame(ticks, timebase) {
+	return Math.round(Number(ticks) / Number(timebase));
+}
+
+// ── 패널(페이지 표현식) ──
+
+/** #srtInput에 파일 하나를 넣고 change를 보낸다. content: 문자열(UTF-8) 또는 바이트 배열 */
+function pageDropSrt(name, content) {
+	const part = typeof content === "string" ? JSON.stringify(content) : "new Uint8Array(" + JSON.stringify(Array.from(content)) + ")";
+	return "(() => { const input = document.getElementById('srtInput'); if (!input) return 'no-input';" +
+		" const dt = new DataTransfer(); dt.items.add(new File([" + part + "], " + JSON.stringify(name) + "));" +
+		" input.files = dt.files; input.dispatchEvent(new Event('change', { bubbles: true }));" +
+		" return input.disabled ? 'sent-disabled' : 'sent'; })()";
+}
+
+/** 목록 행 요약 [{id, num, text, preset, checked, cls}] */
+const PAGE_ROWS = "Array.from(document.querySelectorAll('#listWrap .sub-row')).map((r) => ({" +
+	" id: parseInt(r.id.slice(4), 10)," +
+	" num: (r.querySelector('.sub-num') || {}).textContent || ''," +
+	" text: (r.querySelector('.sub-text') || {}).textContent || ''," +
+	" preset: (r.querySelector('select.mogrt-sel') || {}).value || ''," +
+	" checked: !!(r.querySelector('input[type=checkbox]') || {}).checked," +
+	" cls: r.className }))";
+
+const PAGE_STATUS = "(() => { const s = document.getElementById('statusBar'); return s ? { text: s.textContent, cls: s.className } : null; })()";
+
+/** 행 select로 프리셋 하나를 행 하나에 건다 (체크된 행이 없을 때 = 한 줄 경로) */
+function pageSetRowPreset(rowId, presetId) {
+	return "(() => { const s = document.getElementById('sel-' + " + Number(rowId) + "); if (!s) return 'no-select';" +
+		" s.value = " + JSON.stringify(String(presetId)) + "; s.dispatchEvent(new Event('change')); return s.value; })()";
+}
+
+/** 모든 행의 체크를 끈다 (▶가 확인창 없이 전체를 적용하도록) */
+const PAGE_UNCHECK_ALL = "(() => { const b = document.getElementById('btnToggleSelect'); const any = document.querySelector('#listWrap .sub-row input[type=checkbox]:checked'); if (any && b) b.click(); return !document.querySelector('#listWrap .sub-row input[type=checkbox]:checked'); })()";
+
+/** 행 select에 보이는 프리셋 [[id, 이름]] */
+const PAGE_PRESET_OPTIONS = "(() => { const s = document.querySelector('#listWrap select.mogrt-sel'); return s ? Array.from(s.options).filter((o) => o.value).map((o) => [o.value, o.textContent]) : []; })()";
+
+/** 스캔된 MOGRT [[경로, 이름]] (#defaultMogrtSel 옵션) */
+const PAGE_MOGRT_OPTIONS = "Array.from((document.getElementById('defaultMogrtSel') || { options: [] }).options).filter((o) => o.value).map((o) => [o.value, o.textContent])";
+
+/** 새로 고침하고 [EXCEPTION] 로그가 없는지 확인한다 → 로그 */
+async function reloadClean(reload, assert, log) {
+	const logs = await reload();
+	const bad = logs.filter((l) => /^\[EXCEPTION\]/.test(l));
+	if (log) logs.filter((l) => /^\[(EXCEPTION|error|log:error)/.test(l)).forEach((l) => log("  " + l));
+	assert.equal(bad.length, 0, "새로 고침 중 예외: " + bad.join(" | "));
+	return logs;
+}
+
+/**
+ * 프리셋이 하나도 없으면 모달로 하나 만든다 (행 select 옵션 기준).
+ * v27 getMogrtParams는 프리뷰 시퀀스가 없으면 작업 시퀀스 V1 0~5초를 자르므로,
+ * 모달을 열기 전에 호스트 setupPreviewSequence로 __MOGRT_PREVIEW__를 먼저 만든다.
+ * → [id, 이름]
+ */
+async function ensurePreset(api, opts = {}) {
+	const { panel, host, log } = api;
+	const have = await panel(PAGE_PRESET_OPTIONS);
+	if (have.length) return have[0];
+	const mogrts = await waitFor(panel, "(() => { const o = " + PAGE_MOGRT_OPTIONS + "; return o.length ? o : null; })()", { timeoutMs: 60000, what: "MOGRT 스캔" });
+	const re = opts.prefer || /라온올제/;
+	const pick = mogrts.find((m) => re.test(m[1])) || mogrts[0];
+	if (log) log("프리셋 만들기: " + pick[1]);
+	const setup = await host("setupPreviewSequence(" + JSON.stringify(JSON.stringify({ mogrtPath: pick[0], durationSec: 5 })) + ")");
+	if (String(setup).indexOf("SUCCESS") !== 0) throw new Error("setupPreviewSequence 실패: " + setup);
+	await panel("document.getElementById('btnAddPreset').click(), true");
+	await waitFor(panel, "document.getElementById('defaultMogrtSel').options.length > 1", { what: "모달 MOGRT 목록" });
+	await panel("(() => { const s = document.getElementById('defaultMogrtSel'); s.value = " + JSON.stringify(pick[0]) + "; s.dispatchEvent(new Event('change')); return s.value; })()");
+	// 파라미터가 오기 전에는 저장이 '파라미터가 없습니다.'로 끝난다 → 될 때까지 누른다
+	await waitFor(panel, "(() => { document.getElementById('btnSaveDefault').click(); return /프리셋 저장/.test(document.getElementById('statusBar').textContent); })()",
+		{ timeoutMs: 120000, stepMs: 1500, what: "프리셋 저장" });
+	const after = await waitFor(panel, "(() => { const o = " + PAGE_PRESET_OPTIONS + "; return o.length ? o : null; })()", { what: "행 select의 새 프리셋" });
+	return after[after.length - 1];
+}
+
+module.exports = {
+	sleep, waitFor, ticksToFrame,
+	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed,
+	pageDropSrt, pageSetRowPreset, PAGE_ROWS, PAGE_STATUS, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS,
+	reloadClean, ensurePreset
+};

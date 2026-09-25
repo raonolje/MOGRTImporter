@@ -436,7 +436,12 @@
 		const s = parseFloat(parts[2]) || 0;
 		return h * 3600 + m * 60 + s;
 	}
-	function parseSRT(text) {
+	// opts (다화자 가져오기용). 없으면 v27과 결과가 한 바이트도 다르지 않다 (골든 테스트).
+	//   keepNo     파일의 원래 자막 번호를 srtNo로 남긴다 (번호 줄이 없으면 null)
+	//   stripTags  <i> <b> <u> <font…>와 닫는 태그, {\an8} 같은 ASS 지시를 지운다 (안의 글자는 둔다)
+	//   opts가 있으면 U+2028/2029를 LF로 바꾼다
+	// stripSrtTags는 src/mi/core.ts에 있다 (opts 경로에서만 부른다).
+	function parseSRT(text, opts) {
 		const results = [];
 		const blocks = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split(/\n\n+/);
 		let idx = 1;
@@ -448,18 +453,532 @@
 			if (/^\d+$/.test(firstLine)) lineOffset = 1;
 			const timeMatch = (lines[lineOffset]?.trim() ?? "").match(/(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})/);
 			if (!timeMatch) continue;
-			const textLines = lines.slice(lineOffset + 1).join("\n").trim();
+			let textLines = lines.slice(lineOffset + 1).join("\n").trim();
+			if (opts) {
+				textLines = textLines.replace(/[\u2028\u2029]/g, "\n");
+				if (opts.stripTags) textLines = stripSrtTags(textLines);
+				textLines = textLines.trim();
+			}
 			if (!textLines) continue;
-			results.push({
+			const cue = {
 				index: idx++,
 				startTime: timeMatch[1].replace(",", "."),
 				endTime: timeMatch[2].replace(",", "."),
 				startSec: timeToSec(timeMatch[1]),
 				endSec: timeToSec(timeMatch[2]),
 				text: textLines
-			});
+			};
+			if (opts && opts.keepNo) cue.srtNo = lineOffset ? parseInt(firstLine, 10) : null;
+			results.push(cue);
 		}
 		return results;
+	}
+	//#endregion
+	//#region src/mi/core.ts
+	// ─────────────────────────────────────────────────────────────
+	// 다화자(v28) 순수 로직. 함수 선언과 상수만 둔다.
+	//
+	// DOM, 전역 상태 객체, 호스트 어댑터, 파일 저장소를 참조하지 않는다.
+	// node 테스트(tests/lib/loadRegions.js)가 이 region만 잘라 vm에서 돌리고,
+	// 5단계 MCP 서버도 설치된 app.js에서 이 region을 읽어 해시를 확인한다.
+	// 그래서 이 region은 다른 region의 함수를 부르지 않는다 (자기 완결).
+	// 거꾸로 parseSRT(opts)는 여기의 stripSrtTags를 쓴다.
+	//
+	// 이름 규칙: 여기에는 MI 대문자 접두사 이름을 쓰지 않는다. DEV 설치가
+	// 그 접두사를 MID로 바꾸므로 설치본과 저장소의 region 해시가 달라진다.
+	// ─────────────────────────────────────────────────────────────
+
+	// Premiere Time.ticks의 1초
+	const TICKS_PER_SEC = 254016000000;
+	// AE 텍스트 줄바꿈 규칙 (S0-3 d 결정 전 기본값: LF 그대로).
+	// 실측이 CR을 요구하면 "\r"로 바꾼다. setTextValue만 이 값을 읽는다.
+	const AE_NEWLINE = "\n";
+	// namedParams가 이름으로 바꾸는 AE 속성 종류 (comment·textsetting·group은 그대로)
+	const NAMED_PARAM_TYPES = { text: true, color: true, number: true, angle: true, point: true, dropdown: true, boolean: true };
+
+	// ── 문자열·해시 ──
+
+	// FNV-1a 32비트, UTF-8 바이트 기준 → 8자리 hex. 짝 없는 서로게이트는 U+FFFD로 센다
+	// (TextEncoder·Buffer와 같은 바이트). fnv1a32("") = "811c9dc5"
+	function fnv1a32(str) {
+		const s = String(str == null ? "" : str);
+		let h = 0x811c9dc5;
+		const step = (b) => { h = Math.imul(h ^ b, 0x01000193) >>> 0; };
+		for (let i = 0; i < s.length; i++) {
+			let c = s.charCodeAt(i);
+			if (c >= 0xd800 && c <= 0xdbff) {
+				const d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+				if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
+				else c = 0xfffd;
+			} else if (c >= 0xdc00 && c <= 0xdfff) c = 0xfffd;
+			if (c < 0x80) step(c);
+			else if (c < 0x800) { step(0xc0 | (c >> 6)); step(0x80 | (c & 63)); }
+			else if (c < 0x10000) { step(0xe0 | (c >> 12)); step(0x80 | ((c >> 6) & 63)); step(0x80 | (c & 63)); }
+			else { step(0xf0 | (c >> 18)); step(0x80 | ((c >> 12) & 63)); step(0x80 | ((c >> 6) & 63)); step(0x80 | (c & 63)); }
+		}
+		return ("0000000" + h.toString(16)).slice(-8);
+	}
+	// 키를 정렬한 JSON (같은 내용이면 필드 순서와 상관없이 같은 문자열). undefined·함수는 뺀다
+	function stableJson(v) {
+		if (v === null || v === undefined || typeof v === "function") return "null";
+		if (typeof v !== "object") return JSON.stringify(v);
+		if (Array.isArray(v)) return "[" + v.map((x) => stableJson(x)).join(",") + "]";
+		const keys = Object.keys(v).filter((k) => v[k] !== undefined && typeof v[k] !== "function").sort();
+		return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableJson(v[k])).join(",") + "}";
+	}
+	// 세션 내용 해시 (히스토리 중복 판정용). 필드 순서가 달라도 내용이 같으면 같다
+	function contentHash(subtitles, rowStates, trashBin) {
+		return fnv1a32(stableJson({ s: subtitles || [], r: rowStates || {}, t: trashBin || [] }));
+	}
+
+	// ── SRT 파일 ──
+
+	// 자막 스타일 태그를 지운다: <i> <b> <u> <font …>와 닫는 태그, {\an8} 같은 ASS 지시
+	function stripSrtTags(s) {
+		return String(s == null ? "" : s)
+			.replace(/<\/?(?:i|b|u|font)(?:\s[^>]*)?>/gi, "")
+			.replace(/\{\\[^}]*\}/g, "");
+	}
+	// SRT 바이트 → {text, encoding, replaced}. replaced = 결과의 U+FFFD 개수
+	//   1) BOM이 있으면 BOM을 따른다 (EF BB BF / FF FE / FE FF)
+	//   2) 앞 200바이트의 홀수 위치 중 30% 이상이 0x00이면 UTF-16LE
+	//   3) 아니면 non-fatal UTF-8로 읽어 U+FFFD를 센다(u). 0이면 UTF-8
+	//   4) u > 0이면 euc-kr(CP949)로도 읽어 센다(k). k < u일 때만 euc-kr
+	// fatal UTF-8이 실패하면 euc-kr로 넘어가는 방식은 깨진 바이트 하나로 파일 전체를 망가뜨린다.
+	function decodeSrtBytes(input) {
+		const b = ArrayBuffer.isView(input)
+			? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+			: new Uint8Array(input || 0);
+		const dec = (enc, from) => new TextDecoder(enc).decode(b.subarray(from || 0));
+		const countBad = (s) => {
+			let n = 0;
+			for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 0xfffd) n++;
+			return n;
+		};
+		const done = (text, encoding) => {
+			if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // 남은 BOM 방어
+			return { text, encoding, replaced: countBad(text) };
+		};
+		if (b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) return done(dec("utf-8", 3), "utf-8");
+		if (b.length >= 2 && b[0] === 0xff && b[1] === 0xfe) return done(dec("utf-16le", 2), "utf-16le");
+		if (b.length >= 2 && b[0] === 0xfe && b[1] === 0xff) return done(dec("utf-16be", 2), "utf-16be");
+		const head = Math.min(b.length, 200);
+		let odd = 0;
+		let zero = 0;
+		for (let i = 1; i < head; i += 2) {
+			odd++;
+			if (b[i] === 0) zero++;
+		}
+		if (odd > 0 && zero / odd >= 0.3) return done(dec("utf-16le"), "utf-16le");
+		const u8 = dec("utf-8");
+		const u = countBad(u8);
+		if (u === 0) return done(u8, "utf-8");
+		let kr = null;
+		try { kr = dec("euc-kr"); } catch (_) { kr = null; }
+		if (kr !== null && countBad(kr) < u) return done(kr, "euc-kr");
+		return done(u8, "utf-8");
+	}
+	// 파일 이름의 캡션 트랙 번호 → {key: "C2"|null, ambiguous, nums}
+	// 확장자를 뺀 이름(NFC)에서 앞이 영숫자가 아니고 뒤도 영숫자가 아닌 C<1~99>를 찾는다.
+	// 한글, _, -, 공백, .은 경계다. 서로 다른 번호가 둘 이상이면 모호(ambiguous)다.
+	// 화자 이름은 파일 이름에서 가져오지 않는다.
+	function parseCaptionKey(fileName) {
+		let base = String(fileName == null ? "" : fileName).split(/[\\/]/).pop();
+		base = base.replace(/\.[^.]*$/, "");
+		if (base.normalize) base = base.normalize("NFC");
+		const re = /(^|[^A-Za-z0-9])[Cc]0*([1-9][0-9]?)(?![0-9A-Za-z])/g;
+		const nums = [];
+		let m;
+		while ((m = re.exec(base))) {
+			const n = parseInt(m[2], 10);
+			if (nums.indexOf(n) === -1) nums.push(n);
+		}
+		return { key: nums.length === 1 ? "C" + nums[0] : null, ambiguous: nums.length > 1, nums };
+	}
+
+	// ── 문장 비교 ──
+
+	// 비교용 정규화: NFC, CR·CRLF·U+2028/2029 → LF, 태그 제거, 공백 접기, 빈 줄 제거
+	function normText(s) {
+		let t = String(s == null ? "" : s);
+		if (t.normalize) t = t.normalize("NFC");
+		t = stripSrtTags(t.replace(/\r\n?|[\u2028\u2029]/g, "\n"));
+		t = t.replace(/[ \t\f\v\u00a0\u3000]+/g, " ");
+		return t.split("\n").map((ln) => ln.trim()).filter((ln) => ln !== "").join("\n");
+	}
+	// 한글 음절을 초성·중성·종성 자모로 푼다 (U+1100대). 다른 글자는 그대로
+	function jamo(s) {
+		const str = String(s == null ? "" : s);
+		let out = "";
+		for (let i = 0; i < str.length; i++) {
+			const c = str.charCodeAt(i);
+			if (c >= 0xac00 && c <= 0xd7a3) {
+				const k = c - 0xac00;
+				out += String.fromCharCode(0x1100 + Math.floor(k / 588), 0x1161 + Math.floor((k % 588) / 28));
+				if (k % 28) out += String.fromCharCode(0x11a7 + (k % 28));
+			} else out += str[i];
+		}
+		return out;
+	}
+	// 편집 거리 (두 줄 DP)
+	function levenshtein(a, b) {
+		if (a === b) return 0;
+		if (!a.length) return b.length;
+		if (!b.length) return a.length;
+		let prev = new Array(b.length + 1);
+		let cur = new Array(b.length + 1);
+		for (let j = 0; j <= b.length; j++) prev[j] = j;
+		for (let i = 1; i <= a.length; i++) {
+			cur[0] = i;
+			const ca = a.charCodeAt(i - 1);
+			for (let j = 1; j <= b.length; j++) {
+				const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+				cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+			}
+			const t = prev; prev = cur; cur = t;
+		}
+		return prev[b.length];
+	}
+	// 문장 유사도 0~1: 1 − (자모 편집 거리 / 긴 쪽 길이). 정규화 후 공백은 무시한다
+	function textSim(a, b) {
+		const x = jamo(normText(a)).replace(/\s+/g, "");
+		const y = jamo(normText(b)).replace(/\s+/g, "");
+		const n = Math.max(x.length, y.length);
+		if (n === 0) return 1;
+		return 1 - levenshtein(x, y) / n;
+	}
+
+	// ── 텍스트 필드 ID (T1..Tn) ──
+
+	// 네이티브 템플릿 목록인가 (getMogrtParams 네이티브 분기의 nativeText 표시)
+	function isNativeList(params) {
+		return (params || []).some((p) => p && p.nativeText === true);
+	}
+	// type이 "text"인 param을 배열 순서대로 T1..Tn. pos = 배열 위치
+	// ID는 저장하지 않고 항상 이렇게 계산한다 (rs.params로도, index+1로도 계산하지 않는다)
+	function textFields(params) {
+		const out = [];
+		(params || []).forEach((p, pos) => {
+			if (p && p.type === "text") out.push({ fid: "T" + (out.length + 1), index: p.index, displayName: p.displayName || "", pos });
+		});
+		return out;
+	}
+	// 프리셋의 캡션 필드 ID ('T' 버튼 = textParamIndex). -1이거나 텍스트가 아니면 null
+	function captionFid(preset) {
+		if (!preset || typeof preset.textParamIndex !== "number" || preset.textParamIndex < 0) return null;
+		const f = textFields(preset.params).find((t) => t.index === preset.textParamIndex);
+		return f ? f.fid : null;
+	}
+	// [{fid, index, displayName, caption?}] — caption은 캡션 필드에만 true로 붙는다
+	function fieldIdMap(params, textParamIndex) {
+		return textFields(params).map((t) => {
+			const e = { fid: t.fid, index: t.index, displayName: t.displayName };
+			if (typeof textParamIndex === "number" && textParamIndex >= 0 && t.index === textParamIndex) e.caption = true;
+			return e;
+		});
+	}
+	// "T1=전체 텍스트|T2=포인트 텍스트|…" (외부 쓰기의 필드 구조 확인용)
+	function fieldSignature(params) {
+		return textFields(params).map((t) => t.fid + "=" + t.displayName).join("|");
+	}
+	// 줄의 텍스트 필드를 프리셋의 T-ID로 모두 해석한다 → {T1: {fid, index, displayName, how, param}, …}
+	//   1) 줄의 k번째 텍스트 필드 이름이 프리셋의 k번째와 같으면 "ordinal"
+	//   2) 아니면 아직 쓰이지 않은 줄 텍스트 필드 중 같은 이름의 첫 번째 → "name"
+	//   3) 그래도 없으면 빠진다 (그 ID로는 쓰지 않는다)
+	// presetParams가 없으면 줄 자신의 서수로만 매긴다.
+	function resolveFields(rowParams, presetParams) {
+		const rowT = textFields(rowParams);
+		const out = {};
+		const mk = (rt, fid, how) => ({ fid, index: rt.index, displayName: rt.displayName, how, param: rowParams[rt.pos] });
+		if (!presetParams) {
+			rowT.forEach((rt) => { out[rt.fid] = mk(rt, rt.fid, "ordinal"); });
+			return out;
+		}
+		const preT = textFields(presetParams);
+		const used = {};
+		preT.forEach((pt, k) => {
+			const rt = rowT[k];
+			if (rt && rt.displayName === pt.displayName) {
+				out[pt.fid] = mk(rt, pt.fid, "ordinal");
+				used[k] = true;
+			}
+		});
+		preT.forEach((pt) => {
+			if (out[pt.fid] || !pt.displayName) return;
+			for (let j = 0; j < rowT.length; j++) {
+				if (!used[j] && rowT[j].displayName === pt.displayName) {
+					out[pt.fid] = mk(rowT[j], pt.fid, "name");
+					used[j] = true;
+					return;
+				}
+			}
+		});
+		return out;
+	}
+	// 줄에서 T-ID 하나를 해석한다. 못 찾으면 null (쓰지 않는다)
+	function resolveFid(rowParams, fid, presetParams) {
+		return resolveFields(rowParams, presetParams)[fid] || null;
+	}
+
+	// ── 속성 구조 서명 ──
+
+	// 목록 비교 해시: index 순으로 "index:t|o:displayName"을 이은 fnv. 네이티브는 "n:텍스트 개수"
+	function paramSig(params) {
+		const list = (params || []).filter(Boolean);
+		if (isNativeList(list)) return fnv1a32("n:" + list.filter((p) => p.type === "text").length);
+		return fnv1a32(list.slice().sort((a, b) => a.index - b.index)
+			.map((p) => p.index + ":" + (p.type === "text" ? "t" : "o") + ":" + (p.displayName || "")).join("|"));
+	}
+	// 호스트가 읽은 클립 자체의 속성 레이아웃 해시. AE lay = [[이름, "t"|"o"], …], 네이티브 = {n}
+	function clipLs(lay) {
+		if (Array.isArray(lay)) return fnv1a32(lay.map((d, i) => i + ":" + d[1] + ":" + d[0]).join("|"));
+		if (lay && typeof lay.n === "number") return fnv1a32("n:" + lay.n);
+		return "";
+	}
+	// 줄의 속성 목록이 프리셋과 구조가 다른가: 배열 순서대로 (index, 텍스트 여부, displayName)를 비교한다.
+	// type은 텍스트 여부로만 본다 (definition 패치의 number→dropdown 차이는 같은 속성이다).
+	// 한쪽이 비어 있으면 비교할 것이 없어 false. 네이티브는 텍스트 개수만 본다(호스트가 서수로 쓴다).
+	function layoutMismatch(rowParams, presetParams) {
+		const a = rowParams || [];
+		const b = presetParams || [];
+		if (!a.length || !b.length) return false;
+		if (isNativeList(a) || isNativeList(b)) return paramSig(a) !== paramSig(b);
+		if (a.length !== b.length) return true;
+		for (let i = 0; i < a.length; i++) {
+			const x = a[i];
+			const y = b[i];
+			if (!x || !y) return true;
+			if (x.index !== y.index || (x.type === "text") !== (y.type === "text") || (x.displayName || "") !== (y.displayName || "")) return true;
+		}
+		return false;
+	}
+	// 이름으로 쓰기: 이름이 목록 안에서 유일한 AE 쓰기 속성(text·color·number·angle·point·dropdown·boolean)의
+	// index를 -1로 바꾼 사본. v27 applyParamsToItem은 index가 -1이면 displayName으로 속성을 찾는다.
+	// 네이티브 목록(서수로만 쓴다)과 이름이 겹치는 속성은 그대로 둔다.
+	function namedParams(params) {
+		const list = (params || []).map((p) => (p && typeof p === "object" ? Object.assign({}, p) : p));
+		if (isNativeList(list)) return list;
+		const count = {};
+		list.forEach((p) => { if (p && p.displayName) count[p.displayName] = (count[p.displayName] || 0) + 1; });
+		list.forEach((p) => { if (p && p.displayName && count[p.displayName] === 1 && NAMED_PARAM_TYPES[p.type]) p.index = -1; });
+		return list;
+	}
+	// v27 index 쓰기로 보내면 위험한 줄인가 (하나라도 참이면 참)
+	//   - 줄의 속성 구조가 프리셋과 다름 (옛 버전 MOGRT로 만든 줄)
+	//   - 마지막 검증 적용(ap)의 paramSig가 지금과 다름
+	//   - 구조를 맞추기 전 서명(psOld)이 남아 있음
+	// 프리셋이 없으면 v27도 MOGRT를 쓰지 않으므로 false.
+	function isV27Unsafe(rs, preset) {
+		if (!rs || !preset) return false;
+		const all = rs._allParams || [];
+		if (all.length) {
+			if (layoutMismatch(all, preset.params)) return true;
+		} else if ((rs.params || []).length) {
+			// v27은 _allParams가 비면 노출 속성(rs.params)만 보낸다: 그 index들이 프리셋과 같은 속성인지 본다
+			const pre = preset.params || [];
+			const bad = rs.params.some((p) => {
+				const q = pre.find((x) => x && p && x.index === p.index);
+				return !q || (q.type === "text") !== (p.type === "text") || (q.displayName || "") !== (p.displayName || "");
+			});
+			if (bad) return true;
+		}
+		const sent = all.length ? all : rs.params || [];
+		if (rs.ap && rs.ap.ps && rs.ap.ps !== paramSig(sent)) return true;
+		if (rs.psOld) return true;
+		return false;
+	}
+
+	// ── 텍스트 값 ──
+
+	// 텍스트 param에 문장을 쓴다: value, rawValue.textEditValue, fontTextRunLength = [길이].
+	// 행 편집기·프리셋 모달·loadParamsFromPreset에 흩어진 같은 로직의 공용 사본이다.
+	// opts.aeNewline: AE 텍스트의 줄바꿈 (기본 AE_NEWLINE). 네이티브 텍스트는 LF 그대로 둔다.
+	function setTextValue(param, text, opts) {
+		if (!param) return param;
+		let t = String(text == null ? "" : text);
+		const nl = opts && typeof opts.aeNewline === "string" ? opts.aeNewline : AE_NEWLINE;
+		if (!param.nativeText && nl !== "\n") t = t.replace(/\r\n?|\n/g, nl);
+		param.value = t;
+		if (typeof param.rawValue === "string" && param.rawValue.indexOf("\"textEditValue\"") !== -1) {
+			try {
+				const parsed = JSON.parse(param.rawValue);
+				if (parsed && typeof parsed.textEditValue !== "undefined") {
+					parsed.textEditValue = t;
+					if (parsed.fontTextRunLength) parsed.fontTextRunLength = [t.length];
+					param.rawValue = JSON.stringify(parsed);
+				}
+			} catch (_) { /* rawValue가 JSON이 아니면 value만 쓴다 */ }
+		}
+		return param;
+	}
+	// 포인트 텍스트 검사: '$$'로 나눈 조각이 모두 캡션 안에 그대로 있는가.
+	// → {ok, segs, missing: 없는 조각, dup: 캡션에 두 번 이상 나오는 조각(첫 번째만 칠해짐), tooMany}
+	// 빈 값은 포인트 텍스트가 아니다(ok false). max가 있으면 조각 수 상한도 본다.
+	function pointSegmentsOk(value, caption, max) {
+		const nfc = (s) => { const x = String(s == null ? "" : s); return x.normalize ? x.normalize("NFC") : x; };
+		const cap = nfc(caption);
+		const segs = nfc(value).split("$$").filter((s) => s !== "");
+		const missing = [];
+		const dup = [];
+		segs.forEach((s) => {
+			const i = cap.indexOf(s);
+			if (i === -1) missing.push(s);
+			else if (cap.indexOf(s, i + 1) !== -1) dup.push(s);
+		});
+		const tooMany = typeof max === "number" && max > 0 && segs.length > max;
+		return { ok: segs.length > 0 && missing.length === 0 && !tooMany, segs, missing, dup, tooMany };
+	}
+	// comment 속성의 "최대 N개" 규칙 → N (여럿이면 가장 작은 값), 없으면 null
+	// 예: "포인트 텍스트는 $$로 구분하며 최대 3개까지 입력 가능합니다." → 3
+	function ruleMaxFromComments(params) {
+		let best = null;
+		(params || []).forEach((p) => {
+			if (!p || p.type !== "comment") return;
+			const s = String(p.displayName || "") + " " + String(p.value || "");
+			const re = /최대\s*(\d+)\s*개/g;
+			let m;
+			while ((m = re.exec(s))) {
+				const n = parseInt(m[1], 10);
+				if (n > 0 && (best === null || n < best)) best = n;
+			}
+		});
+		return best;
+	}
+
+	// ── id ──
+
+	// "preset_12" → 12, 형식이 아니면 0
+	function presetNum(id) {
+		const m = /^preset_(\d+)$/.exec(String(id == null ? "" : id));
+		return m ? parseInt(m[1], 10) : 0;
+	}
+	// 단조 증가 프리셋 id: 1 + max(저장된 nextPresetId − 1, 알려진 모든 숫자 접미사).
+	// 빈 번호를 메우지 않는다. presets는 {id: preset} 맵(또는 id·프리셋 배열),
+	// presetTrash는 [{preset}], refs는 행·휴지통·cast가 가리키는 id들(배열·Set).
+	// → {id: "preset_9", next: 10}  (next는 state.nextPresetId에 넣는다)
+	function nextFreePresetId(presets, presetTrash, refs, storedNext) {
+		let max = Math.max(0, (parseInt(storedNext, 10) || 1) - 1);
+		const see = (id) => { const n = presetNum(id); if (n > max) max = n; };
+		const seeItem = (x) => { if (x && typeof x === "object") see(x.preset ? x.preset.id : x.id); else see(x); };
+		if (Array.isArray(presets)) presets.forEach(seeItem);
+		else if (presets && typeof presets === "object") Object.keys(presets).forEach((k) => { see(k); seeItem(presets[k]); });
+		(presetTrash || []).forEach(seeItem);
+		if (refs) Array.from(refs).forEach(see);
+		const n = max + 1;
+		return { id: "preset_" + n, next: n + 1 };
+	}
+	// 줄 id 다시 매기기 (다른 시퀀스의 작업 파일): startId부터 줄 → 휴지통 순으로.
+	// rowStates 키와 줄 id가 함께 바뀌고, 휴지통 항목은 제 상태를 품고 새 id를 받는다.
+	// 입력은 바꾸지 않는다. → {subtitles, rowStates, trashBin, nextId, map: {옛 id: 새 id}}
+	function remapIds(data, startId) {
+		const src = JSON.parse(JSON.stringify(data || {}));
+		let next = Math.max(1, parseInt(startId, 10) || 1);
+		const map = {};
+		const rsIn = src.rowStates && typeof src.rowStates === "object" ? src.rowStates : {};
+		const rsOut = {};
+		const taken = {};
+		const subtitles = (Array.isArray(src.subtitles) ? src.subtitles : []).filter(Boolean);
+		subtitles.forEach((s) => {
+			const old = s.id;
+			const nid = next++;
+			if (map[old] === undefined) map[old] = nid;
+			s.id = nid;
+			if (rsIn[old] !== undefined) {
+				rsOut[nid] = taken[old] ? JSON.parse(JSON.stringify(rsIn[old])) : rsIn[old];
+				taken[old] = true;
+			}
+		});
+		const trashBin = (Array.isArray(src.trashBin) ? src.trashBin : []).filter(Boolean);
+		trashBin.forEach((t) => {
+			if (!t.sub) return;
+			const old = t.sub.id;
+			const nid = next++;
+			if (map[old] === undefined) map[old] = nid;
+			t.sub.id = nid;
+		});
+		return { subtitles, rowStates: rsOut, trashBin, nextId: next, map };
+	}
+	// 복원 뒤의 nextId: max(복원한 nextId, hwm + 1, 현재 nextId, 복원한 줄·휴지통의 최대 id + 1)
+	function safeNextId(data, hwm, curNext) {
+		let n = Math.max(1, parseInt(data && data.nextId, 10) || 1);
+		const h = parseInt(hwm, 10);
+		if (h >= 0 && h + 1 > n) n = h + 1;
+		const c = parseInt(curNext, 10);
+		if (c > n) n = c;
+		const see = (id) => { const v = parseInt(id, 10); if (v >= n) n = v + 1; };
+		((data && data.subtitles) || []).forEach((s) => { if (s) see(s.id); });
+		((data && data.trashBin) || []).forEach((t) => { if (t && t.sub) see(t.sub.id); });
+		return n;
+	}
+	// sequenceKey의 GUID 부분 ("proj_x_seq_<GUID>" → GUID). 이름 기반 키·기본 키는 null
+	function seqGuidOf(seqKey) {
+		const s = String(seqKey == null ? "" : seqKey);
+		const i = s.indexOf("_seq_");
+		if (i === -1) return null;
+		const g = s.slice(i + 5);
+		if (!g || g.indexOf("name_") === 0) return null;
+		return g;
+	}
+
+	// ── mi 블록 (session.json의 선택 키) ──
+
+	function miDefault() {
+		return { v: 1, salt: "", hwm: 0, legacyTrack: null, remapped: false, castOrder: [], cast: {}, stack: false, stackDy: 0.12, applied: {} };
+	}
+	// 저장할 내용이 있는가 (salt가 있거나 화자가 있다). 없으면 session.json에 mi를 쓰지 않는다
+	function miHasData(mi) {
+		return !!(mi && ((typeof mi.salt === "string" && mi.salt) || (mi.cast && typeof mi.cast === "object" && Object.keys(mi.cast).length)));
+	}
+	// 파일의 mi → 메모리 mi. 모든 필드(salt, hwm, applied, 모르는 키)를 그대로 두고 빠진 기본값만 채운다
+	function miFromFile(src) {
+		const mi = miDefault();
+		if (!src || typeof src !== "object" || Array.isArray(src)) return mi;
+		const c = JSON.parse(JSON.stringify(src));
+		Object.keys(c).forEach((k) => { mi[k] = c[k]; });
+		const isObj = (o) => !!o && typeof o === "object" && !Array.isArray(o);
+		if (typeof mi.v !== "number") mi.v = 1;
+		if (typeof mi.salt !== "string") mi.salt = "";
+		if (typeof mi.hwm !== "number" || !isFinite(mi.hwm) || mi.hwm < 0) mi.hwm = 0;
+		if (mi.legacyTrack !== null && typeof mi.legacyTrack !== "number") mi.legacyTrack = null;
+		mi.remapped = mi.remapped === true;
+		if (!Array.isArray(mi.castOrder)) mi.castOrder = [];
+		if (!isObj(mi.cast)) mi.cast = {};
+		if (typeof mi.stack !== "boolean") mi.stack = false;
+		if (typeof mi.stackDy !== "number" || !isFinite(mi.stackDy)) mi.stackDy = 0.12;
+		if (!isObj(mi.applied)) mi.applied = {};
+		return mi;
+	}
+	// 히스토리·작업 파일에 싣는 부분 (salt, hwm, applied는 뺀다)
+	function miSnapshotOf(mi) {
+		const m = miFromFile(mi);
+		return JSON.parse(JSON.stringify({ cast: m.cast, castOrder: m.castOrder, stack: m.stack, stackDy: m.stackDy, legacyTrack: m.legacyTrack }));
+	}
+	// 히스토리·작업 파일 복원: 화자 표는 스냅숏에서, salt·hwm·applied·remapped는 현재 값을 유지한다
+	function miRestoreFrom(cur, snap) {
+		const mi = miFromFile(cur);
+		if (!snap || typeof snap !== "object") return mi;
+		const s = miFromFile(snap);
+		mi.cast = s.cast;
+		mi.castOrder = s.castOrder;
+		mi.stack = s.stack;
+		mi.stackDy = s.stackDy;
+		mi.legacyTrack = s.legacyTrack;
+		return mi;
+	}
+
+	// ── 표시·시간 ──
+
+	// 사람이 읽는 줄 주소: 단일 화자 "#12", 다화자 "C2·12". 파싱할 때마다 바뀌므로 쓰기 주소로 쓰지 않는다
+	function rowLabel(sub, castMode) {
+		if (!sub) return "";
+		return castMode && sub.spk ? sub.spk + "·" + sub.index : "#" + sub.index;
+	}
+	// 초 → 프레임 번호. 정확한 ticks로 계산하고 반올림한다 (Math.floor는 ms 반올림 시간을 한 프레임 앞에 둔다).
+	// sec × TICKS_PER_SEC가 2^53을 넘지 않는 약 9.8시간까지 정확하다. frameTicks는 문자열이어도 된다
+	function frameOf(sec, frameTicks) {
+		const ft = Number(frameTicks);
+		if (!(ft > 0)) return NaN;
+		return Math.round((Number(sec) * TICKS_PER_SEC) / ft);
 	}
 	//#endregion
 	//#region src/ui/tabs.ts
