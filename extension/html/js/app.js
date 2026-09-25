@@ -13,7 +13,10 @@
 		currentProjectKey: "default",
 		currentSequenceKey: "default_seq",
 		currentSequenceId: "",
-		presetViewMode: "list"
+		presetViewMode: "list",
+		// 다화자(v28) 블록: salt·hwm·화자 표·applied. 로더가 키마다 항상 새로 넣는다 (다른 시퀀스의 mi가 새지 않게).
+		// miHasData일 때만 session.json에 쓴다 → 단일 화자 파일은 v27과 같은 키 4개
+		mi: miDefault()
 	};
 	var _cachedSystemFonts = null; // 시스템 폰트 캐시 (전역)
 	// 부팅·세션 플래그. 부팅 중 TDZ를 피하려고 맨 앞 state region에 둔다.
@@ -140,6 +143,12 @@
 		if (!root) return null;
 		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/history_safety.json";
 	}
+	// cast.json: 화자 표 사본 (v27이 저장하며 session.json의 mi를 버려도 되살린다)
+	function _getCastPath() {
+		const root = _getCacheRoot();
+		if (!root) return null;
+		return root + "/" + state.currentProjectKey + "/" + state.currentSequenceKey + "/cast.json";
+	}
 	function _getTrackPath() {
 		const root = _getCacheRoot();
 		if (!root) return null;
@@ -241,15 +250,60 @@
 				_renderSeqLabel();
 				if (kept) showAlert("이 시퀀스의 세션 파일을 읽지 못해 목록을 비웠었습니다.\n읽지 못한 파일은 다음 이름으로 옮겨 보관하고, 지금 작업을 새로 저장합니다.\n\n" + kept);
 			}
-			if (state.subtitles.length === 0 && state.trashBin.length === 0 && !_fsExists(path)) return;
+			if (state.subtitles.length === 0 && state.trashBin.length === 0 && !miHasData(state.mi) && !_fsExists(path)) return;
 			const data = {
 				subtitles: state.subtitles,
 				rowStates: state.rowStates,
 				trashBin: state.trashBin,
 				nextId: state.nextId
 			};
-			_fsWrite(path, data);
+			// mi는 salt나 화자가 있을 때만 싣는다 (단일 화자 파일은 키 4개 그대로)
+			if (miHasData(state.mi)) data.mi = state.mi;
+			if (_fsWrite(path, data)) _saveCastSidecar();
 		} catch (_) {}
+	}
+	// cast.json을 mi의 화자 표·salt·hwm과 맞춘다 (내용이 바뀌었을 때만 쓴다).
+	// session.json을 쓸 때마다 부르므로 화자·salt가 바뀌면 곧바로 따라간다. mi에 쓸 것이 없으면 쓰지 않는다.
+	var _castSidecarSig = "";
+	function _saveCastSidecar() {
+		try {
+			if (!_keysResolved || _sessionReadFailed || !miHasData(state.mi)) return false;
+			const path = _getCastPath();
+			if (!path) return false;
+			const body = castSidecarOf(state.mi);
+			const sig = path + "|" + stableJson(body);
+			if (sig === _castSidecarSig && _fsExists(path)) return true;
+			const data = Object.assign({ v: body.v, savedAt: new Date().toISOString() }, body);
+			if (!_fsWrite(path, data)) return false;
+			_castSidecarSig = sig;
+			return true;
+		} catch (_) { return false; }
+	}
+	// 불러온 session.json(없으면 null)에 맞는 mi. 로더는 이 값을 항상 넣는다.
+	//   파일에 mi가 있다            → miFromFile (salt·hwm·applied 그대로)
+	//   mi는 없고 spk 줄 + 쓸 만한 cast.json → cast.json에서 (applied는 빈 값)
+	//   그 밖                         → miDefault()
+	function _miForLoadedSession(sdata) {
+		if (sdata && sdata.mi && typeof sdata.mi === "object" && !Array.isArray(sdata.mi)) return miFromFile(sdata.mi);
+		if (sdata && Array.isArray(sdata.subtitles) && sdata.subtitles.some((s) => s && s.spk)) {
+			const path = _getCastPath();
+			const side = path ? _fsRead(path) : null;
+			if (castSidecarUsable(sdata, side)) {
+				console.warn("[MOGRT] session.json에 mi가 없어 cast.json에서 화자 표를 되살림:", path);
+				return miFromCast(side);
+			}
+		}
+		return miDefault();
+	}
+	// 발급한 가장 큰 id를 mi.hwm에 올린다 (내리지 않는다). id를 새로 주거나 복원한 뒤 부른다
+	function _raiseHwm() {
+		const top = state.nextId - 1;
+		if (top > (state.mi.hwm || 0)) state.mi.hwm = top;
+	}
+	// 히스토리·작업 파일 복원: 화자 표는 스냅숏에서, salt·hwm·applied는 지금 값.
+	// 스냅숏이 없으면(단일 화자 항목·v27 파일) 화자 표가 빈 상태로 돌아간다.
+	function _miRestore(snap) {
+		state.mi = miRestoreFrom(state.mi, snap && typeof snap === "object" && !Array.isArray(snap) ? snap : miSnapshotOf(miDefault()));
 	}
 	// 읽지 못한 세션 파일을 같은 폴더의 path.unreadable-<YYYYMMDD-HHMMSS>로 옮긴다 (지우지 않는다).
 	//   → 옮긴 경로 / "" (그 사이 파일이 없어져 옮길 것이 없다) / null (옮기지 못했다: 쓰면 안 된다)
@@ -327,6 +381,7 @@
 		state.rowStates = sdata.rowStates && typeof sdata.rowStates === "object" ? sdata.rowStates : {};
 		state.trashBin = Array.isArray(sdata.trashBin) ? sdata.trashBin : [];
 		state.nextId = r.exists ? safeNextId(sdata) : 1;
+		state.mi = _miForLoadedSession(r.data || null);
 	}
 	function loadSessionFromStorage() {
 		try {
@@ -369,7 +424,7 @@
 		const e = _presetRefEntry();
 		if (n > e.max) e.max = n;
 	}
-	// cache/<projKey>/*/{session,history_auto,history_manual,history_safety}.json의 "presetId":"preset_N" 중 가장 큰 N.
+	// cache/<projKey>/*/{session,history_auto,history_manual,history_safety,cast}.json의 "presetId":"preset_N" 중 가장 큰 N.
 	// 파싱하지 않고 글자로만 찾는다 (깨진 파일도 본다). 프로젝트 키마다 한 번 (처음 id를 줄 때).
 	// 그 뒤로 디스크에 새로 생기는 참조는 살아 있거나 휴지통에 있던 프리셋의 것이라 카운터가 덮는다.
 	function _scanDiskPresetRefs() {
@@ -385,7 +440,7 @@
 			if (!ls || ls.err !== 0 || !Array.isArray(ls.data)) return;
 			const re = /"presetId"\s*:\s*"preset_(\d+)"/g;
 			ls.data.forEach((name) => {
-				["session.json", "history_auto.json", "history_manual.json", "history_safety.json"].forEach((f) => {
+				["session.json", "history_auto.json", "history_manual.json", "history_safety.json", "cast.json"].forEach((f) => {
 					const r = fsx.readFile(dir + "/" + name + "/" + f);
 					if (!r || r.err !== 0 || !r.data) return;
 					let m;
@@ -397,19 +452,21 @@
 			console.warn("[MOGRT] 프리셋 참조 훑기 실패:", err);
 		}
 	}
-	// 새 id가 피해야 할 참조: 행과 자막 휴지통이 가리키는 id + 메모리 밖에서 본 가장 큰 번호
+	// 새 id가 피해야 할 참조: 행·자막 휴지통·화자 표가 가리키는 id + 메모리 밖에서 본 가장 큰 번호
 	function _presetRefs() {
 		_scanDiskPresetRefs();
 		const refs = [];
 		Object.values(state.rowStates || {}).forEach((rs) => { if (rs && rs.presetId) refs.push(rs.presetId); });
 		(state.trashBin || []).forEach((t) => { if (t && t.state && t.state.presetId) refs.push(t.state.presetId); });
+		const cast = (state.mi && state.mi.cast) || {};
+		Object.keys(cast).forEach((k) => { if (cast[k] && cast[k].presetId) refs.push(cast[k].presetId); });
 		const outside = _presetRefEntry().max;
 		if (outside > 0) refs.push("preset_" + outside);
 		return refs;
 	}
 	// 새 프리셋 id (단조 증가, 빈 번호를 다시 쓰지 않는다). state.nextPresetId를 함께 올린다.
-	// 참조: 살아 있는 프리셋, 프리셋 휴지통, 행과 자막 휴지통이 가리키는 id, 메모리 밖 참조(_presetRefs).
-	// (S1-5에서 mi.cast, S2-3에서 cast_defaults가 참조에 더해진다)
+	// 참조: 살아 있는 프리셋, 프리셋 휴지통, 행과 자막 휴지통·화자 표(mi.cast)가 가리키는 id, 메모리 밖 참조(_presetRefs).
+	// (S2-3에서 cast_defaults가 참조에 더해진다)
 	// 호출한 쪽이 savePresetsToStorage()로 저장한다.
 	function _allocPresetId() {
 		const r = nextFreePresetId(state.presets, state.presetTrash, _presetRefs(), state.nextPresetId);
@@ -1178,6 +1235,34 @@
 		return mi;
 	}
 
+	// ── cast.json 사이드카 ──
+
+	// cast.json에 싣는 부분 (applied는 싣지 않는다). savedAt은 쓰는 쪽이 붙인다
+	function castSidecarOf(mi) {
+		const m = miFromFile(mi);
+		return JSON.parse(JSON.stringify({ v: 1, salt: m.salt, hwm: m.hwm, legacyTrack: m.legacyTrack, castOrder: m.castOrder, cast: m.cast, stack: m.stack, stackDy: m.stackDy }));
+	}
+	// 세션에 mi가 없을 때(v27이 저장하며 mi를 버렸다) cast.json을 믿어도 되는가.
+	//   화자(spk)가 있는 줄이 있고, 모든 spk 줄의 id ≤ 사이드카 hwm일 때만.
+	// 그 밖에는 낡은 사이드카다 (v27이 SRT를 다시 열어 id를 새로 매긴 경우 등).
+	function castSidecarUsable(session, side) {
+		if (!session || typeof session !== "object" || (session.mi && typeof session.mi === "object")) return false;
+		if (!side || typeof side !== "object" || Array.isArray(side)) return false;
+		const hwm = Number(side.hwm);
+		if (!isFinite(hwm) || hwm < 0) return false;
+		const spk = (Array.isArray(session.subtitles) ? session.subtitles : []).filter((s) => s && typeof s.spk === "string" && s.spk !== "");
+		if (!spk.length) return false;
+		return spk.every((s) => Number(s.id) <= hwm);
+	}
+	// cast.json → 메모리 mi (applied는 비우고 remapped는 false)
+	function miFromCast(side) {
+		const mi = miFromFile(side);
+		delete mi.savedAt;
+		mi.applied = {};
+		mi.remapped = false;
+		return mi;
+	}
+
 	// ── 표시·시간 ──
 
 	// 사람이 읽는 줄 주소: 단일 화자 "#12", 다화자 "C2·12". 파싱할 때마다 바뀌므로 쓰기 주소로 쓰지 않는다
@@ -1191,6 +1276,79 @@
 		const ft = Number(frameTicks);
 		if (!(ft > 0)) return NaN;
 		return Math.round((Number(sec) * TICKS_PER_SEC) / ft);
+	}
+
+	// ── 명령(runCommand)용 주소·요약 ──
+
+	// 사람이 쓴 줄 주소 → {spk: "C2"|null, index: 12, fid: "T2"|null}. 형식이 아니면 null
+	//   "#12", "12", "#12 T2", "C2·12", "C2-12", "c2 · 12 t2"
+	function parseRowLabel(label) {
+		let s = String(label == null ? "" : label);
+		if (s.normalize) s = s.normalize("NFC");
+		const m = /^\s*(?:#?\s*(\d+)|[Cc]0*([1-9][0-9]?)\s*[·・.\-]\s*(\d+))(?:\s+[Tt](\d+))?\s*$/.exec(s);
+		if (!m) return null;
+		const fid = m[4] !== undefined ? "T" + parseInt(m[4], 10) : null;
+		if (m[1] !== undefined) return { spk: null, index: parseInt(m[1], 10), fid };
+		return { spk: "C" + parseInt(m[2], 10), index: parseInt(m[3], 10), fid };
+	}
+	// 주소에 맞는 줄들. 화자가 있으면 그 화자의 index, 없으면 index만 본다 (다화자에서는 여럿일 수 있다)
+	function findRowsByLabel(subtitles, parsed) {
+		if (!parsed) return [];
+		return (subtitles || []).filter((s) => s && s.index === parsed.index && (!parsed.spk || s.spk === parsed.spk));
+	}
+	// 줄 요약 (rows·resolve 명령). 텍스트 필드 값은 줄 자신의 _allParams를 프리셋의 T-ID로 해석한다.
+	// rs.params(노출 속성)로는 ID를 매기지 않는다 → _allParams가 없으면 fields는 비고 sig는 "".
+	// uid는 salt가 있으면 "salt-id", 없으면(단일 화자) id 문자열이다. 쓰기 주소는 uid뿐이다.
+	function rowSummary(sub, rs, preset, salt, castMode) {
+		const all = rs && Array.isArray(rs._allParams) ? rs._allParams : [];
+		const res = resolveFields(all, preset ? preset.params : null);
+		const fields = {};
+		Object.keys(res).sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10)).forEach((fid) => {
+			const p = res[fid].param;
+			fields[fid] = p && p.value != null ? String(p.value) : "";
+		});
+		return {
+			uid: salt ? salt + "-" + sub.id : String(sub.id),
+			id: sub.id,
+			index: sub.index,
+			label: rowLabel(sub, castMode),
+			spk: sub.spk || null,
+			s: sub.startSec,
+			e: sub.endSec,
+			text: sub.text,
+			presetId: (rs && rs.presetId) || "",
+			sig: fieldSignature(all),
+			captionFid: preset ? captionFid(preset) : null,
+			fields,
+			warn: (rs && Array.isArray(rs.warn)) ? rs.warn : [],
+			sugg: (rs && rs.sugg && typeof rs.sugg === "object") ? rs.sugg : {}
+		};
+	}
+	// 프리셋 요약 (presets 명령, 5단계 list_presets): T-ID 목록, 캡션, 필드 서명, comment 규칙 문구.
+	// 네이티브는 필드 이름이 definition.json에서 오지 못해 '텍스트 N'이면 순서 미확인(orderVerified false)이다.
+	function presetSummary(preset) {
+		const params = (preset && preset.params) || [];
+		const native = isNativeList(params);
+		const fields = fieldIdMap(params, preset && preset.textParamIndex).map((f) => ({ fid: f.fid, label: f.displayName, index: f.index, caption: !!f.caption }));
+		const notes = params.filter((p) => p && p.type === "comment").map((p) => String(p.value || p.displayName || "")).filter((x) => x !== "");
+		const generic = native && fields.length > 0 && fields.every((f) => /^텍스트 \d+$/.test(f.label));
+		return { id: (preset && preset.id) || "", name: (preset && preset.name) || "", captionFid: captionFid(preset), sig: fieldSignature(params), fields, notes, native, orderVerified: !native || !generic };
+	}
+	// app.js 원문에서 //#region <name> 본문을 잘라낸다 (표식 줄 제외, 줄바꿈 LF). 없으면 null.
+	// tests/lib/loadRegions.js의 sliceRegion과 같은 규칙: coreHash = fnv1a32(이 region 본문)
+	function regionTextOf(src, name) {
+		const lines = String(src == null ? "" : src).replace(/\r\n/g, "\n").split("\n");
+		const open = lines.findIndex((ln) => { const m = /^\s*\/\/#region\s+(.+?)\s*$/.exec(ln); return !!m && m[1] === name; });
+		if (open < 0) return null;
+		let depth = 0;
+		for (let i = open + 1; i < lines.length; i++) {
+			if (/^\s*\/\/#region\b/.test(lines[i])) depth++;
+			else if (/^\s*\/\/#endregion\b/.test(lines[i])) {
+				if (depth === 0) return lines.slice(open + 1, i).join("\n");
+				depth--;
+			}
+		}
+		return null;
 	}
 	//#endregion
 	//#region src/ui/tabs.ts
@@ -4690,6 +4848,147 @@ var modalState = {
 		return false;
 	}
 	//#endregion
+	//#region src/mi/commands.ts
+	// ─────────────────────────────────────────────────────────────
+	// 헤드리스 명령: runCommand(op, args, ctx) → Promise<{ok:true, data} | {ok:false, error, detail}>
+	//
+	// UI 처리기, CDP 하드 테스트(window._mogrtDebug.cmd), 5단계 인박스가 같은 함수를 쓴다.
+	// ctx.source: "ui" | "test" | "agent".
+	// 오류 코드: needs-approval | fields-changed | busy | seq-mismatch | build-mismatch | bad-args | not-found
+	//   (예상하지 못한 예외는 exception)
+	//
+	// S1-5에는 읽기 명령만 있다: status, rows, resolve, presets, cast.get, session.snapshot.
+	// 바꾸는 명령(importSrt, merge*, plan/apply, cast.set, suggest …)은 뒤 커밋에서 더하고,
+	// agent가 보내면 M5.4(승인 카드) 전까지 needs-approval이다.
+	// 줄 주소 "#12" / "C2·12"는 사람이 읽는 이름일 뿐이다(파싱할 때마다 바뀐다). 쓰기 주소는 uid다.
+	// ─────────────────────────────────────────────────────────────
+	const CMD_SOURCES = { ui: true, test: true, agent: true };
+	const CMD_ROWS_MAX = 200;
+	function _cmdOk(data) {
+		return { ok: true, data };
+	}
+	function _cmdErr(error, detail) {
+		return { ok: false, error, detail: detail || "" };
+	}
+	// 화자 표가 있으면 다화자 표시("C2·12")
+	function _castMode() {
+		return Object.keys((state.mi && state.mi.cast) || {}).length > 0;
+	}
+	function _cmdClone(v) {
+		return JSON.parse(JSON.stringify(v === undefined ? null : v));
+	}
+	// 설치된 app.js의 src/mi/core.ts 본문 해시 (5단계 MCP 서버가 같은 core를 쓰는지 확인하는 값).
+	// 패널이 실제로 로드한 파일을 읽는다. 읽지 못하면 null (한 번만 시도한다).
+	var _coreHashMemo;
+	function _coreHash() {
+		if (_coreHashMemo !== undefined) return _coreHashMemo;
+		_coreHashMemo = null;
+		try {
+			const cacheRoot = _getCacheRoot();
+			if (!cacheRoot || !window.cep || !window.cep.fs) return null;
+			const r = window.cep.fs.readFile(cacheRoot.replace(/\/cache$/, "") + "/html/js/app.js");
+			if (r && r.err === 0 && r.data) {
+				const body = regionTextOf(r.data, "src/mi/core.ts");
+				if (body !== null) _coreHashMemo = fnv1a32(body);
+			}
+		} catch (_) {}
+		return _coreHashMemo;
+	}
+	function _rowSummaryOf(sub) {
+		const rs = state.rowStates[sub.id];
+		const preset = rs && rs.presetId ? state.presets[rs.presetId] : null;
+		return rowSummary(sub, rs, preset, (state.mi && state.mi.salt) || "", _castMode());
+	}
+	const _COMMANDS = {
+		// 패널·시퀀스·목록 요약. host는 v28 호스트 ping이 생기면 채운다 (S2-1)
+		status: () => {
+			const mi = state.mi || miDefault();
+			const speakers = (mi.castOrder || []).map((k) => {
+				const c = (mi.cast && mi.cast[k]) || {};
+				return { key: k, name: c.name || k, track: typeof c.track === "number" ? c.track : null, presetId: c.presetId || "", count: state.subtitles.filter((s) => s.spk === k).length };
+			});
+			return _cmdOk({
+				panel: { v: 28, build: null },
+				host: null,
+				seq: { id: state.currentSequenceId || "", name: (_seqLabelInfo && _seqLabelInfo.seqName) || "" },
+				projKey: state.currentProjectKey,
+				seqKey: state.currentSequenceKey,
+				keysResolved: _keysResolved,
+				sessionReadFailed: _sessionReadFailed,
+				rows: state.subtitles.length,
+				castMode: _castMode(),
+				speakers,
+				busy: false,
+				coreHash: _coreHash()
+			});
+		},
+		// 줄 목록 (쪽 단위). args {spk?, from = 0, count ≤ 200, filter: all|changed|warn|sugg}
+		// → {total: 거른 뒤 줄 수, from, rows: [{uid, id, index, label, spk, s, e, text, presetId, sig, captionFid, fields, warn, sugg}]}
+		rows: (args) => {
+			const filter = args.filter === undefined ? "all" : args.filter;
+			if (["all", "changed", "warn", "sugg"].indexOf(filter) === -1) return _cmdErr("bad-args", "filter는 all|changed|warn|sugg");
+			const from = args.from === undefined ? 0 : Number(args.from);
+			const count = args.count === undefined ? CMD_ROWS_MAX : Number(args.count);
+			if (!Number.isInteger(from) || from < 0) return _cmdErr("bad-args", "from은 0 이상의 정수");
+			if (!Number.isInteger(count) || count < 1 || count > CMD_ROWS_MAX) return _cmdErr("bad-args", "count는 1~" + CMD_ROWS_MAX);
+			if (args.spk !== undefined && typeof args.spk !== "string") return _cmdErr("bad-args", "spk는 문자열 (예: C2)");
+			const keep = (sub) => {
+				if (args.spk !== undefined && (sub.spk || "") !== args.spk) return false;
+				const rs = state.rowStates[sub.id] || {};
+				if (filter === "changed") return !!rs.mm;
+				if (filter === "warn") return Array.isArray(rs.warn) && rs.warn.length > 0;
+				if (filter === "sugg") return !!rs.sugg && typeof rs.sugg === "object" && Object.keys(rs.sugg).length > 0;
+				return true;
+			};
+			const all = state.subtitles.filter(keep);
+			return _cmdOk({ total: all.length, from, rows: _cmdClone(all.slice(from, from + count).map(_rowSummaryOf)) });
+		},
+		// 사람이 쓴 주소("#12", "C2·12", "#12 T2") → 지금 목록의 줄 {uid, id, index, label, spk, text, captionFid, fields, sig}
+		// 주소에 필드가 있으면 fid와 field {fid, index, displayName, value, caption}(못 찾으면 null)도 준다
+		resolve: (args) => {
+			const parsed = parseRowLabel(args.label);
+			if (!parsed) return _cmdErr("bad-args", "주소 형식이 아니다: " + String(args.label) + " (예: #12, C2·12, #12 T2)");
+			const hits = findRowsByLabel(state.subtitles, parsed);
+			if (!hits.length) return _cmdErr("not-found", "그런 줄이 없다: " + String(args.label));
+			if (hits.length > 1) return _cmdErr("bad-args", "여러 줄이 맞는다: " + hits.map((s) => rowLabel(s, true)).join(", ") + " — 화자를 붙여 주세요");
+			const r = _rowSummaryOf(hits[0]);
+			const out = { uid: r.uid, id: r.id, index: r.index, label: r.label, spk: r.spk, text: r.text, presetId: r.presetId, captionFid: r.captionFid, fields: r.fields, sig: r.sig };
+			if (parsed.fid) {
+				const rs = state.rowStates[hits[0].id];
+				const preset = rs && rs.presetId ? state.presets[rs.presetId] : null;
+				const f = resolveFid((rs && rs._allParams) || [], parsed.fid, preset ? preset.params : null);
+				out.fid = parsed.fid;
+				out.field = f ? { fid: f.fid, index: f.index, displayName: f.displayName, value: f.param && f.param.value != null ? String(f.param.value) : "", caption: out.captionFid === f.fid } : null;
+			}
+			return _cmdOk(_cmdClone(out));
+		},
+		// 프리셋마다 [{id, name, captionFid, sig, fields:[{fid, label, index, caption}], notes, native, orderVerified}]
+		presets: () => {
+			const ids = Object.keys(state.presets).sort((a, b) => (presetNum(a) - presetNum(b)) || (a < b ? -1 : a > b ? 1 : 0));
+			return _cmdOk(_cmdClone(ids.map((id) => presetSummary(Object.assign({}, state.presets[id], { id })))));
+		},
+		// 화자 표 (salt 포함, applied·hwm 제외)
+		"cast.get": () => {
+			const mi = miFromFile(state.mi);
+			return _cmdOk(_cmdClone({ salt: mi.salt, castOrder: mi.castOrder, cast: mi.cast, legacyTrack: mi.legacyTrack, stack: mi.stack, stackDy: mi.stackDy, remapped: mi.remapped }));
+		},
+		// 세션 전체 사본 (읽기 전용)
+		"session.snapshot": () => _cmdOk(_cmdClone({ projKey: state.currentProjectKey, seqKey: state.currentSequenceKey, subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi }))
+	};
+	async function runCommand(op, args, ctx) {
+		const source = ctx && ctx.source !== undefined ? ctx.source : "ui";
+		if (!CMD_SOURCES[source]) return _cmdErr("bad-args", "ctx.source는 ui|test|agent");
+		if (typeof op !== "string" || !Object.prototype.hasOwnProperty.call(_COMMANDS, op)) return _cmdErr("bad-args", "모르는 명령: " + String(op));
+		if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) return _cmdErr("bad-args", "args는 객체");
+		try {
+			return await _COMMANDS[op](args || {}, { source });
+		} catch (e) {
+			console.error("[MOGRT] runCommand 예외:", op, e);
+			return _cmdErr("exception", (e && e.message) || String(e));
+		}
+	}
+	window._mogrtDebug.cmd = (op, args) => runCommand(op, args, { source: "test" });
+	//#endregion
 	//#region src/main.ts
 	function setStatus(msg, cls) {
 		const el = document.getElementById("statusBar");
@@ -4740,6 +5039,7 @@ var modalState = {
 					checked: false
 				};
 			});
+			_raiseHwm();
 			renderAll();
 			renderTrash();
 			updateMultiSelect();
@@ -5513,6 +5813,8 @@ var modalState = {
 			nextId: state.nextId,
 			trackValue: document.getElementById("trackSel")?.value ?? "2"
 		};
+		// 화자 표·salt가 있으면 싣는다 (hwm·applied는 이 시퀀스의 것이라 싣지 않는다)
+		if (miHasData(state.mi)) workData.mi = Object.assign(miSnapshotOf(state.mi), { salt: state.mi.salt });
 		const json = JSON.stringify(workData, null, 2);
 		const seqName = (state.currentSequenceKey || "work").replace(/[^a-zA-Z0-9_\-가-힣]/g, "_");
 		const dateStr = new Date().toLocaleDateString("ko-KR").replace(/\./g, "").replace(/ /g, "_");
@@ -5545,12 +5847,31 @@ var modalState = {
 				if (!data.subtitles || !data.rowStates) { showAlert("올바른 작업 파일이 아닙니다."); return; }
 				// 지금 목록을 바꾸기 전에 안전 지점을 남긴다
 				_saveSafety("작업 불러오기 전");
+				// id 규칙 (다른 시퀀스의 id가 이 시퀀스의 id·클립 태그와 겹치지 않게):
+				//   같은 시퀀스(GUID가 같다. Premiere '다른 이름으로 저장'으로 projKey만 바뀐 경우 포함)
+				//     → id 유지, nextId = safeNextId, 화자 표는 파일에서. 지금 salt가 비었으면 파일의 salt를 받는다
+				//   다른 시퀀스 → 지금 쓴 적 있는 id 다음부터 다시 매기고 mi.remapped = true. salt는 받지 않는다
+				const curGuid = seqGuidOf(state.currentSequenceKey);
+				const sameSeq = data.sequenceKey === state.currentSequenceKey || (!!curGuid && seqGuidOf(data.sequenceKey) === curGuid);
+				const fileMi = data.mi && typeof data.mi === "object" && !Array.isArray(data.mi) ? data.mi : null;
+				let loaded;
+				if (sameSeq) {
+					loaded = { subtitles: data.subtitles, rowStates: data.rowStates, trashBin: data.trashBin || [], nextId: safeNextId(data, state.mi.hwm, state.nextId) };
+					_miRestore(fileMi);
+					if (!state.mi.salt && fileMi && typeof fileMi.salt === "string" && /^[a-z0-9]{4}$/.test(fileMi.salt)) state.mi.salt = fileMi.salt;
+				} else {
+					const start = safeNextId({ nextId: state.nextId, subtitles: state.subtitles, trashBin: state.trashBin }, state.mi.hwm, state.nextId);
+					loaded = remapIds({ subtitles: data.subtitles, rowStates: data.rowStates, trashBin: data.trashBin || [] }, start);
+					_miRestore(fileMi);
+					state.mi.remapped = true;
+				}
 				// _sanitizeOrphanPresets()로 rowStates까지 정리한 뒤
 				// saveSessionToStorage()가 돈다.
-				setSubtitles(data.subtitles, { reason: "작업 파일 불러오기", persist: false });
-				state.rowStates = data.rowStates;
-				state.trashBin = data.trashBin || [];
-				state.nextId = data.nextId || 1;
+				setSubtitles(loaded.subtitles, { reason: "작업 파일 불러오기", persist: false });
+				state.rowStates = loaded.rowStates;
+				state.trashBin = loaded.trashBin;
+				state.nextId = loaded.nextId;
+				_raiseHwm();
 			// 트랙 복원 + localStorage에도 저장
 			if (data.trackValue) {
 				const trackSel = document.getElementById("trackSel");
@@ -5565,7 +5886,7 @@ var modalState = {
 				renderTrash();
 				updateMultiSelect();
 				saveSessionToStorage();
-				setStatus("작업 불러오기: " + file.name + " (" + state.subtitles.length + "개)", "ok");
+				setStatus("작업 불러오기: " + file.name + " (" + state.subtitles.length + "개)" + (sameSeq ? "" : " · 다른 시퀀스의 작업이라 내부 id를 새로 매겼습니다"), "ok");
 			} catch (_) {
 				showAlert("JSON 파일 파싱 실패. 올바른 작업 파일인지 확인하세요.");
 			}
@@ -5621,6 +5942,8 @@ var modalState = {
 			nextId: state.nextId,
 			trackValue: document.getElementById("trackSel")?.value ?? "2"
 		};
+		// 화자 표(salt·hwm·applied 제외)는 있을 때만 싣는다 → 단일 화자 항목은 v27 모양 + hash
+		if (miHasData(state.mi)) entry.mi = miSnapshotOf(state.mi);
 		entry.hash = contentHash(entry.subtitles, entry.rowStates, entry.trashBin);
 		return entry;
 	}
@@ -5795,7 +6118,10 @@ var modalState = {
 					setSubtitles(entry.subtitles, { reason: "히스토리 복원", persist: false });
 					state.rowStates = entry.rowStates;
 					state.trashBin = entry.trashBin || [];
-					state.nextId = entry.nextId || 1;
+					// 화자 표는 항목에서, salt·hwm·applied는 지금 값. nextId는 되돌리지 않는다 (쓴 적 있는 id를 다시 주지 않게)
+					_miRestore(entry.mi);
+					state.nextId = safeNextId(entry, state.mi.hwm, state.nextId);
+					_raiseHwm();
 					if (entry.trackValue) {
 						const trackSel = document.getElementById("trackSel");
 						if (trackSel) {
@@ -5902,7 +6228,8 @@ var modalState = {
 			presetTrash: state.presetTrash.map((t) => Object.assign({}, t, { preset: slim(t.preset) })),
 			nextPresetId: state.nextPresetId,
 			mogrtCount: state.mogrtList.length,
-			mogrtOriginals: state.mogrtOriginals
+			mogrtOriginals: state.mogrtOriginals,
+			mi: state.mi
 		}));
 	}
 	window._mogrtDebug.snapshot = _debugSnapshot;

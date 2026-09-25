@@ -321,6 +321,16 @@ function buildDocument() {
 
 // ── cep.fs (메모리) ──
 
+/** EXT_DIR/html/… → 저장소 extension/html/… 내용 (없으면 null). 쓰기·목록에는 나타나지 않는다 */
+function extFile(p) {
+	const pre = EXT_DIR + "/html/";
+	if (String(p).indexOf(pre) !== 0) return null;
+	const rel = String(p).slice(pre.length);
+	if (!rel || rel.split("/").indexOf("..") !== -1) return null;
+	const real = path.join(ROOT, "extension", "html", ...rel.split("/"));
+	return fs.existsSync(real) && fs.statSync(real).isFile() ? fs.readFileSync(real, "utf8") : null;
+}
+
 function makeFs(initial) {
 	const files = new Map(Object.entries(initial || {}).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)]));
 	const dirs = new Set();
@@ -338,7 +348,11 @@ function makeFs(initial) {
 		readFile(p) {
 			p = norm(p);
 			if (api.unreadable.has(p)) return { err: 4, data: "" };
-			return files.has(p) ? { err: 0, data: files.get(p) } : { err: 3, data: "" };
+			if (files.has(p)) return { err: 0, data: files.get(p) };
+			// 설치 폴더의 패널 파일(html/…)은 저장소 extension/html/…을 읽는다 (runCommand status의 coreHash 등)
+			const ext = extFile(p);
+			if (ext !== null) return { err: 0, data: ext };
+			return { err: 3, data: "" };
 		},
 		writeFile(p, data) { p = norm(p); files.set(p, String(data)); writes.push(p); return { err: 0 }; },
 		makedir(p) { dirs.add(norm(p)); return { err: 0 }; },
@@ -397,6 +411,13 @@ function makeHost(opts) {
 	host.handlers.capturePreviewFrame = () => "ERROR: 하네스";
 	host.handlers.getPreviewClipParams = () => "ERROR: 없음";
 	host.handlers.applyToTimeline = () => "SUCCESS: 0개 배치 (하네스)";
+	// 작업 저장 대화상자: 내용을 host.savedFiles에 남기고 저장한 것으로 답한다
+	host.savedFiles = [];
+	host.handlers.saveTextFileWithDialog = (json) => {
+		const o = JSON.parse(json);
+		host.savedFiles.push(o);
+		return "SUCCESS: C:/fake/" + (o.defaultName || "work.json");
+	};
 	host.handlers.$ = () => "C:/Temp";
 	return host;
 }
@@ -460,6 +481,7 @@ const cachePaths = {
 	historyAuto: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/history_auto.json",
 	historyManual: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/history_manual.json",
 	historySafety: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/history_safety.json",
+	cast: (projPath, seqId) => CACHE_ROOT + "/" + projKeyOf(projPath) + "/" + seqKeyOf(projPath, seqId) + "/cast.json",
 	defaultSession: CACHE_ROOT + "/default/default_seq/session.json"
 };
 

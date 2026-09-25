@@ -148,6 +148,19 @@ function pageDropSrt(name, content) {
 		" return input.disabled ? 'sent-disabled' : 'sent'; })()";
 }
 
+/** #workInput에 작업 파일(객체 → JSON)을 넣고 change를 보낸다 */
+function pageLoadWork(name, obj) {
+	return "(() => { const input = document.getElementById('workInput'); if (!input) return 'no-input';" +
+		" const dt = new DataTransfer(); dt.items.add(new File([" + JSON.stringify(JSON.stringify(obj)) + "], " + JSON.stringify(name) + ", { type: 'application/json' }));" +
+		" input.files = dt.files; input.dispatchEvent(new Event('change', { bubbles: true }));" +
+		" return input.disabled ? 'sent-disabled' : 'sent'; })()";
+}
+
+/** runCommand 결과 (window._mogrtDebug.cmd, 약속을 기다린다) */
+function pageCmd(op, args) {
+	return "window._mogrtDebug.cmd(" + JSON.stringify(op) + ", " + JSON.stringify(args || {}) + ")";
+}
+
 /** 목록 행 요약 [{id, num, text, preset, checked, cls}] */
 const PAGE_ROWS = "Array.from(document.querySelectorAll('#listWrap .sub-row')).map((r) => ({" +
 	" id: parseInt(r.id.slice(4), 10)," +
@@ -283,7 +296,7 @@ async function devCacheRoot(panel) {
 module.exports = {
 	sleep, waitFor, ticksToFrame,
 	jsxReadVideoTrack, jsxClearVideoTrack, jsxHasSequenceNamed, jsxDeletePreviewSequence, jsxCloneActiveAsScratch, jsxDropScratch, withScratchSequence, SCRATCH_PREFIX,
-	pageDropSrt, pageSetRowPreset, pageImportPresetsText,
+	pageDropSrt, pageLoadWork, pageCmd, pageSetRowPreset, pageImportPresetsText,
 	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS, PAGE_RECORD_HOST_CALLS,
 	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot
 };

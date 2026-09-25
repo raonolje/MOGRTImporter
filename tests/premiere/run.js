@@ -139,7 +139,8 @@ async function checkBuildStamp(client, opts = {}) {
 	lines.push("호스트 빌드: " + (hostBuild || "(읽지 못함: " + String(raw).slice(0, 120) + ")"));
 	let ok = !!hostBuild && (!exp.build || hostBuild === exp.build);
 	if (!ok) lines.push("!! 호스트 빌드가 설치 빌드와 다르다 — JSX는 Premiere를 다시 시작할 때까지 캐시된다. Premiere를 재시작한다");
-	const panelRaw = await api.panel("(window._mogrtDebug && typeof window._mogrtDebug.cmd === \"function\") ? JSON.stringify(window._mogrtDebug.cmd(\"status\", {})) : \"\"");
+	// cmd는 약속을 돌려준다 (runCommand, S1-5) → 기다린 뒤 문자열로
+	const panelRaw = await api.panel("(async () => (window._mogrtDebug && typeof window._mogrtDebug.cmd === \"function\") ? JSON.stringify(await window._mogrtDebug.cmd(\"status\", {})) : \"\")()");
 	let panelBuild = null;
 	if (panelRaw) {
 		try { panelBuild = _findBuild(JSON.parse(panelRaw)); } catch (_) { panelBuild = null; }

@@ -34,6 +34,8 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   - `panel_golden.test.js`(단일 화자 SRT → 프리셋 → ▶ 페이로드·session.json)는 v27 app.js에서도 통과한다. 단일 화자 경로가 바뀌면 여기서 깨진다.
 - **픽스처는 합성 텍스트만** 넣는다(`tests/fixtures/`). 저장소에 GitHub 원격이 있다. `tests/fixtures/**`는 `-text`라 CRLF·CR·BOM 바이트가 그대로 커밋된다.
 - `tests/compat/` (S1-5부터, `preset_refs.test.js`는 S1-2 리뷰 반영): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지). 출력은 숫자·id만.
+  - `realcache.test.js` (S1-5): 비어 있지 않은 session.json을 하네스(메모리 cep.fs)에 넣고 불러와 다시 저장해도 JSON이 같고 키 4개(mi 없음)인지, 히스토리 항목을 드롭다운으로 복원해도 목록·rowStates·휴지통이 같은지, 캡션 T-ID가 모든 줄에서 캡션 필드로 해석되고 isV27Unsafe가 옛 구조 줄과 정확히 같은지 본다. 실행: `MI_REAL_CACHE="$APPDATA/Adobe/CEP/extensions/CEP_MogrtImporter/cache" node --test tests/compat/realcache.test.js`
+- `runCommand` (S1-5, `//#region src/mi/commands.ts`): 하드 케이스는 `await window._mogrtDebug.cmd(op, args)`(약속)로 부른다 (`hard.js`의 `pageCmd`). 읽기 명령 status·rows·resolve·presets·cast.get·session.snapshot.
 
 ## 3. ES3 린트
 
