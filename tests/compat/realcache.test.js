@@ -258,3 +258,76 @@ test("운영 캐시 (S1-10): 옛 구조 줄을 지금 프리셋 구조로 맞추
 	}
 	t.diagnostic("맞춘 줄 " + rebasedAll + "개 (옛 구조 " + stale + "개), 못 옮긴 텍스트 " + orphans + "개");
 });
+
+test("운영 캐시 (S3-4): 레거시 목록을 화자로 나눈다 — 세션 자막을 번갈아 C1·C2 파일로 다시 내보낸 것(합성)으로 분배하면 줄마다 제 화자, id·시간·문장·후반 작업 그대로, 같은 파일을 다시 가져오면 변화 없음", { skip }, (t) => {
+	const core = loadRegions(["src/srtParser.ts", "src/mi/core.ts"]);
+	const js = (v) => JSON.stringify(v);
+	const clone = (v) => JSON.parse(js(v));
+	// 한 화자의 합성 SRT (parseSRT opts 결과 모양, 번호는 그 파일 안에서 1부터)
+	const cuesOf = (rows) => rows.slice().sort((a, b) => a.startSec - b.startSec).map((x, j) => ({ index: j + 1, startTime: x.startTime, endTime: x.endTime, startSec: x.startSec, endSec: x.endSec, text: x.text, srtNo: j + 1 }));
+	let sessions = 0;
+	let rows = 0;
+	let dups = 0;
+	let ambiguous = 0;
+	let trashAssigned = 0;
+	for (const s of sequences()) {
+		const raw = readText(path.join(s.dir, "session.json"));
+		if (!raw) continue;
+		let sess;
+		let presets = {};
+		try {
+			sess = JSON.parse(raw);
+			if (s.presets) presets = JSON.parse(s.presets).presets || {};
+		} catch (_) { continue; }
+		if (!sess || !Array.isArray(sess.subtitles) || !sess.subtitles.length || sess.subtitles.some((x) => x.spk)) continue;
+		const where = tag(s);
+		// 차례마다 번갈아 C1·C2. 시작과 문장이 같은 줄(중복)은 같은 화자로 둔다 (두 파일에 같은 자막이 있으면 어느 화자인지 가릴 수 없다)
+		const keyOf = {};
+		const first = {};
+		sess.subtitles.forEach((x, i) => {
+			const k = x.startSec + "|" + core.normText(x.text);
+			if (first[k] === undefined) first[k] = i;
+			else dups++;
+			keyOf[x.id] = first[k] % 2 ? "C2" : "C1";
+		});
+		const files = ["C1", "C2"].map((K) => ({ key: K, name: "", action: "new", cues: cuesOf(sess.subtitles.filter((x) => keyOf[x.id] === K)) })).filter((f) => f.cues.length);
+		const data = { subtitles: clone(sess.subtitles), rowStates: clone(sess.rowStates || {}), trashBin: clone(sess.trashBin || []), nextId: sess.nextId || 1, mi: core.miDefault() };
+		const rep = core.importIntoData(data, { files: clone(files), legacy: { mode: "split", oneKey: "", assign: {} } }, { now: 1, presets, salt: "ab12", trackValue: 2 });
+		assert.ok(rep.legacy && rep.legacy.total === sess.subtitles.length, where + ": 분배한 줄 수");
+		assert.equal(rep.legacy.unmatched, 0, where + ": 짝 없는 줄(휴지통으로 간 줄) 없음");
+		ambiguous += rep.legacy.ambiguous.length;
+		trashAssigned += rep.legacy.trashAssigned;
+		assert.ok(rep.files.every((f) => f.action === "merge"), where + ": 화자마다 나눈 줄에 병합 " + js(rep.files.map((f) => f.action)));
+		rep.files.forEach((f) => {
+			const st = f.stats;
+			assert.ok(st && st.same === f.count && st.text + st.time + st.both + st.check + st.new + st.removed + st.conflict + st.restored === 0, where + " " + f.key + ": 제 파일과는 모두 같음 " + js({ same: st && st.same, count: f.count, text: st && st.text, time: st && st.time, check: st && st.check, new: st && st.new, removed: st && st.removed }));
+		});
+		assert.equal(data.subtitles.length, sess.subtitles.length, where + ": 줄 수 (새 줄·빠진 줄 없음)");
+		assert.equal(data.trashBin.length, (sess.trashBin || []).length, where + ": 휴지통 수");
+		const orig = {};
+		sess.subtitles.forEach((x) => { orig[x.id] = x; });
+		const bad = { spk: 0, sub: 0, rs: 0 };
+		data.subtitles.forEach((x) => {
+			const o = orig[x.id];
+			if (!o || x.spk !== keyOf[x.id]) bad.spk++;
+			if (!o || x.text !== o.text || x.startSec !== o.startSec || x.endSec !== o.endSec || x.startTime !== o.startTime || x.endTime !== o.endTime) bad.sub++;
+			if (js(data.rowStates[x.id]) !== js((sess.rowStates || {})[x.id])) bad.rs++;
+		});
+		assert.deepEqual(bad, { spk: 0, sub: 0, rs: 0 }, where + ": 제 화자·id·시간·문장·줄 상태(프리셋·후반 작업) 그대로");
+		assert.equal(js(data.mi.castOrder), js(files.map((f) => f.key)), where + ": 화자 표");
+		assert.equal(data.mi.legacyTrack, 2, where + ": 옛 클립 트랙");
+		// 화자 안 번호는 1부터 차례대로
+		files.forEach((f) => {
+			const idx = data.subtitles.filter((x) => x.spk === f.key).map((x) => x.index);
+			assert.ok(idx.every((v, i) => v === i + 1), where + " " + f.key + ": 번호");
+		});
+		// 같은 파일을 다시 가져오면 (이제 화자 줄이 있다 → 화자마다 병합) 아무것도 바뀌지 않는다
+		const again = js(data);
+		const rep2 = core.importIntoData(data, { files: clone(files).map((f) => Object.assign(f, { action: "merge" })) }, { now: 2, presets });
+		assert.ok(rep2.legacy === null && rep2.files.every((f) => f.action === "merge"), where + ": 다시 가져오기는 병합");
+		assert.ok(js(data) === again, where + ": 같은 파일 다시 가져오기는 변화 없음");
+		sessions++;
+		rows += sess.subtitles.length;
+	}
+	t.diagnostic("나눈 세션 " + sessions + "개, 줄 " + rows + "개 (시작·문장 중복 " + dups + "개, 확인 필요 " + ambiguous + "개, 휴지통 항목 배정 " + trashAssigned + "개)");
+});

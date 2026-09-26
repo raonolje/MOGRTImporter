@@ -57,12 +57,14 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - `tests/compat/native_bake_real.test.js` (S1-11): 설치된 MOGRT 폴더(`MI_MOGRT_ROOT`, 기본 `%APPDATA%/Adobe/Common/Motion Graphics Templates`)가 있으면 돈다. 읽기 전용(메모리에서만 굽는다). Classic Lower Third Two Lines를 굽고, 모든 네이티브 템플릿의 prgraphic마다 Source Text 수가 TextLayer 수와 같거나 0(새 형식)인지 본다.
 - `tests/compat/` (S1-5부터, `preset_refs.test.js`는 S1-2 리뷰 반영): `MI_REAL_CACHE`가 운영 캐시(`%APPDATA%/Adobe/CEP/extensions/CEP_MogrtImporter/cache`)를 가리킬 때만 돈다. **읽기 전용**이고, 실제 자막 텍스트를 저장소에 복사하지 않는다(스냅샷·픽스처·로그 파일 금지). 출력은 숫자·id만.
   - `realcache.test.js` (S1-5): 비어 있지 않은 session.json을 하네스(메모리 cep.fs)에 넣고 불러와 다시 저장해도 JSON이 같고 키 4개(mi 없음)인지, 히스토리 항목을 드롭다운으로 복원해도 목록·rowStates·휴지통이 같은지, 캡션 T-ID가 모든 줄에서 캡션 필드로 해석되고 isV27Unsafe가 옛 구조 줄과 정확히 같은지 본다. 실행: `MI_REAL_CACHE="$APPDATA/Adobe/CEP/extensions/CEP_MogrtImporter/cache" node --test tests/compat/realcache.test.js`
+    - (S3-4) 레거시 목록 → 화자 나누기: 세션마다 자기 자막을 차례대로 번갈아 C1·C2 합성 파일(메모리에서만)로 만들어 분배(split)하면 줄마다 제 화자를 받고, 짝 없는 줄·새 줄·빠진 줄이 없고, id·시간·문장·줄 상태(프리셋·후반 작업)가 그대로, 화자 안 번호는 1부터, 같은 파일을 다시 가져오면 변화 없음. 시작·문장이 같은 중복 줄은 같은 화자로 둔다. 출력은 세션·줄·중복·확인 필요 수뿐이다.
 - `runCommand` (S1-5, `//#region src/mi/commands.ts`): 하드 케이스는 `await window._mogrtDebug.cmd(op, args)`(약속)로 부른다 (`hard.js`의 `pageCmd`). 읽기 명령 status·rows·resolve·presets·cast.get·session.snapshot.
   다른 출처는 `await window._mogrtDebug.cmdAs(source, op, args, {seqId, build, by})`.
 - `tests/unit/core_sugg.test.js` (S3-1): core `validateSuggestion`(받음 '날씨$$하늘', 거절: 캡션 필드·없는 필드·서명 다름 fields-changed·조각이 캡션에 없음·최대 3개 넘김·빈 값·500자, 자유 문구 경고, 두 번 나오는 조각 경고, 순서 미확인 네이티브), `suggState`(낡은 제안), `suggCheckText`, `uidToId`. 리뷰 반영: 공백뿐인 '$$' 조각 거절, `recheckPointWarn`(승인 뒤 포인트 경고 다시 보기).
 - `tests/unit/core_verify.test.js` (S3-1): core `verifyReport` — 지움·끝 자름·자르기·문장 고침·Motion 키가 정확히 그 다섯 줄, 옛 버전·템플릿 바뀜·의도 해시·변경 표시·기록 없음·놓인 적 없음(미적용), 옛 gen·목록에 없는 클립·다른 트랙, 네이티브는 확인 불가.
 - `tests/unit/panel_verify.test.js` (S3-3): 패널 + premiereSim — 적용 뒤 지움·끝 자름·자르기·문장 고침·Motion 키 → `#verifyModal`에 정확히 그 다섯 줄(요약 글·분류 머리·라벨), 검수 중 호스트 호출은 `MI_ping`·`MI_getTracks`·`MI_readClipTexts`뿐, 줄을 누르면 `seekToClip`(클립 시작·지운 클립은 마지막 적용 자리)과 `.vf-hit`; 옛 gen·목록에 없는 클립·패널에서 바꾼 값(미적용); 단일 화자에는 검수 버튼 없음·호스트가 없으면 까닭; ⟳(경로 → C1 병합 창, 경로 없음 → 파일 대화상자 → C번호 없는 파일은 C2); `#castToast`(3초 폴, 가져오기 창이 열린 동안 쉼, 스스로 병합 안 함, 닫은 바뀜은 다시 알리지 않음, [병합 미리보기] → 병합 창 → [가져오기] 뒤 파일 정보 갱신). 리뷰 반영: ⟳ 대화상자 취소 뒤 보통 SRT 열기·시퀀스 전환은 보통 경로, 다른 화자의 ⟳는 보이는 알림을 본 것으로 하지 않음, 같은 내용 다시 내보내기를 '변경 없음'으로 가져오면 파일 정보만 새로 → 다시 열어도 알림 없음, 적용 중·패널이 숨었을 때 쉼.
 - `tests/unit/panel_sugg.test.js` (S3-2): 제안이 와도 `_allParams`·단일 화자 ▶ 페이로드 바이트 같음, `.sugg-box` 문구·위치(필드 블록 입력 칸 아래)·[적용](값·속성창·안전 지점·mm text·'AI' 사라짐)·[무시], 캡션을 고치면 낡음(회색·[적용] 꺼짐), 'AI 제안 (N)' 드롭다운(제안 줄만 보기·검증 통과만 적용·모두 무시 확인창), 캡션을 바꾸는 병합이 제안을 지움, '경고 (N)' 필터·`.field-warn`, 속성창에 없는 필드는 `.sugg-extra`, 속성창이 없는 줄은 확인창. 리뷰 반영: 경고 필드를 제안 승인으로 고치면 rs.warn·'!'·`.field-warn`이 빠지고 경고 필터가 풀린다.
+- `tests/unit/panel_e2e.test.js` (S3-4): 하드 케이스 `s3_4_e2e`와 같은 자막·같은 순서를 패널 + premiereSim으로 — (A) 3화자 × 40줄 동시 발화(모든 차례에 세 화자가 겹침)를 가져오기 창(이름·프리셋)으로 → ▶ 점검 창 '배치 120줄: C1 철수 V3 40 · C2 영희 V5 40 · C3 민수 V6 40'·'새 비디오 트랙 2개 (V5, V6)'(V4에 남의 클립) → 화자마다 자기 트랙, 줄마다 클립 시작·끝 = 자막 ±1프레임·문장, 남은 태그 클립 없음, 다시 적용 0개, 검수 '정상 120', (B) C1 다시 내보내기(11번째 줄을 둘로·마지막 두 줄을 하나로, 문장도 다듬어 유사도 0.5 밑) → 가져오기 창 '같음 37 · 나눔·합침 확인 2 · 새 줄 1 · 빠짐 1'·mm check/check/new → ▶ 한 번(점검 창 빠진 줄 클립 지우기) → '화자별 배치: 놓음 1 · 갱신 2 · 지움 1 · 그대로 117', 보낸 작업 순서(앞 조각 update → 뒤 조각 place(덮는 이웃을 guard로) → 합친 줄 update), 이웃 머리 그대로(같은 nodeId), 다시 계획 0개 → 히스토리 되돌리기 '지움 1 · 되돌림 2 · 되놓음 1' → C1·C2·C3 트랙이 적용 전과 같다(uid·시작·끝·문장).
 - `tests/unit/panel_commands.test.js` (S3-1): 패널 + premiereSim — presets·rows·resolve, cast.set(화자 표·히스토리·틀리면 그대로·UI 칸 같은 함수), suggest(캡션 거절·fields-changed·모두 통과할 때만·속성 그대로), sugg.approve·reject(안전 지점 'AI 제안 적용 전', mm text, 레거시 줄은 mm 없음), agent 승인 대기열(needs-approval + rid, 승인 → 'AI: … 전' 안전 지점·'AI: …' 히스토리), planToken, seqId·build·busy, verify(쓰기 호출 없음), files {path}. 리뷰 반영: 인자가 틀린 요청을 승인하면 안전 지점 없이 그 오류.
 
 ## 3. ES3 린트
@@ -123,6 +125,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - `npm run hard` (`tests/premiere/suite.js`): 가드 → `smoke.expr.txt` → `cases/*.case.js`(이름순). `npm run hard -- s1_9`처럼 이름 일부로 거른다.
 - 스모크(`tests/premiere/smoke.expr.txt`, 읽기 전용): `window._mogrtDebug`가 object, `getActiveSequenceInfo()`가 seqId를 돌려준다.
 - 케이스 공용 도우미 `tests/premiere/lib/hard.js`: `waitFor`(페이지 표현식이 참이 될 때까지), 트랙 읽기·비우기 JSX(`jsxReadVideoTrack`, `jsxClearVideoTrack` — 스크래치 사본의 V2 이상만), 스크래치 시퀀스(`withScratchSequence` — 활성 T_ 시퀀스를 `Sequence.clone()`해 `T_scratch_<tag>`로 돌리고 끝나면 `deleteSequence`·DEV 세션 폴더 정리. 원본 T_23976에는 S0-3 수동 확인용 클립이 있어 타임라인을 바꾸는 케이스는 반드시 여기서 돈다), `#srtInput`에 파일 넣기(`pageDropSrt`), 행 요약(`PAGE_ROWS`), 새로 고침 예외 검사(`reloadClean`), 프리셋이 없을 때 모달로 만들기(`ensurePreset` — 먼저 `setupPreviewSequence`로 프리뷰 시퀀스를 만들어 V1을 지킨다).
+  - `s3_4_e2e` (S3-4, 스크래치 하나): (A) 3화자 × 40줄 동시 발화 — V2 이상을 비우고 V4~마지막 트랙마다 남의 클립(태그 없는 MOGRT)을 깔아 C2·C3가 새 트랙을 쓰게 한 뒤 가져오기 창(이름 철수·영희·민수, 캡션 AE 프리셋) → ▶ 점검 창 줄 'C1 철수 V3 40 · C2 영희 Vn 40 · C3 민수 Vn+1 40'과 '새 비디오 트랙 2개' → 줄마다 클립 시작·끝이 자막 ±1프레임(잘린 클립 없음), 화자마다 자기 트랙, 같은 트랙 겹침 없음, 남의 클립 그대로. (C) 성능 로그: 적용 시간(진행률 문구 '… 전체 n/120'을 모은다, spec 목표 ≤ ~100초), 다시 적용(보낸 작업 0, 5초 안), 다시 계획, 스캔, 검수('정상 120'), 가장 긴 evalScript(페이지에서 `CSInterface.prototype.evalScript`를 감싸 잰다. 청크 예산 7초 + 작업 하나라 10초 안을 단언하고 spec 목표 8초는 로그). (B) C1 다시 내보내기(11번째 줄 s+0.5에서 나눔·마지막 두 줄 합침) → 가져오기 창 '같음 37 · 나눔·합침 확인 2 · 새 줄 1 · 빠짐 1' → ▶ 한 번(점검 창 빠진 줄 클립 지우기 미리 체크, `hostMi.placeChunk`를 감싸 보낸 작업을 남긴다): 앞 조각 update → 뒤 조각 place(템플릿 길이가 머리를 덮는 12번째 줄을 guard로) → 합친 줄 update, 모든 줄 ±1프레임, C1 트랙 40개, 앞 조각·합친 줄 같은 nodeId, C2·C3 그대로, 다시 계획 0개 → 히스토리 되돌리기 → C1 트랙이 (B) 전과 같다(uid·시작·끝·캡션). 이웃 머리를 되돌렸는지(같은 nodeId) 덮여 다시 놓았는지는 로그에 남긴다. 같은 자막의 Premiere 없는 판은 `panel_e2e.test.js`. `cast_defaults.json`은 되돌린다.
   - `s3_3_verify` (S3-3): 스크래치 사본(V2 이상 비움)에 C1·C2 SRT를 저장소 밖 임시 폴더에서 경로로 가져와(mergeCommit {path}) 적용 → JSX로 지움·끝 0.5초 자름·QE razor·캡션 고침·Motion Position 키 → `#btnVerify` → 정확히 그 다섯 줄·정상 3, 검수 중 MID_ 호출은 ping·getTracks·readClipTexts뿐, 줄을 누르면 재생 헤드가 그 클립 시작(±1f) → C1 파일 수정 시각을 바꾸면 5초 안에 `#castToast`(스스로 병합 안 함) → ⟳가 C1 병합 창을 연다. `cast_defaults.json`은 되돌리고 임시 폴더는 지운다. 호스트는 바뀌지 않는다(패널만 새로 고침).
   - `s3_2_sugg` (S3-2): (1) 단일 화자 목록에서 제안 전후 `_allParams`와 ▶ 페이로드가 같다 — 페이지에서 `CSInterface.prototype.evalScript`의 `applyToTimeline(`만 가로채 글자를 받고 호스트로 보내지 않는다(타임라인 그대로, 끝나면 되돌린다), (2) 2화자 목록 `.sugg-box` [적용] → 값·mm text·안전 지점 'AI 제안 적용 전'(DEV 캐시 history_safety.json), (3) 캡션을 바꾸는 mergeCommit이 그 줄의 제안을 지우고 시간만 바뀐 줄은 둔다. 제안 필드가 속성창에 없으면 칸은 속성창 맨 위(`.sugg-extra`)에 있다.
   - `s3_1_cmd` (S3-1): 스크래치 사본에 C1 14줄·C2 12줄 → (1) presets fields·notes ↔ 속성창 배지, (2) rows 쪽·화자·필터·라벨, (3) resolve '#12' 모호·'#13'·'C2·12 T2', (4) cast.set → 화자 표·칩·히스토리, (5) 캡션 필드 제안 거절, (6) 낡은 서명 fields-changed·받은 제안은 대기열에만, (7) agent apply → needs-approval(호스트 호출 없음) → 대기열에서 버림. 타임라인은 바꾸지 않는다. `cast_defaults.json`은 되돌린다.
@@ -131,6 +134,24 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
   - `s2_4_e2e` (S2-4): 화자별 배치 E2E (a)~(h). 스크래치 사본마다 V2 이상을 비운 뒤 돈다. (c)는 페이지에서 `window._mogrtDebug.hostMi.placeChunk`를 한 번 감싸 첫 청크 뒤 `miStop()`을 부른다. (g)는 적용한 스크래치를 다시 `Sequence.clone`하고 끝나면 지운다. (h)는 메모리 경고 모달을 피하려고 120줄. `cast_defaults.json`은 시작 전 내용으로 되돌린다.
   - `s2_3_cast` (S2-3): 세 화자 가져오기 → 화자 표·칩·필터·선택 삭제·이름 파일 셋·새 프리셋 선택지·프리셋 삭제·새로 고침 bootDone, 단일 화자 줄 모양·되살리기 자리. 프로젝트 단위 `cast_defaults.json`(DEV 캐시)은 끝나면 시작 전 내용으로 되돌린다.
   - 적용·구조 맞춤 케이스용(S1-9, S1-10): 클립 속성 되읽기(`jsxTrackProps` — 클립마다 시작·끝·nodeId와 [이름, 값], 텍스트는 `T:`+textEditValue, `propValue`), MOGRT 직접 놓기(`jsxPlaceMogrt`, 스크래치 사본만), 확인창 기다리기(`waitConfirm`), `PAGE_CLEAR_STATUS`, `pageSelectTrack`, `pageCheckRow`, `pageTypeField`, 합성 SRT(`srtOf`), MOGRT로 프리셋 찾기·만들기(`pickPresetForMogrt`), 빈 목록에 SRT + 프리셋(`loadRowsWithPreset`), ▶ → [안전하게 적용 (N)](`safeApplyClick`).
+
+### 전체 하드 모음 (S3-4)
+
+커밋의 하드 케이스만이 아니라 `cases/*.case.js` 전체(s1_1 … s3_4)를 돌릴 때:
+
+1. `tools/install_dev.sh` — 작업 트리를 DEV로 (운영 폴더가 그대로인지 설치 전후 sha1로 알려 준다)
+2. Premiere 종료 → 실행 → **Ctrl+O**로 `MI_test.prproj` → `T_23976`을 활성 시퀀스로 → 창 > 확장 > MOGRT Subtitle Importer (DEV). 운영 패널은 닫아 둔다
+3. `node tests/premiere/run.js --port 7778 --check-build` — 다르면 Premiere를 다시 시작한다 (JSX 캐시)
+4. `npm run hard` — 가드 → 스모크 → 케이스 이름순. 맨 끝 줄 `=== n/n 통과`
+
+무거운 케이스(importMGT가 많다): `s2_2_place`, `s2_4_e2e`(120줄 포함), `s2_5_undo`, `s3_4_e2e`(3화자 120줄 + 나누기·합치기·되돌리기).
+
+알려진 환경 문제:
+
+- **메모리 부족 경고 모달이 ExtendScript를 막는다.** 긴 실행(수백 번의 importMGT) 뒤 Premiere가 메모리 경고 대화상자를 띄우면, 닫을 때까지 evalScript가 돌아오지 않는다. 케이스는 `시간 초과(…)`로 실패하고(스위트가 모달을 확인하라는 줄을 덧붙인다), 패널 적용 중이면 워치독 문구 'Premiere에 대화상자가 떠 있을 수 있습니다'가 뜬다. 모달을 닫고 Premiere를 다시 시작한 뒤(2~3단계) 실패한 케이스부터 다시 돌린다: `npm run hard -- s3_4`. 재시작한 뒤 다시 돌려 초록이면 환경 문제로 본다.
+- **무거운 묶음 사이에 다시 시작한다.** 한 Premiere 세션에서 전체를 이어 돌리면 모달이 뜨기 쉽다. 단계별로 나눠 돌리고 사이마다 2~3단계를 반복한다: `npm run hard -- s1_` → 재시작 → `npm run hard -- s2_` → 재시작 → `npm run hard -- s3_`. 케이스는 줄 수를 작게 두고 스크래치 사본 하나에서 끝나게 쓴다.
+- 중간에 멈춘 케이스가 `T_scratch_…` 시퀀스를 남길 수 있다 (`withScratchSequence`는 끝에서 지운다). 이름이 `T_scratch_`로 시작하는 시퀀스만 지워도 된다. 원본 `T_` 시퀀스는 지우지 않는다.
+- 스위트는 케이스 사이에 패널을 새로 고치지 않는다: 케이스는 시작할 때 플래그(`setMiCast(null)`, `setLegacyV28(null)`)를 기본값으로 돌리고, 끝날 때 `cast_defaults.json`과 페이지 훅(evalScript·placeChunk 감싸기)을 되돌린다.
 
 ### 테스트 프로젝트
 

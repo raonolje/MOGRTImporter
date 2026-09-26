@@ -7,7 +7,8 @@
  *   npm run hard                         전체
  *   npm run hard -- s1_9 s2_              이름에 s1_9 또는 s2_ 가 들어간 케이스만 (스모크는 항상)
  *   npm run hard -- --port 7778 --timeout 300000
- * 케이스 목록은 단계마다 늘어난다(S3-4에서 전체 E2E로 확장).
+ * 전체 모음 절차(install_dev → Premiere 재시작 → --check-build → npm run hard)와 환경 문제(메모리 경고 모달이 ExtendScript를 막는다,
+ * 무거운 묶음 사이에 재시작)는 docs/TESTING.md §5 '전체 하드 모음'.
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -71,6 +72,8 @@ async function main(argv) {
 			} catch (e) {
 				results.push({ rel, ok: false, ms: Date.now() - t0, msg: e.message });
 				console.log("FAIL " + rel + " — " + e.message);
+				// 시간 초과는 대개 Premiere 모달(메모리 경고 등)이 ExtendScript를 막은 것이다
+				if (/시간 초과/.test(e.message)) console.log("     Premiere에 모달(메모리 경고 등)이 떠 있는지 확인 — 닫고 Premiere를 다시 시작한 뒤 이 케이스부터 (docs/TESTING.md §5)");
 				if (e instanceof GuardError) break; // 테스트가 시퀀스를 바꿨다면 더 진행하지 않는다
 			}
 		}
