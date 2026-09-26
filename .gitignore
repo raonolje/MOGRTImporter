@@ -10,6 +10,7 @@ desktop.ini
 
 # 빌드 산출물 / 의존성 (향후 TS 프로젝트 복원 시)
 node_modules/
+mcp/node_modules/
 dist/
 *.tsbuildinfo
 

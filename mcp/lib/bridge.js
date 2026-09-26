@@ -100,7 +100,7 @@ async function checkPanel(dir, opts = {}) {
 		const s = Math.round(last.age / 1000);
 		return {
 			ok: false, code: "panel-not-responding",
-			message: "패널이 " + Math.round(waitMs / 1000) + "초 넘게 신호를 보내지 않습니다 (마지막 신호 " + (isFinite(s) ? s + "초 전" : "시각 모름") + ").",
+			message: "패널 신호가 끊겼습니다 (마지막 신호 " + (isFinite(s) ? s + "초 전" : "시각 모름") + ").",
 			hint: "Premiere가 멈췄거나(모달 창·긴 작업) 패널이 닫혔을 수 있습니다. Premiere 화면을 확인하고 패널을 연 뒤 'AI 연결 허용'을 켜 주세요.",
 			age: last.age
 		};

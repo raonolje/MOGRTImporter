@@ -1111,6 +1111,19 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
     node 쪽 클라이언트는 의존성 없는 `mcp/lib/bridge.js`(checkPanel: off·closed·낡음·없음, call: 시간 초과면 가져가지 않은 명령을 거둔다) — 서버·테스트·하드 케이스가 같이 쓴다.
     테스트: `tests/unit/panel_inbox.test.js`(하네스, 메모리 fs), `tests/unit/mcp_bridge.test.js`(진짜 임시 폴더로 하네스 패널과 왕복), 하드 `s5_inbox`.
 - M5.2 읽기 도구 + find_row, 설치본 core 로드, 해시 확인
+  - (M5.2 구현) `mcp/`: `package.json`(의존성은 `@modelcontextprotocol/sdk` 1.30.1 하나, 고정·lock 커밋, `mcp/node_modules`는 .gitignore), `server.mjs`(ESM, stdio,
+    저수준 `Server` — 스키마를 손으로 적으려고 zod를 쓰지 않는다), `lib/tools.js`(도구 정의·처리, SDK 없이 단위 시험), `lib/guide.js`(안내문 2048자 이하·앞 512자 규칙,
+    get_guide 본문), `lib/core.js`(heartbeat.extPath의 **설치된** app.js에서 core region을 잘라 해시·실행), `lib/loadRegions.js`·`lib/jsmask.js`(tests/lib 복사본, 바이트까지 같음을 시험).
+    읽기 도구: get_status(패널 status + core.match), list_presets, get_cast, get_rows(speaker·from·count ≤ 200 기본 50·filter), find_row(resolve), get_suggestions,
+    plan_apply(plan, 읽기만), verify_timeline, get_guide. 모두 readOnlyHint true, 결과는 content[0].text JSON 하나 — **structuredContent는 싣지 않는다**
+    (spec의 'plus structuredContent'와 다른 점: Codex는 structuredContent가 있으면 글자를 버린다). 스키마는 루트 object + 이름을 적은 properties,
+    additionalProperties false, anyOf·default·min/max 없음 (값 범위는 설명과 서버 확인), 모르는 인자 이름은 bad-args로 거절.
+    호출마다 19초 한도: 패널 신호 확인(최대 5초 기다림) + 패널 명령(최대 15초, 계획·검수는 남은 시간). 한도 안에 답이 없으면 timeout이고 패널이 가져가지 않은 명령은 거둔다.
+    패널 신호 오류는 한국어 {code, message, hint}: ai-link-off(기다리지 않음)·panel-closed·panel-not-responding·no-heartbeat(5초). by는 클라이언트 이름(codex·claude).
+    core 해시가 다르면 get_status가 core.match false(panel-version-mismatch)로 알린다 — 쓰기 도구(M5.3)는 거절한다. 설치본을 못 읽으면 core-unavailable.
+    README(`mcp/README.md`)에 Codex·Claude 등록 조각을 적었다 (설정 파일은 고치지 않는다).
+    테스트: `tests/unit/mcp_tools.test.js`, `npm run test:mcp`(`tests/mcp/server_read.test.js`: 진짜 서버를 SDK Client로, 가짜 패널 프로세스 fixture·off·closed·stale·silent,
+    그리고 진짜 app.js를 vm으로 띄운 패널과 끝에서 끝), 하드 `s5_mcp`(DEV 패널, 설치된 DEV app.js의 core 해시).
 - M5.3 제안
 - M5.4 승인 카드
 - M5.5 Claude

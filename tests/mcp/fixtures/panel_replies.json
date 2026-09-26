@@ -1,0 +1,476 @@
+{
+ "_comment": "tests/mcp/fake_panel.js fixture 모드의 답 (합성 데이터). byArg 키는 서버가 보내는 args의 JSON 그대로다.",
+ "seqId": "seq-fx-1",
+ "seqName": "T_FIXTURE",
+ "replies": {
+  "status": {
+   "default": {
+    "ok": true,
+    "data": {
+     "panel": {
+      "v": 28,
+      "build": "@@BUILD@@"
+     },
+     "host": {
+      "ok": true,
+      "v": 28,
+      "build": "@@BUILD@@",
+      "prefix": "MI_"
+     },
+     "seq": {
+      "id": "seq-fx-1",
+      "name": "T_FIXTURE"
+     },
+     "projKey": "proj_fx",
+     "seqKey": "proj_fx_seq_seq-fx-1",
+     "keysResolved": true,
+     "sessionReadFailed": false,
+     "rows": 4,
+     "castMode": true,
+     "speakers": [
+      {
+       "key": "C1",
+       "name": "철수",
+       "track": null,
+       "presetId": "preset_3",
+       "count": 2
+      },
+      {
+       "key": "C2",
+       "name": "영희",
+       "track": 3,
+       "presetId": "preset_3",
+       "count": 2
+      }
+     ],
+     "busy": false,
+     "suggestions": 1,
+     "approvals": 0,
+     "coreHash": "(가짜 패널이 설정값으로 바꾼다)"
+    }
+   }
+  },
+  "presets": {
+   "default": {
+    "ok": true,
+    "data": [
+     {
+      "id": "preset_3",
+      "name": "합성 자막",
+      "captionFid": "T1",
+      "sig": "T1:텍스트|T2:포인트 텍스트",
+      "fields": [
+       {
+        "fid": "T1",
+        "label": "텍스트",
+        "index": 0,
+        "caption": true
+       },
+       {
+        "fid": "T2",
+        "label": "포인트 텍스트",
+        "index": 1,
+        "caption": false
+       }
+      ],
+      "notes": [
+       "포인트 텍스트는 $$로 구분하며 최대 3개까지 입력 가능합니다."
+      ],
+      "native": false,
+      "orderVerified": true
+     }
+    ]
+   }
+  },
+  "cast.get": {
+   "default": {
+    "ok": true,
+    "data": {
+     "salt": "fx01",
+     "castOrder": [
+      "C1",
+      "C2"
+     ],
+     "cast": {
+      "C1": {
+       "name": "철수",
+       "track": null,
+       "autoTrack": null,
+       "presetId": "preset_3",
+       "color": 0
+      },
+      "C2": {
+       "name": "영희",
+       "track": 3,
+       "autoTrack": null,
+       "presetId": "preset_3",
+       "color": 1
+      }
+     },
+     "legacyTrack": null,
+     "stack": false,
+     "stackDy": 0.12,
+     "remapped": false
+    }
+   }
+  },
+  "rows": {
+   "default": {
+    "ok": true,
+    "data": {
+     "total": 4,
+     "from": 0,
+     "rows": [
+      {
+       "uid": "fx01-1",
+       "id": 1,
+       "index": 1,
+       "label": "C1·1",
+       "spk": "C1",
+       "s": 1,
+       "e": 2.5,
+       "text": "오늘 날씨 1번 하늘 맑음",
+       "presetId": "preset_3",
+       "sig": "T1:텍스트|T2:포인트 텍스트",
+       "captionFid": "T1",
+       "fields": {
+        "T1": "오늘 날씨 1번 하늘 맑음",
+        "T2": ""
+       },
+       "warn": [],
+       "sugg": {}
+      },
+      {
+       "uid": "fx01-2",
+       "id": 2,
+       "index": 1,
+       "label": "C2·1",
+       "spk": "C2",
+       "s": 3,
+       "e": 4,
+       "text": "영희의 바다 1번째 이야기",
+       "presetId": "preset_3",
+       "sig": "T1:텍스트|T2:포인트 텍스트",
+       "captionFid": "T1",
+       "fields": {
+        "T1": "영희의 바다 1번째 이야기",
+        "T2": ""
+       },
+       "warn": [],
+       "sugg": {
+        "T2": {
+         "v": "바다$$이야기",
+         "by": "codex",
+         "ts": 1790000000000,
+         "cap": "0badc0de",
+         "sig": "T1:텍스트|T2:포인트 텍스트",
+         "st": "pending",
+         "note": ""
+        }
+       }
+      },
+      {
+       "uid": "fx01-3",
+       "id": 3,
+       "index": 2,
+       "label": "C1·2",
+       "spk": "C1",
+       "s": 5,
+       "e": 6.5,
+       "text": "오늘 날씨 2번 하늘 맑음",
+       "presetId": "preset_3",
+       "sig": "T1:텍스트|T2:포인트 텍스트",
+       "captionFid": "T1",
+       "fields": {
+        "T1": "오늘 날씨 2번 하늘 맑음",
+        "T2": "날씨$$맑음"
+       },
+       "warn": [],
+       "sugg": {}
+      },
+      {
+       "uid": "fx01-4",
+       "id": 4,
+       "index": 2,
+       "label": "C2·2",
+       "spk": "C2",
+       "s": 7,
+       "e": 8,
+       "text": "영희의 바다 2번째 이야기",
+       "presetId": "preset_3",
+       "sig": "T1:텍스트|T2:포인트 텍스트",
+       "captionFid": "T1",
+       "fields": {
+        "T1": "영희의 바다 2번째 이야기",
+        "T2": ""
+       },
+       "warn": [
+        {
+         "fid": "T2",
+         "missing": [
+          "고래"
+         ],
+         "dup": []
+        }
+       ],
+       "sugg": {}
+      }
+     ]
+    }
+   },
+   "byArg": {
+    "{\"count\":50,\"spk\":\"C2\"}": {
+     "ok": true,
+     "data": {
+      "total": 2,
+      "from": 0,
+      "rows": [
+       {
+        "uid": "fx01-2",
+        "id": 2,
+        "index": 1,
+        "label": "C2·1",
+        "spk": "C2",
+        "s": 3,
+        "e": 4,
+        "text": "영희의 바다 1번째 이야기",
+        "presetId": "preset_3",
+        "sig": "T1:텍스트|T2:포인트 텍스트",
+        "captionFid": "T1",
+        "fields": {
+         "T1": "영희의 바다 1번째 이야기",
+         "T2": ""
+        },
+        "warn": [],
+        "sugg": {
+         "T2": {
+          "v": "바다$$이야기",
+          "by": "codex",
+          "ts": 1790000000000,
+          "cap": "0badc0de",
+          "sig": "T1:텍스트|T2:포인트 텍스트",
+          "st": "pending",
+          "note": ""
+         }
+        }
+       },
+       {
+        "uid": "fx01-4",
+        "id": 4,
+        "index": 2,
+        "label": "C2·2",
+        "spk": "C2",
+        "s": 7,
+        "e": 8,
+        "text": "영희의 바다 2번째 이야기",
+        "presetId": "preset_3",
+        "sig": "T1:텍스트|T2:포인트 텍스트",
+        "captionFid": "T1",
+        "fields": {
+         "T1": "영희의 바다 2번째 이야기",
+         "T2": ""
+        },
+        "warn": [
+         {
+          "fid": "T2",
+          "missing": [
+           "고래"
+          ],
+          "dup": []
+         }
+        ],
+        "sugg": {}
+       }
+      ]
+     }
+    },
+    "{\"count\":1,\"from\":2}": {
+     "ok": true,
+     "data": {
+      "total": 4,
+      "from": 2,
+      "rows": [
+       {
+        "uid": "fx01-3",
+        "id": 3,
+        "index": 2,
+        "label": "C1·2",
+        "spk": "C1",
+        "s": 5,
+        "e": 6.5,
+        "text": "오늘 날씨 2번 하늘 맑음",
+        "presetId": "preset_3",
+        "sig": "T1:텍스트|T2:포인트 텍스트",
+        "captionFid": "T1",
+        "fields": {
+         "T1": "오늘 날씨 2번 하늘 맑음",
+         "T2": "날씨$$맑음"
+        },
+        "warn": [],
+        "sugg": {}
+       }
+      ]
+     }
+    },
+    "{\"count\":50,\"filter\":\"warn\"}": {
+     "ok": true,
+     "data": {
+      "total": 1,
+      "from": 0,
+      "rows": [
+       {
+        "uid": "fx01-4",
+        "id": 4,
+        "index": 2,
+        "label": "C2·2",
+        "spk": "C2",
+        "s": 7,
+        "e": 8,
+        "text": "영희의 바다 2번째 이야기",
+        "presetId": "preset_3",
+        "sig": "T1:텍스트|T2:포인트 텍스트",
+        "captionFid": "T1",
+        "fields": {
+         "T1": "영희의 바다 2번째 이야기",
+         "T2": ""
+        },
+        "warn": [
+         {
+          "fid": "T2",
+          "missing": [
+           "고래"
+          ],
+          "dup": []
+         }
+        ],
+        "sugg": {}
+       }
+      ]
+     }
+    }
+   }
+  },
+  "resolve": {
+   "default": {
+    "ok": false,
+    "error": "not-found",
+    "detail": "그런 줄이 없다"
+   },
+   "byArg": {
+    "{\"label\":\"#2\"}": {
+     "ok": false,
+     "error": "bad-args",
+     "detail": "여러 줄이 맞는다: C1·2, C2·2 — 화자를 붙여 주세요"
+    },
+    "{\"label\":\"C2·2 T2\"}": {
+     "ok": true,
+     "data": {
+      "uid": "fx01-4",
+      "id": 4,
+      "index": 2,
+      "label": "C2·2",
+      "spk": "C2",
+      "text": "영희의 바다 2번째 이야기",
+      "presetId": "preset_3",
+      "captionFid": "T1",
+      "fields": {
+       "T1": "영희의 바다 2번째 이야기",
+       "T2": ""
+      },
+      "sig": "T1:텍스트|T2:포인트 텍스트",
+      "fid": "T2",
+      "field": {
+       "fid": "T2",
+       "index": 1,
+       "displayName": "포인트 텍스트",
+       "value": "",
+       "caption": false
+      }
+     }
+    }
+   }
+  },
+  "sugg.list": {
+   "default": {
+    "ok": true,
+    "data": [
+     {
+      "uid": "fx01-2",
+      "id": 2,
+      "label": "C2·1",
+      "fid": "T2",
+      "field": "포인트 텍스트",
+      "v": "바다$$이야기",
+      "by": "codex",
+      "ts": 1790000000000,
+      "note": "",
+      "ok": true,
+      "stale": false,
+      "error": "",
+      "warn": [],
+      "check": "✓ 본문에 있음"
+     }
+    ]
+   }
+  },
+  "plan": {
+   "default": {
+    "ok": true,
+    "data": {
+     "planToken": "p-fx-1",
+     "plan": {
+      "ops": {
+       "place": 4
+      },
+      "removals": 0,
+      "none": 0,
+      "minCount": 5,
+      "tracks": [
+       {
+        "spk": "C1",
+        "track": 2,
+        "add": false
+       },
+       {
+        "spk": "C2",
+        "track": 3,
+        "add": true
+       }
+      ],
+      "conflicts": [],
+      "edited": [],
+      "missing": []
+     },
+     "lines": [
+      "C1 철수 → V3 (2줄)",
+      "C2 영희 → V4 (새 트랙, 2줄)"
+     ]
+    }
+   }
+  },
+  "verify": {
+   "default": {
+    "ok": true,
+    "data": {
+     "counts": {
+      "ok": 3,
+      "missing": 1
+     },
+     "items": [
+      {
+       "cat": "missing",
+       "id": 4,
+       "uid": "fx01-4",
+       "label": "C2·2"
+      }
+     ],
+     "text": "정상 3 · 타임라인에 없음 1",
+     "frameTicks": "10594584000",
+     "salt": "fx01",
+     "legacyRows": 0,
+     "seqId": "seq-fx-1"
+    }
+   }
+  }
+ }
+}

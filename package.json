@@ -6,6 +6,7 @@
   "scripts": {
     "test": "node --test \"tests/unit/**/*.test.js\" \"tests/compat/**/*.test.js\"",
     "lint:jsx": "node tests/lib/es3lint.js extension/jsx/hostscript.jsx",
+    "test:mcp": "node --test \"tests/mcp/**/*.test.js\"",
     "hard": "node tests/premiere/suite.js"
   },
   "engines": {

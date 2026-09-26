@@ -334,8 +334,8 @@ function buildDocument() {
 // ── cep.fs (메모리) ──
 
 /** EXT_DIR/html/… → 저장소 extension/html/… 내용 (없으면 null). 쓰기·목록에는 나타나지 않는다 */
-function extFile(p) {
-	const pre = EXT_DIR + "/html/";
+function extFile(p, extDir = EXT_DIR) {
+	const pre = extDir + "/html/";
 	if (String(p).indexOf(pre) !== 0) return null;
 	const rel = String(p).slice(pre.length);
 	if (!rel || rel.split("/").indexOf("..") !== -1) return null;
@@ -343,7 +343,7 @@ function extFile(p) {
 	return fs.existsSync(real) && fs.statSync(real).isFile() ? fs.readFileSync(real, "utf8") : null;
 }
 
-function makeFs(initial) {
+function makeFs(initial, extDir = EXT_DIR) {
 	const files = new Map(Object.entries(initial || {}).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)]));
 	const dirs = new Set();
 	const writes = [];
@@ -362,7 +362,7 @@ function makeFs(initial) {
 			if (api.unreadable.has(p)) return { err: 4, data: "" };
 			if (files.has(p)) return { err: 0, data: files.get(p) };
 			// 설치 폴더의 패널 파일(html/…)은 저장소 extension/html/…을 읽는다 (runCommand status의 coreHash 등)
-			const ext = extFile(p);
+			const ext = extFile(p, extDir);
 			if (ext !== null) return { err: 0, data: ext };
 			return { err: 3, data: "" };
 		},
@@ -575,10 +575,13 @@ const cachePaths = {
  *             {env: {APPDATA: …}} — require("process").env (5단계 AI 연결 다리 폴더)
  *             {fs: 진짜 fs 같은 객체} — 메모리 fs 대신 쓴다 (MCP 테스트가 진짜 폴더로 패널과 이야기할 때. h.nodeFs = 그 객체)
  *   appSrc    app.js 대신 돌릴 소스 (예: git tag v27의 app.js — 단일 화자 DOM이 v27과 같은지 비교할 때)
+ *   extDir    설치 폴더 (기본 EXT_DIR). 캐시는 <extDir>/cache — cachePaths는 기본 폴더 기준이라 다른 폴더면 경로를 직접 만든다
+ *             (MCP 끝에서 끝 테스트: 진짜 임시 폴더에 html/js/app.js 사본을 두고 서버가 그 core를 읽는다)
  */
 async function bootPanel(opts = {}) {
 	const doc = buildDocument();
-	const cfs = makeFs(opts.files);
+	const extDir = opts.extDir || EXT_DIR;
+	const cfs = makeFs(opts.files, extDir);
 	const host = makeHost(opts);
 	const clock = makeClock();
 	const logs = [];
@@ -620,7 +623,7 @@ async function bootPanel(opts = {}) {
 	const clipboard = [];
 	win.navigator = { language: "ko-KR", clipboard: { writeText: (t) => { clipboard.push(String(t)); return Promise.resolve(); } } };
 	win.CSInterface = function CSInterface() {};
-	win.CSInterface.prototype.getSystemPath = (t) => (t === "userData" ? USER_DATA_DIR : EXT_DIR);
+	win.CSInterface.prototype.getSystemPath = (t) => (t === "userData" ? USER_DATA_DIR : extDir);
 	// 처리기는 글자를 돌려주거나, 약속(느린 호출 흉내: 워치독 시험)을 돌려준다
 	win.CSInterface.prototype.evalScript = (script, cb) => {
 		const { fn, args } = parseCall(script);
