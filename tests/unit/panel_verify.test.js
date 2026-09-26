@@ -260,3 +260,137 @@ test("(2) 바뀜 알림: 경로의 수정 시각·크기가 바뀌면 3초 안�
 	assert.equal(toast(), null);
 	noErrors(h);
 });
+
+// rowsSix의 화자 K 줄을 그대로 적은 SRT (같은 문장·시간 → 병합하면 '변경 없음')
+function srtOf(K) {
+	const t = (x) => tc(x).replace(".", ",");
+	return rowsSix().filter((r) => r[1] === K).map((r, i) => (i + 1) + "\n" + t(sec(r[2])) + " --> " + t(sec(r[3])) + "\n" + r[4] + "\n").join("\n");
+}
+
+test("⟳ 대화상자를 취소하면 다음 보통 'SRT 열기'(C번호 없는 파일)는 보통 경로; 시퀀스가 바뀌면 ⟳를 잊는다", async () => {
+	const { sim, preset } = makeSim();
+	const B = { seqId: "seq-verify-2", seqName: "T_VERIFY_B", projPath: PROJ };
+	const h = await boot(sim, preset, castSession(preset, rowsSix()), {
+		files: {
+			[P.presets(PROJ)]: { presets: { [preset.id]: preset }, presetTrash: [], nextPresetId: 4 },
+			[P.session(PROJ, A.seqId)]: castSession(preset, rowsSix()),
+			[P.session(PROJ, B.seqId)]: castSession(preset, rowsSix())
+		}
+	});
+	const file = [{ name: "인터뷰 최종.srt", content: "1\n00:00:08,341 --> 00:00:10,844\n영희 1 말\n" }];
+	await h.dropSrts(file);
+	const base = impModal(h).rows;
+	assert.deepEqual(base, [{ key: "", act: "" }], "보통 경로: 키를 고르지 않은 창");
+	h.$("impCancel").click();
+	// ⟳ (경로 없는 C2) → 대화상자를 취소 (change 없음) → 30초 뒤 보통 'SRT 열기' (label → #srtInput click → change)
+	const reimport = (i) => h.$("castRows").querySelectorAll(".cast-row")[i].querySelector(".cast-reimport").click();
+	reimport(1);
+	await h.advance(30000);
+	h.$("srtInput").click();
+	await h.dropSrts(file);
+	assert.deepEqual(impModal(h).rows, base, "취소한 ⟳는 보통 'SRT 열기'를 C2 병합으로 보내지 않는다");
+	h.$("impCancel").click();
+	// ⟳ 뒤 Premiere에서 시퀀스가 바뀌면 (같은 화자 키가 있는 시퀀스) 그 대화상자에서 고른 파일도 보통 경로
+	reimport(1);
+	h.host.seq = B;
+	await h.advance(1000);
+	assert.equal(h.snapshot().keys.seqId, B.seqId);
+	await h.dropSrts(file);
+	assert.deepEqual(impModal(h).rows, base, "다른 시퀀스의 C2에 병합하지 않는다");
+	h.$("impCancel").click();
+	// ⟳ 바로 뒤에 고른 파일은 여전히 그 화자
+	reimport(1);
+	await h.dropSrts(file);
+	assert.deepEqual(impModal(h).rows, [{ key: "C2", act: "merge" }]);
+	h.$("impCancel").click();
+	noErrors(h);
+});
+
+test("바뀜 알림: 다른 화자의 ⟳는 보이는 알림의 바뀜을 '본 것'으로 만들지 않는다", async () => {
+	const { sim, preset } = makeSim();
+	const s1 = srtOf("C1");
+	const s2 = srtOf("C2");
+	const h = await boot(sim, preset, castSession(preset, rowsSix(), {
+		C1: { path: "D:/srt/C1.srt", size: Buffer.byteLength(s1), mtime: 1790000000000 },
+		C2: { path: "D:/srt/C2.srt", size: Buffer.byteLength(s2), mtime: 1790000000000 }
+	}), { node: { files: { "D:/srt/C1.srt": { data: s1, mtimeMs: 1790000000000 }, "D:/srt/C2.srt": { data: s2, mtimeMs: 1790000000000 } } } });
+	const toast = () => (h.$("castToast").style.display === "" ? h.$("castToastText").textContent : null);
+	h.nodeFs.files.get("D:/srt/C1.srt").mtimeMs = 1790000060000;
+	await h.advance(3000);
+	assert.equal(toast(), "철수(C1) 파일이 바뀌었습니다");
+	h.$("castRows").querySelectorAll(".cast-row")[1].querySelector(".cast-reimport").click();
+	await h.flush();
+	assert.deepEqual(impModal(h).rows, [{ key: "C2", act: "merge" }]);
+	assert.equal(toast(), null, "창이 열린 동안은 숨긴다");
+	h.$("impCancel").click();
+	await h.advance(3000);
+	assert.equal(toast(), "철수(C1) 파일이 바뀌었습니다", "C1의 바뀜은 아직 처리하지 않았다");
+	// 그 화자의 ⟳는 그 바뀜을 처리한 것으로 본다
+	h.$("castRows").querySelectorAll(".cast-row")[0].querySelector(".cast-reimport").click();
+	await h.flush();
+	assert.deepEqual(impModal(h).rows, [{ key: "C1", act: "merge" }]);
+	h.$("impCancel").click();
+	await h.advance(6000);
+	assert.equal(toast(), null);
+	noErrors(h);
+});
+
+test("바뀜 알림: 내용이 같은 파일을 다시 내보낸 것도 [가져오기]('변경 없음')하면 화자 표의 파일 정보를 새로 둔다 → 패널을 다시 열어도 알리지 않는다", async () => {
+	const { sim, preset } = makeSim();
+	const s1 = srtOf("C1");
+	const sess = castSession(preset, rowsSix(), { C1: { path: "D:/srt/C1.srt", size: Buffer.byteLength(s1), mtime: 1790000000000 } });
+	const node = () => ({ node: { files: { "D:/srt/C1.srt": { data: s1, mtimeMs: 1790000060000 } } } });
+	const h = await boot(sim, preset, sess, node());
+	const toast = (x) => (x.$("castToast").style.display === "" ? x.$("castToastText").textContent : null);
+	await h.advance(3000);
+	assert.equal(toast(h), "철수(C1) 파일이 바뀌었습니다");
+	const nAuto = (h.fs.readJson(P.historyAuto(PROJ, A.seqId)) || []).length;
+	const nSafe = (h.fs.readJson(P.historySafety(PROJ, A.seqId)) || []).length;
+	h.$("castToastMerge").click();
+	await h.flush();
+	assert.match(h.$("impBody").querySelector(".imp-stats").textContent, /^변경 없음 \(같음 3\)$/);
+	h.$("impOk").click();
+	await h.flush();
+	assert.match(h.status().text, /^변경 없음: C1 C1\.srt$/);
+	assert.equal(h.snapshot().mi.cast.C1.mtime, 1790000060000);
+	const saved = h.fs.readJson(P.session(PROJ, A.seqId));
+	assert.deepEqual([saved.mi.cast.C1.path, saved.mi.cast.C1.size, saved.mi.cast.C1.mtime], ["D:/srt/C1.srt", Buffer.byteLength(s1), 1790000060000]);
+	assert.equal((h.fs.readJson(P.historyAuto(PROJ, A.seqId)) || []).length, nAuto, "히스토리 항목은 남기지 않는다");
+	assert.equal((h.fs.readJson(P.historySafety(PROJ, A.seqId)) || []).length, nSafe, "안전 지점도");
+	// 저장된 세션으로 패널을 다시 연다
+	const h2 = await boot(sim, preset, saved, node());
+	await h2.advance(6000);
+	assert.equal(toast(h2), null);
+	noErrors(h);
+	noErrors(h2);
+});
+
+test("바뀜 알림: 적용이 도는 동안과 패널이 숨었을 때는 쉰다", async () => {
+	const { sim, preset } = makeSim();
+	const s1 = srtOf("C1");
+	const h = await boot(sim, preset, castSession(preset, rowsSix(), { C1: { path: "D:/srt/C1.srt", size: Buffer.byteLength(s1), mtime: 1790000000000 } }),
+		{ node: { files: { "D:/srt/C1.srt": { data: s1, mtimeMs: 1790000000000 } } } });
+	const toast = () => (h.$("castToast").style.display === "" ? h.$("castToastText").textContent : null);
+	// ping을 잡아 두어 적용이 도는 동안을 만든다
+	let release;
+	const ping = h.host.handlers.MI_ping;
+	h.host.handlers.MI_ping = (json) => new Promise((res) => { release = () => res(ping(json)); });
+	const running = h.win._mogrtDebug.cmd("apply", {});
+	await h.flush();
+	assert.equal(h.win._mogrtDebug.miBusy(), true);
+	h.nodeFs.files.get("D:/srt/C1.srt").mtimeMs = 1790000060000;
+	await h.advance(3000);
+	assert.equal(toast(), null, "적용 중");
+	h.host.handlers.MI_ping = ping;
+	release();
+	assert.equal(JSON.parse(JSON.stringify(await running)).ok, true);
+	await settle(h);
+	// 패널이 숨으면 쉰다
+	h.doc.hidden = true;
+	await h.advance(6000);
+	assert.equal(toast(), null, "숨은 동안");
+	h.doc.hidden = false;
+	await h.advance(3000);
+	assert.equal(toast(), "철수(C1) 파일이 바뀌었습니다");
+	noErrors(h);
+});

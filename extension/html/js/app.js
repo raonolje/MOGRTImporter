@@ -2896,7 +2896,7 @@
 	}
 	// 제안 하나를 확인한다 (순수). inp {sub, rs, preset, fid, value, sig, cap?: 제안이 본 캡션 해시}
 	// → {ok, error, detail, warn: [], kind: "point"|"text", segs, missing, dup, max, capHash, field: 필드 이름}
-	//   error (받지 않음): too-long · empty · no-preset · native-unverified(순서 미확인 네이티브) · no-fields · fields-changed(서명 다름) ·
+	//   error (받지 않음): too-long · empty(빈 값·공백뿐인 '$$' 조각) · no-preset · native-unverified(순서 미확인 네이티브) · no-fields · fields-changed(서명 다름) ·
 	//     caption-field(캡션은 SRT 문장만) · unknown-field · stale(캡션이 바뀜) · missing-segment('$$' 조각이 캡션에 없음) · too-many(최대 N개 초과)
 	//   warn (받되 알림): not-in-caption('$$' 없는 문구가 캡션에 없음, 제목 같은 자유 문구) · dup(조각이 캡션에 두 번 → 첫 번째만 칠해짐)
 	// '$$'가 있는 값은 포인트 텍스트다: 조각마다 지금 캡션 안에 그대로 있어야 하고, 조각 수는 프리셋 설명(comment)의 '최대 N개'를 넘지 않는다.
@@ -2932,6 +2932,8 @@
 			out.missing = r.missing;
 			out.dup = r.dup;
 			if (!r.segs.length) return fail("empty", "'$$' 조각이 없다");
+			// 공백뿐인 조각은 어느 문장에나 있어 '있음'으로 보이지만 칠할 것이 없다 ('최대 N개'에도 세지 않게 먼저 거절)
+			if (r.segs.some((x) => !x.trim())) return fail("empty", "공백뿐인 '$$' 조각");
 			if (r.missing.length) return fail("missing-segment", quoteIga(r.missing) + " 캡션에 없다");
 			if (r.tooMany) return fail("too-many", "조각 " + r.segs.length + "개 (최대 " + out.max + "개)");
 			if (r.dup.length) out.warn.push("dup");
@@ -2965,6 +2967,30 @@
 		});
 		if (!Object.keys(rs.sugg).length) delete rs.sugg;
 		return n;
+	}
+	// 필드 값을 바꾼 뒤(제안 승인) 줄의 포인트 경고(rs.warn, 병합의 포인트 확인)를 지금 필드 값·캡션으로 다시 본다.
+	// 값은 고치지 않고 새 경고도 만들지 않는다: 항목마다 그 필드 값의 '$$' 조각을 지금 캡션에서 다시 찾아 missing·dup을 새로 적고,
+	// 둘 다 비었거나 값이 비었으면 뺀다. 해석되지 않는 필드의 항목은 그대로 둔다. 남은 것이 없으면 rs.warn을 지운다 → 바뀌었는가
+	function recheckPointWarn(sub, rs, preset) {
+		if (!rs || !Array.isArray(rs.warn)) return false;
+		const before = stableJson(rs.warn);
+		const cap = suggCaptionOf(sub, rs, preset);
+		const all = Array.isArray(rs._allParams) ? rs._allParams : [];
+		const out = [];
+		rs.warn.forEach((w) => {
+			const f = w ? resolveFid(all, w.fid, preset ? preset.params : null) : null;
+			if (!f || !f.param) {
+				if (w) out.push(w);
+				return;
+			}
+			const v = f.param.value == null ? "" : String(f.param.value);
+			if (!v) return;
+			const r = pointSegmentsOk(v, cap);
+			if (r.missing.length || r.dup.length) out.push({ fid: w.fid, missing: r.missing, dup: r.dup });
+		});
+		if (out.length) rs.warn = out;
+		else delete rs.warn;
+		return stableJson(out.length ? out : null) !== before;
 	}
 	// 인용한 낱말 목록 뒤의 조사 '이'/'가' ("‘하늘’이", "‘날씨’가"): 마지막 낱말의 끝 글자에 받침이 있으면 '이'. 한글이 아니면 '이(가)'
 	function quoteIga(words) {
@@ -8340,6 +8366,8 @@ var modalState = {
 			}
 			plan.push([K, ch]);
 		}
+		// 승인한 AI 요청(runCommand cast.set)이면 여기서 안전 지점 'AI: 화자 표 바꾸기 전' (모두 확인한 뒤, 바꾸기 전)
+		_aiSafetyFlush();
 		const changed = [];
 		const parts = [];
 		plan.forEach(([K, ch]) => {
@@ -8531,14 +8559,16 @@ var modalState = {
 	// ── 화자 파일 다시 가져오기(⟳)와 바뀜 알림 (S3-3) ──
 	// ⟳: 화자 표에 기억한 파일 경로(cast[K].path, 가져올 때 CEP File.path·명령 {path})에서 SRT를 다시 읽어 'SRT 가져오기' 창을
 	// 그 화자(키)의 병합으로 연다. 창에서 통계를 보고 [가져오기]를 눌러야 병합한다. 경로가 없거나 읽지 못하면 파일 대화상자(#srtInput)를
-	// 연다 — 고른 파일 이름에 C번호가 없으면 그 화자로 본다 (2분 안, _castReimportKey).
+	// 연다 — 고른 파일 이름에 C번호가 없으면 그 화자로 본다 (_castReimportKey: 2분 안, ⟳를 누른 시퀀스에서만).
+	// 대화상자를 취소하면 change가 오지 않아 알 수 없으므로, 다음에 #srtInput을 ⟳가 아닌 것(📂 SRT 열기)이 열거나 시퀀스가 바뀌면 잊는다.
 	// 바뀜 알림: 3초마다 경로를 stat해 크기·수정 시각이 가져올 때와 다르면 #castToast "영희(C2) 파일이 바뀌었습니다 [병합 미리보기] [닫기]".
 	// 적용 중·가져오기 창이 열렸을 때·패널이 숨었을 때·시퀀스 확인 전에는 쉰다. 스스로 병합하지 않고, 같은 바뀜은 한 번만 알린다.
 	const CAST_WATCH_MS = 3000;
 	// 수정 시각 비교 여유 (File.lastModified는 ms 정수, stat은 소수 ms)
 	const CAST_MTIME_TOL = 1000;
 	const CAST_REIMPORT_TTL = 120000;
-	var _castReimportKey = null; // {K, at}: ⟳에서 연 파일 대화상자
+	var _castReimportKey = null; // {K, at, seq}: ⟳에서 연 파일 대화상자 (seq: _importSeqToken)
+	var _castReimportOpening = false; // ⟳가 #srtInput.click()을 부르는 동안 (그 click은 키를 지우지 않는다)
 	var _castToastKey = null; // 알림 중인 {K, sig}
 	var _castWatchSeen = {}; // 알렸거나 닫은 바뀜 {sig: true}
 	function _castReimport(K) {
@@ -8560,23 +8590,35 @@ var modalState = {
 			}
 			setStatus(K + " " + _castName(K) + ": " + r.error + " — 파일을 고르세요", "err");
 		} else setStatus(K + " " + _castName(K) + ": 파일 위치를 모릅니다 — 파일을 고르세요", "");
-		_castReimportKey = { K, at: Date.now() };
+		_castReimportKey = { K, at: Date.now(), seq: _importSeqToken() };
 		const input = document.getElementById("srtInput");
-		if (input && typeof input.click === "function") input.click();
+		if (input && typeof input.click === "function") {
+			_castReimportOpening = true;
+			try {
+				input.click();
+			} finally {
+				_castReimportOpening = false;
+			}
+		}
 	}
-	// 파일 하나를 화자 K의 병합으로 가져오기 창에 연다 (파일 이름에 C번호가 없거나 다르면 K로 본다 — ⟳는 그 화자의 파일이다)
+	// #srtInput을 ⟳가 아닌 것이 열면(📂 SRT 열기 label → input click) 취소된 ⟳ 대화상자의 키를 잊는다
+	document.getElementById("srtInput")?.addEventListener("click", () => {
+		if (!_castReimportOpening) _castReimportKey = null;
+	});
+	// 파일 하나를 화자 K의 병합으로 가져오기 창에 연다 (파일 이름에 C번호가 없거나 다르면 K로 본다 — ⟳는 그 화자의 파일이다).
+	// 알림은 숨긴다: K의 바뀜이면 본 것으로, 다른 화자의 바뀜이면 그대로 두어 창을 닫은 뒤 다시 알린다
 	function _openReimport(K, file) {
 		const an = _analyzeSrt(file);
 		if (an.capKey.key !== K) an.capKey = { key: K, ambiguous: false, nums: [castKeyNum(K)] };
-		_hideCastToast(true);
+		_hideCastToast(!!_castToastKey && _castToastKey.K === K);
 		_openImportModal([an], false, _importSeqToken());
 		return { route: "modal", key: K };
 	}
-	// #srtInput 처리기가 부른다: ⟳에서 연 대화상자(2분 안)에서 파일 하나를 골랐고 그 이름에 C번호가 없으면 → 그 화자의 병합으로 연다 (처리했으면 true)
+	// #srtInput 처리기가 부른다: ⟳에서 연 대화상자(2분 안, 같은 시퀀스)에서 파일 하나를 골랐고 그 이름에 C번호가 없으면 → 그 화자의 병합으로 연다 (처리했으면 true)
 	function _castReimportChosen(read) {
 		const p = _castReimportKey;
 		_castReimportKey = null;
-		if (!p || Date.now() - p.at > CAST_REIMPORT_TTL || !read || read.length !== 1 || !state.mi.cast[p.K]) return false;
+		if (!p || Date.now() - p.at > CAST_REIMPORT_TTL || p.seq !== _importSeqToken() || !read || read.length !== 1 || !state.mi.cast[p.K]) return false;
 		if (parseCaptionKey(read[0].name).key) return false;
 		_openReimport(p.K, read[0]);
 		return true;
@@ -10363,7 +10405,8 @@ var modalState = {
 		return JSON.parse(JSON.stringify({ subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi }));
 	}
 	// 바뀌었는가를 가르는 서명. salt만 새로 만든 것, 화자의 파일 정보(file·path·size·mtime)만 바뀐 것은 바뀐 것이 아니다:
-	// 내용이 같은 파일을 다시 내보냈거나(mtime) 명령으로 넣은 것(path 없음)도 '변경 없음' (그때 파일 정보도 그대로 둔다)
+	// 내용이 같은 파일을 다시 내보냈거나(mtime) 명령으로 넣은 것(path 없음)도 '변경 없음'.
+	// 그때 경로를 아는 파일이면 화자 표의 파일 정보만 새로 둔다 (_castFileInfoSync — 바뀜 알림이 다시 뜨지 않게), 경로 없는 파일은 그대로 둔다
 	function _sessionDataSig(d) {
 		const mi = d.mi || {};
 		const cast = {};
@@ -10373,6 +10416,21 @@ var modalState = {
 			cast[k] = c;
 		});
 		return stableJson({ s: d.subtitles, r: d.rowStates, t: d.trashBin, c: cast, o: mi.castOrder, l: mi.legacyTrack });
+	}
+	// '변경 없음' 가져오기: 가져온 화자의 파일 정보(file·path·size·mtime)만 사본(importIntoData가 새로 적은 값)에서 상태로 옮긴다.
+	// 경로를 아는 파일(#srtInput의 File.path·⟳·명령 {path})만 — 내용이 같은 파일을 다시 내보낸 것을 '가져온 파일'로 기억해야
+	// 바뀜 알림(_castWatchTick)이 패널을 다시 열 때마다 같은 파일을 알리지 않는다. 히스토리·안전 지점은 남기지 않는다 → 옮겼는가
+	const CAST_FILE_INFO = ["file", "path", "size", "mtime"];
+	function _castFileInfoSync(data, report) {
+		let n = 0;
+		((report && report.files) || []).forEach((r) => {
+			const src = r.key && data.mi && data.mi.cast ? data.mi.cast[r.key] : null;
+			const dst = r.key && state.mi && state.mi.cast ? state.mi.cast[r.key] : null;
+			if (!src || !dst || !src.path || CAST_FILE_INFO.every((k) => dst[k] === src[k])) return;
+			CAST_FILE_INFO.forEach((k) => { dst[k] = src[k]; });
+			n++;
+		});
+		return n > 0;
 	}
 	// 사본을 상태에 넣고 그리고 저장한다 (session.json + cast.json)
 	function _commitSessionData(data, reason) {
@@ -10418,7 +10476,7 @@ var modalState = {
 	// 가져오기 작업을 목록·화자 표에 넣는다 (새 화자 / 병합 / 교체 / 분배, 화자 없는 목록 병합).
 	// 사본에 core importIntoData → 바뀌었을 때만: 안전 지점 하나("SRT 가져오기 전: C1 a.srt · C2 b.srt") →
 	// 상태·session.json·cast.json → 자동 항목 하나("SRT 가져오기: C1 철수(7)" / "SRT 병합: C2 (문장 2 · …)").
-	// 같은 파일을 다시 가져오면 '변경 없음' (상태·히스토리 그대로)
+	// 같은 파일을 다시 가져오면 '변경 없음' (목록·히스토리 그대로, 경로를 아는 파일이면 화자 표의 파일 정보만 새로)
 	function _importIntoCast(job) {
 		const data = _sessionClone();
 		const before = _sessionDataSig(data);
@@ -10431,6 +10489,10 @@ var modalState = {
 			return r.key || (f ? f.file.name : "");
 		};
 		if (_sessionDataSig(data) === before) {
+			if (_castFileInfoSync(data, report)) {
+				saveSessionToStorage();
+				renderCastBar();
+			}
 			setStatus("변경 없음: " + job.files.map(fileOf).join(" · "), "ok");
 			return report;
 		}
@@ -10464,7 +10526,8 @@ var modalState = {
 	// 바꾸기: importSrt, mergeCommit, apply {planToken | ids | uids | spk}, undo, cast.set,
 	//         suggest (제안 대기열에만 넣는다 — 속성·타임라인은 그대로), sugg.approve·sugg.reject (ui·test만), approvals.approve·approvals.reject (ui·test만)
 	// agent가 바꾸는 명령(CMD_MUTATING)을 보내면 실행하지 않고 승인 대기열에 넣고 needs-approval(rid)을 돌려준다 (M5.4 승인 카드 전까지는
-	// approvals.approve로 승인한다). 승인하면 안전 지점 'AI: <명령> 전'을 먼저 남기고 실행하며, 그동안 남는 히스토리 이름은 'AI: …'다.
+	// approvals.approve로 승인한다). 승인하면 실행하고, 그 명령이 인자를 확인한 뒤 바꾸기 바로 앞에서 안전 지점 'AI: <명령> 전'을 남긴다
+	// (_aiSafetyFlush — 틀린 요청은 남기지 않는다). 그동안 남는 히스토리 이름은 'AI: …'다.
 	// suggest는 agent도 바로 된다: 제안 대기열 자체가 승인 단계다 (사용자가 [적용]하기 전에는 아무것도 쓰지 않는다, 결정 4).
 	// 모든 명령: ctx.seqId·ctx.build가 있으면 지금 시퀀스·패널 빌드와 같아야 하고(seq-mismatch·build-mismatch), 바꾸는 명령은
 	// 적용이 도는 동안(_miBusy) busy이고 무작업 자동저장 시계를 되돌린다(_lastActivityTime).
@@ -10488,6 +10551,15 @@ var modalState = {
 	const SUGG_BATCH_MAX = 200;
 	var _agentQueue = [];
 	var _agentSeq = 0;
+	// 승인한 agent 요청의 안전 지점 이름 ('AI: <명령> 전'). 바꾸는 명령이 인자를 모두 확인한 뒤 바꾸기 바로 앞에서 _aiSafetyFlush로 남긴다:
+	// 틀린 요청(bad-args·not-found)이 안전 지점 자리(SAFETY_MAX)를 쓰지 않고, '… 전' 이름이 돌지 않은 명령을 가리키지 않게
+	var _aiSafetyPending = "";
+	function _aiSafetyFlush() {
+		if (!_aiSafetyPending) return;
+		const label = _aiSafetyPending;
+		_aiSafetyPending = "";
+		_saveSafety(label);
+	}
 	var _planTokens = {};
 	var _planSeq = 0;
 	function _cmdOk(data) {
@@ -10616,6 +10688,7 @@ var modalState = {
 			const read = _cmdReadFiles(args.files);
 			if (read.error) return _cmdErr("bad-args", read.error);
 			if (!_keysResolved) return _cmdErr("no-sequence", "시퀀스를 열면 SRT를 열 수 있습니다");
+			_aiSafetyFlush();
 			return _cmdOk(_cmdClone(_routeSrtImport(_miCastEnabled() ? read.files : read.files.slice(0, 1))));
 		},
 		// 병합 미리 보기 (아무것도 바꾸지 않는다) = 가져오기 창이 보여 주는 통계.
@@ -10656,6 +10729,7 @@ var modalState = {
 				if (r.error) return _cmdErr("bad-args", r.error);
 				r.single = args.single === true;
 			}
+			_aiSafetyFlush();
 			const res = await _miApply(r.subs, { auto: true, single: r.single, pf: r.pf });
 			if (!res || (res.ok !== true && !res.runId && res.error)) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
 			return _cmdOk(_cmdClone(res));
@@ -10664,6 +10738,7 @@ var modalState = {
 		// → {removed, restored, moved, replaced, placed, partial, changed, skipped, failed, repaired, lost, runId}
 		undo: async (args) => {
 			if (args.runId !== undefined && typeof args.runId !== "string") return _cmdErr("bad-args", "runId는 문자열");
+			_aiSafetyFlush();
 			const res = await _miUndo({ runId: args.runId });
 			if (!res || (res.ok !== true && !res.runId && res.error)) return _cmdErr(res && res.error === "busy" ? "busy" : (res && res.error) || "exception", (res && res.detail) || "");
 			return _cmdOk(_cmdClone(res));
@@ -10673,6 +10748,7 @@ var modalState = {
 		mergeCommit: (args) => {
 			const r = _cmdImportJob(args);
 			if (r.error) return _cmdErr(r.code || "bad-args", r.error);
+			_aiSafetyFlush();
 			const before = _sessionDataSig(_sessionClone());
 			const rep = _importIntoCast(r.job);
 			return _cmdOk(_cmdClone(_cmdImportSummary(r.job, rep, _sessionDataSig(_sessionClone()) !== before)));
@@ -10725,16 +10801,17 @@ var modalState = {
 		},
 		// agent 요청 대기열 → [{rid, op, what, by, at, args}]
 		"approvals.list": () => _cmdOk(_cmdClone(_agentPrune().map((q) => ({ rid: q.rid, op: q.op, what: CMD_MUTATING[q.op], by: q.by, at: q.at, args: q.args })))),
-		// agent 요청 승인 (ui·test만): 안전 지점 'AI: <명령> 전' → 그 명령을 실행 (그동안 남는 히스토리 이름은 'AI: …') → 그 명령의 결과
+		// agent 요청 승인 (ui·test만): 그 명령을 실행 (인자를 확인한 뒤 바꾸기 전에 안전 지점 'AI: <명령> 전', 그동안 남는 히스토리 이름은 'AI: …') → 그 명령의 결과
 		"approvals.approve": async (args) => {
 			const q = _agentTake(args.rid);
 			if (q.error) return _cmdErr(q.code, q.error);
-			_saveSafety("AI: " + CMD_MUTATING[q.item.op] + " 전");
+			_aiSafetyPending = "AI: " + CMD_MUTATING[q.item.op] + " 전";
 			_aiLabel = true;
 			try {
 				return await _COMMANDS[q.item.op](_cmdClone(q.item.args), { source: "agent", approved: true, by: q.item.by });
 			} finally {
 				_aiLabel = false;
+				_aiSafetyPending = "";
 			}
 		},
 		// agent 요청 버리기 (ui·test만) → {rid}
@@ -10876,6 +10953,7 @@ var modalState = {
 	}
 	// 제안 적용: 지금 다시 확인해 통과한 것만 쓴다. 쓸 것이 있으면 먼저 안전 지점 'AI 제안 적용 전'.
 	// 쓰기는 _setRowFieldValue(해석한 _allParams 항목과 같은 필드의 노출 속성)로만. 다화자 줄은 병합 표시(mm "text")를 단다.
+	// 쓴 줄의 포인트 경고(rs.warn)는 새 값으로 다시 본다 (core recheckPointWarn — 고친 경고는 '!'·'경고 (N)'에서 빠진다).
 	// 레거시(화자 없는) 줄은 mm을 달지 않는다: '안전하게 적용'이 문장만 바뀐 줄(mm text)로 보고 캡션 속성 하나만 보내
 	// 승인한 값이 타임라인에 가지 않는다 — 패널에서 직접 고친 것과 같게 두고 ▶·↑가 속성 전부를 보낸다
 	// → {applied, ids: [줄 id], skipped: [{uid, fid, why, detail}]}
@@ -10914,6 +10992,8 @@ var modalState = {
 		});
 		ids.forEach((id) => {
 			const rs = state.rowStates[id];
+			const sub = state.subtitles.find((x) => x.id === id);
+			if (rs && sub) recheckPointWarn(sub, rs, rs.presetId ? state.presets[rs.presetId] || null : null);
 			if (rs && rs.params && rs.params.length) renderParamsPanel(id);
 		});
 		saveSessionToStorage();
@@ -13862,9 +13942,10 @@ var modalState = {
 				const isSameProject = newProjKey === state.currentProjectKey;
 				// 이전 시퀀스의 목록으로 연 SRT 가져오기 창·확인창은 닫는다 (바뀐 시퀀스에 넣지 않게)
 				const importClosed = _closeImportUi();
-				// 검수 창·화자 파일 바뀜 알림도 이전 시퀀스의 것이다 (S3-3)
+				// 검수 창·화자 파일 바뀜 알림·⟳ 대화상자도 이전 시퀀스의 것이다 (S3-3)
 				_closeVerifyModal();
 				_hideCastToast(false);
+				_castReimportKey = null;
 				saveSessionToStorage();
 				state.currentProjectKey = newProjKey;
 				state.currentSequenceKey = newSeqKey;

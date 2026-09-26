@@ -163,10 +163,12 @@ test("같은 내용을 수정 시각만 다르게 다시 가져와도 '변경 �
 	h.$("impOk").click();
 	await h.flush();
 	assert.match(h.status().text, /^변경 없음: C1 C1\.srt$/);
-	assert.deepEqual(snap(h), s0, "상태 그대로 (파일 정보도)");
+	// 목록·휴지통·히스토리는 그대로, 경로를 아는 파일이면 화자 표의 파일 정보만 새 파일로 (바뀜 알림의 기준, S3-3 리뷰)
+	s0.mi.cast.C1.mtime = 2000;
+	assert.deepEqual(snap(h), s0, "상태 그대로 (파일 정보만 새로)");
 	assert.equal(autoList(h).length, nAuto, "자동 항목 없음");
 	assert.equal(safetyList(h).length, nSafe, "안전 지점 없음");
-	// 명령으로 넣은 같은 파일 (path·mtime 없음)
+	// 명령으로 넣은 같은 파일 (path·mtime 없음): 파일 정보도 그대로
 	const b64 = bytesOf("cap_C1.srt").toString("base64");
 	const pv = await cmd(h, "mergePreview", { files: [{ name: "C1.srt", b64 }] });
 	assert.equal(pv.data.changed, false);

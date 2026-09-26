@@ -132,3 +132,37 @@ test("quoteIga: 끝 글자 받침에 맞춘 조사 ('하늘’이 · ‘날씨�
 	assert.equal(core.quoteIga(["바다", "하늘"]), "‘바다’, ‘하늘’이", "마지막 낱말을 따른다");
 	assert.equal(core.quoteIga(["AI"]), "‘AI’이(가)");
 });
+
+test("거절: 공백뿐인 '$$' 조각 (어느 문장에나 있어 칠할 것이 없고 '최대 N개'에 세지 않는다)", () => {
+	const x = row3(CAP);
+	for (const val of ["$$ $$", " $$날씨", "날씨$$ ", "날씨$$" + String.fromCharCode(0x3000) + "$$하늘"]) {
+		const r = v(x, "T2", val);
+		assert.deepEqual([r.ok, r.error], [false, "empty"], JSON.stringify(val));
+	}
+	assert.equal(v(x, "T2", " 날씨$$하늘").ok, true, "공백이 붙은 조각은 그대로 비교한다 (캡션에 ' 날씨'가 있다)");
+});
+
+test("recheckPointWarn: 필드 값을 바꾼 뒤 줄의 포인트 경고를 지금 값·캡션으로 다시 본다 (풀린 것은 빼고 새 경고는 만들지 않는다)", () => {
+	const x = row3(CAP);
+	x.rs.warn = [{ fid: "T2", missing: ["바다"], dup: [] }, { fid: "T7", missing: ["구름"], dup: [] }];
+	// T2가 아직 캡션에 없는 조각을 가지면 그 조각으로 다시 적는다, 해석되지 않는 필드(T7)는 그대로
+	core.setRowFieldValue(x.rs, x.p3, "T2", "날씨$$바다$$구름");
+	assert.equal(core.recheckPointWarn(x.sub, x.rs, x.p3), true);
+	assert.deepEqual(plain(x.rs.warn), [{ fid: "T2", missing: ["바다", "구름"], dup: [] }, { fid: "T7", missing: ["구름"], dup: [] }]);
+	assert.equal(core.recheckPointWarn(x.sub, x.rs, x.p3), false, "그대로면 바뀌지 않음");
+	// 캡션 안의 조각만 → 뺀다
+	core.setRowFieldValue(x.rs, x.p3, "T2", "날씨");
+	x.rs.warn = [{ fid: "T2", missing: ["하늘"], dup: [] }];
+	assert.equal(core.recheckPointWarn(x.sub, x.rs, x.p3), true);
+	assert.equal(x.rs.warn, undefined, "남은 것이 없으면 rs.warn을 지운다");
+	// 두 번 나오는 조각은 dup으로 남는다
+	const y = row3("좋다 좋다 날씨");
+	y.rs.warn = [{ fid: "T2", missing: ["하늘"], dup: [] }];
+	core.setRowFieldValue(y.rs, y.p3, "T2", "좋다$$날씨");
+	core.recheckPointWarn(y.sub, y.rs, y.p3);
+	assert.deepEqual(plain(y.rs.warn), [{ fid: "T2", missing: [], dup: ["좋다"] }]);
+	// 경고가 없는 줄은 건드리지 않는다
+	const z = row3(CAP);
+	assert.equal(core.recheckPointWarn(z.sub, z.rs, z.p3), false);
+	assert.equal("warn" in z.rs, false);
+});

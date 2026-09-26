@@ -367,3 +367,31 @@ test("importSrt·mergeCommit {path}: 디스크에서 읽고 경로를 화자 표
 	assert.match(r.detail, /파일을 읽지 못했다: D:\/srt\/없음\.srt/);
 	noErrors(h);
 });
+
+test("approvals.approve: 인자가 틀린 요청은 안전 지점을 남기지 않고 그 오류 (대기열에서는 빠진다)", async () => {
+	const { sim, preset } = makeSim();
+	const h = await boot(sim, preset, castSession(preset, rowsTwo()));
+	const nSafe = safety(h).length;
+	const bad = [
+		["cast.set", { items: [{ key: "C9", name: "x" }] }, "bad-args"],
+		["mergeCommit", { files: [] }, "bad-args"],
+		["importSrt", { files: [{ path: "D:/없음.srt" }] }, "bad-args"],
+		["apply", { planToken: "p-없음" }, "not-found"],
+		["apply", { spk: "C9" }, "bad-args"],
+		["undo", { runId: 3 }, "bad-args"]
+	];
+	for (const [op, args, err] of bad) {
+		const q = await cmdAs(h, "agent", op, args);
+		assert.equal(q.error, "needs-approval", op);
+		const r = await cmd(h, "approvals.approve", { rid: q.rid });
+		assert.deepEqual([r.ok, r.error], [false, err], op + " " + JSON.stringify(r));
+		assert.equal(safety(h).length, nSafe, op + ": 안전 지점을 남기지 않는다");
+	}
+	assert.equal((await cmd(h, "approvals.list", {})).data.length, 0);
+	// 맞는 요청은 그대로 안전 지점 'AI: … 전' → 실행
+	const q = await cmdAs(h, "agent", "cast.set", { items: [{ key: "C2", name: "지영" }] });
+	assert.equal((await cmd(h, "approvals.approve", { rid: q.rid })).ok, true);
+	assert.equal(safety(h).length, nSafe + 1);
+	assert.equal(safety(h)[0].label, "AI: 화자 표 바꾸기 전");
+	noErrors(h);
+});

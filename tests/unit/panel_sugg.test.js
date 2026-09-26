@@ -261,3 +261,26 @@ test("속성창에 없는 필드(노출하지 않은 T2)의 제안은 속성창 
 	noErrors(h);
 	noErrors(h2);
 });
+
+test("경고가 있는 필드를 제안 승인으로 고치면 그 경고(rs.warn)를 다시 본다: 풀린 경고·'!'·.field-warn을 지우고 마지막이면 '경고 (N)' 필터를 푼다", async () => {
+	const { presets } = build();
+	const p3 = presets.preset_3;
+	const sess = session(p3, [[1, "C1", 1, "첫 줄"], [2, "C1", 4, "오늘 날씨 맑음"], [3, "C2", 7, "셋째"]]);
+	sess.rowStates[2].warn = [{ fid: "T2", missing: ["하늘"], dup: [] }];
+	const h = await boot(p3, sess);
+	h.$("btnWarnFilter").click();
+	assert.deepEqual(visible(h), [2]);
+	assert.ok(h.$("row-2").querySelector(".sub-warn"));
+	await suggest(h, [[2, "T2", "날씨"]]);
+	const r = await cmd(h, "sugg.approve", { all: true });
+	assert.equal(r.data.applied, 1);
+	assert.equal(t2Of(h, 2, p3), "날씨");
+	assert.equal(h.snapshot().rowStates[2].warn, undefined);
+	assert.equal(h.$("row-2").querySelector(".sub-warn"), null, "행 머리 '!'도");
+	assert.deepEqual(h.$("params-2").querySelectorAll(".field-warn").map((e) => e.textContent), []);
+	assert.equal(h.$("btnWarnFilter").style.display, "none");
+	assert.deepEqual(visible(h), [1, 2, 3], "마지막 경고를 처리하면 필터를 푼다");
+	assert.equal(h.fs.readJson(P.session(PROJ, A.seqId)).rowStates[2].warn, undefined, "저장");
+	assert.deepEqual(safety(h)[0].rowStates[2].warn, [{ fid: "T2", missing: ["하늘"], dup: [] }], "안전 지점은 고치기 전");
+	noErrors(h);
+});
