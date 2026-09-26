@@ -10,7 +10,8 @@
  *   fixture  tests/mcp/fixtures/panel_replies.json의 답을 돌려준다 (op별, 일부는 인자별). seqId가 다르면 seq-mismatch,
  *            2분 지난 명령은 expired — 패널 inbox.ts와 같은 겉모양. 받은 명령은 logFile(jsonl)에 남긴다.
  *   harness  진짜 app.js 전체를 panelHarness(vm)로 띄우고 premiereSim을 호스트로 잇는다. 'AI 연결 허용'을 켜고
- *            가짜 시계를 실제 시간에 맞춰 돌린다 → 패널 inbox.ts가 진짜로 답한다. snapFile에 스냅숏을 0.3초마다 쓴다.
+ *            가짜 시계를 실제 시간에 맞춰 돌린다 → 패널 inbox.ts가 진짜로 답한다. snapFile에 스냅숏·상태 줄·ui(제안 버튼 글자,
+ *            승인 카드 글자)·예외를 0.3초마다 쓴다.
  *   off | closed | stale   heartbeat에 그 상태 하나만 쓰고 답하지 않는다 (stale = 60초 전 state on)
  *   silent   살아 있는 heartbeat만 쓰고 명령은 가져가지 않는다 (시간 초과 시험)
  * 준비되면 stdout에 "ready"를 쓴다.
@@ -113,7 +114,14 @@ async function harness() {
 		await h.advance(50);
 		if (cfg.snapFile && ++n % 6 === 0) {
 			try {
-				writeJsonAtomic(cfg.snapFile, { snapshot: h.snapshot(), status: h.status(), errors: h.errors().map((e) => String((e && e.message) || e)).slice(0, 5) });
+				const bar = h.$("aiReqBar");
+				const sb = h.$("btnSuggestions");
+				const ui = {
+					sugg: sb ? sb.textContent : "",
+					suggShown: !!h.$("suggWrap") && h.$("suggWrap").style.display !== "none",
+					aiReq: bar && bar.style.display !== "none" ? bar.querySelectorAll(".ai-req-text").map((e) => e.textContent) : []
+				};
+				writeJsonAtomic(cfg.snapFile, { snapshot: h.snapshot(), status: h.status(), ui, errors: h.errors().map((e) => String((e && e.message) || e)).slice(0, 5) });
 			} catch (_) {}
 		}
 		await sleep(50);

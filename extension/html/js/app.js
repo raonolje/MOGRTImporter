@@ -10815,7 +10815,7 @@ var modalState = {
 	// 오류 코드: needs-approval | fields-changed | busy | seq-mismatch | build-mismatch | bad-args | not-found
 	//   (예상하지 못한 예외는 exception)
 	//
-	// 읽기: status, rows, resolve, presets, cast.get, session.snapshot, mergePreview, plan(→ planToken), verify, sugg.list, approvals.list
+	// 읽기: status, rows, resolve, presets, cast.get, session.snapshot, rows.raw(M5.3), mergePreview, plan(→ planToken), verify, sugg.list, approvals.list
 	// 바꾸기: importSrt, mergeCommit, apply {planToken | ids | uids | spk}, undo, cast.set,
 	//         suggest (제안 대기열에만 넣는다 — 속성·타임라인은 그대로), sugg.approve·sugg.reject (ui·test만), approvals.approve·approvals.reject (ui·test만)
 	// agent가 바꾸는 명령(CMD_MUTATING)을 보내면 실행하지 않고 승인 대기열에 넣고 needs-approval(rid)을 돌려준다 (M5.4 승인 카드 전까지는
@@ -10974,6 +10974,27 @@ var modalState = {
 		},
 		// 세션 전체 사본 (읽기 전용)
 		"session.snapshot": () => _cmdOk(_cmdClone({ projKey: state.currentProjectKey, seqKey: state.currentSequenceKey, subtitles: state.subtitles, rowStates: state.rowStates, trashBin: state.trashBin, nextId: state.nextId, mi: state.mi })),
+		// 줄 원본 (읽기만, M5.3): MCP 서버가 같은 core의 validateSuggestion을 직접 돌릴 입력. args {uids: [uid] (1~200)}
+		// → {seqId, rows: [{uid, sub: {id, index, spk, text}, rs: {presetId, _allParams}}], presets: {id: {id, name, params, textParamIndex}}, missing: [uid]}
+		"rows.raw": (args) => {
+			if (!Array.isArray(args.uids) || !args.uids.length || args.uids.length > SUGG_BATCH_MAX) return _cmdErr("bad-args", "uids는 줄 uid 배열 (1~" + SUGG_BATCH_MAX + "개)");
+			const rows = [];
+			const missing = [];
+			const presets = {};
+			args.uids.forEach((uid) => {
+				const sub = _subByUid(uid);
+				if (!sub) {
+					missing.push(uid);
+					return;
+				}
+				const rs = state.rowStates[sub.id] || {};
+				const pid = rs.presetId || "";
+				rows.push({ uid: _uidOf(sub), sub: { id: sub.id, index: sub.index, spk: sub.spk || null, text: sub.text }, rs: { presetId: pid, _allParams: Array.isArray(rs._allParams) ? rs._allParams : [] } });
+				const p = pid ? state.presets[pid] : null;
+				if (p && !presets[pid]) presets[pid] = { id: pid, name: p.name || "", params: p.params || [], textParamIndex: p.textParamIndex };
+			});
+			return _cmdOk(_cmdClone({ seqId: state.currentSequenceId || "", rows, presets, missing }));
+		},
 		// SRT 가져오기 = #srtInput에서 그 파일들을 고른 것과 같다 (경로에 따라 v27 교체·인코딩 확인창·가져오기 창).
 		// args {files: [{name, b64}]} → {route: legacy|modal|distribute, files: [{name, key, ambiguous, encoding, replaced, cues}]}
 		// 플래그가 꺼져 있으면 첫 파일 하나만 본다. files[]는 {name, b64} 또는 {path} (디스크에서 읽는다, 5단계 import_srt)
@@ -11131,6 +11152,7 @@ var modalState = {
 		_agentQueue.push({ rid, op, args: _cmdClone(args || {}), by, at: Date.now(), seq: _importSeqToken() });
 		if (_agentQueue.length > AGENT_QUEUE_MAX) _agentQueue.shift();
 		setStatus("AI 요청 대기: " + CMD_MUTATING[op] + " — 패널에서 승인해야 실행됩니다", "");
+		_aiReqRender(); // 화자 표 제안 카드 (inbox.ts, M5.3)
 		return Object.assign(_cmdErr("needs-approval", CMD_MUTATING[op] + "은(는) 패널에서 승인해야 합니다"), { rid });
 	}
 	// 대기열에서 요청 하나를 꺼낸다 → {item} | {error, code}
@@ -11139,7 +11161,9 @@ var modalState = {
 		_agentPrune();
 		const i = _agentQueue.findIndex((q) => q.rid === rid);
 		if (i === -1) return { error: "대기 중인 요청이 없다 (낡았거나 시퀀스가 바뀜): " + rid, code: "not-found" };
-		return { item: _agentQueue.splice(i, 1)[0] };
+		const item = _agentQueue.splice(i, 1)[0];
+		_aiReqRender();
+		return { item };
 	}
 	// ── 계획 토큰 ──
 	function _planTokenNew(subs, single, pf) {
@@ -11678,6 +11702,7 @@ var modalState = {
 			_aiRenderLink();
 		}
 		if (_aiBeats % 5 === 1) _aiSweep(fs, dir);
+		_aiReqRender();
 	}
 	// 호스트 버전 (heartbeat.host): 적용 중이 아닐 때 AI_HOST_PING_MS마다 한 번 ping (MI_ 호스트가 없으면 null)
 	function _aiPingHost() {
@@ -11833,6 +11858,68 @@ var modalState = {
 			console.warn("[MOGRT] AI 연결: 응답을 쓰지 못함", id, _errText(e));
 		}
 	}
+	// ── AI 요청 카드 (M5.3) ──
+	// agent가 보낸 화자 표 제안(cast.set — MCP set_cast_proposal)을 패널 위쪽 #aiReqBar에 한 줄씩 보인다: [승인]이면 그 요청을 실행하고
+	// (approvals.approve: 안전 지점 'AI: 화자 표 바꾸기 전' → 화자 표 → 히스토리 'AI: 화자 표: …'), [거절]이면 버린다. 타임라인은 바꾸지 않는다.
+	// 적용·가져오기 같은 다른 바꾸는 요청의 카드는 M5.4에서 (그 전에는 대기열에만 있다가 10분 뒤 버려진다).
+	// 대기열이 바뀔 때(넣기·꺼내기)와 heartbeat마다(낡음·시퀀스 전환) 다시 그린다.
+	function _aiReqRender() {
+		const bar = document.getElementById("aiReqBar");
+		if (!bar) return;
+		const list = _agentPrune().filter((q) => q.op === "cast.set");
+		const sig = list.map((q) => q.rid).join(",");
+		if (bar.dataset.rids === sig && (list.length > 0) === (bar.style.display !== "none")) return;
+		bar.dataset.rids = sig;
+		bar.textContent = "";
+		list.forEach((q) => {
+			const row = document.createElement("div");
+			row.className = "ai-req";
+			row.dataset.rid = q.rid;
+			const txt = document.createElement("span");
+			txt.className = "ai-req-text";
+			txt.textContent = "AI 요청 (" + _suggByLabel(q.by) + ") · " + _aiReqSummary(q);
+			txt.title = "패널에서 승인해야 실행됩니다. 승인하면 바꾸기 전 상태를 안전 지점 'AI: 화자 표 바꾸기 전'에 남깁니다";
+			const ok = document.createElement("button");
+			ok.className = "btn ai-req-ok";
+			ok.textContent = "승인";
+			ok.addEventListener("click", () => { _aiReqDecide(q.rid, true); });
+			const no = document.createElement("button");
+			no.className = "btn ai-req-no";
+			no.textContent = "거절";
+			no.addEventListener("click", () => { _aiReqDecide(q.rid, false); });
+			row.appendChild(txt);
+			row.appendChild(ok);
+			row.appendChild(no);
+			bar.appendChild(row);
+		});
+		bar.style.display = list.length ? "" : "none";
+	}
+	// "화자 표: C2(영희) 이름 ‘민수’, 트랙 V5 · C1(철수) 기본 프리셋 ‘합성 자막’ — 메모"
+	function _aiReqSummary(q) {
+		const a = q.args || {};
+		const items = Array.isArray(a.items) ? a.items : [];
+		const parts = items.map((it) => {
+			if (!it || typeof it !== "object") return "?";
+			const bits = [];
+			if (it.name !== undefined) bits.push("이름 ‘" + String(it.name) + "’");
+			if (it.track !== undefined) bits.push("트랙 " + (it.track === null ? "자동" : Number.isInteger(it.track) ? _trackName(it.track) : String(it.track)));
+			if (it.presetId !== undefined) {
+				const p = it.presetId ? state.presets[it.presetId] : null;
+				bits.push("기본 프리셋 " + (it.presetId ? "‘" + ((p && p.name) || it.presetId) + "’" : "없음"));
+			}
+			if (it.pos !== undefined) bits.push("위치 " + (it.pos && typeof it.pos === "object" ? it.pos.x + ", " + it.pos.y : "원래대로"));
+			const K = String(it.key);
+			return K + (state.mi && state.mi.cast && state.mi.cast[K] ? "(" + _castName(K) + ")" : "") + " " + (bits.join(", ") || "변경 없음");
+		});
+		return "화자 표: " + (parts.join(" · ") || "(항목 없음)") + (typeof a.note === "string" && a.note.trim() ? " — " + a.note.trim().slice(0, 120) : "");
+	}
+	async function _aiReqDecide(rid, yes) {
+		const r = await runCommand(yes ? "approvals.approve" : "approvals.reject", { rid }, { source: "ui" });
+		if (yes && r.ok) setStatus("AI 요청을 승인했습니다: 화자 표 바꾸기" + (r.data && r.data.changed && r.data.changed.length ? " (" + r.data.changed.join(", ") + ")" : " — 바뀐 것 없음"), "ok");
+		else if (!r.ok) setStatus("AI 요청을 " + (yes ? "실행하지" : "버리지") + " 못했습니다: " + (r.detail || r.error), "err");
+		_aiReqRender();
+		return r;
+	}
 	// ── 켜기 칸과 부팅 ──
 	(function _aiBind() {
 		const chk = document.getElementById("aiLinkChk");
@@ -11853,7 +11940,8 @@ var modalState = {
 		set: (on) => _aiSetLink(on === true),
 		poll: () => _aiPollTick(),
 		beat: () => { _aiBeat(); return _aiOn; },
-		processed: () => Object.keys(_aiProcessed)
+		processed: () => Object.keys(_aiProcessed),
+		reqDecide: (rid, yes) => _aiReqDecide(rid, yes === true)
 	};
 	//#endregion
 	//#region src/mi/apply.ts

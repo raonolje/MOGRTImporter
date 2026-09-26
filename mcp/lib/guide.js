@@ -12,13 +12,14 @@ const HEAD = [
 	"① 먼저 get_status를 부른다. 오류 code가 ai-link-off·panel-closed·no-heartbeat·panel-not-responding이면 사용자에게 Premiere에서 패널을 열고 'AI 연결 허용'을 켜 달라고 한다.",
 	"② 줄은 uid로, 필드는 T-ID(T1, T2…)와 그 줄의 field_sig(get_rows·find_row의 sig)로 가리킨다. 사용자가 '#12 T2'·'C2·12'처럼 말하면 find_row로 그 줄의 문장을 확인한 뒤 쓴다.",
 	"③ 캡션 필드(captionFid)와 시간은 절대 쓰지 않는다.",
-	"④ 이 도구는 타임라인을 바꾸지 않는다. 바꾸는 요청은 패널에서 사용자가 승인한다."
+	"④ 이 도구는 타임라인을 바꾸지 않는다. 제안(suggest_fields)은 패널 대기열에만 가고, 바꾸는 요청은 패널에서 사용자가 승인한다."
 ].join("\n");
 
 const TAIL = [
 	"포인트 텍스트: 캡션 문장 안에 그대로 있는 조각을 '$$'로 이은 값(예: 날씨$$하늘). 조각 수는 list_presets notes의 '최대 N개'를 넘지 않는다. 같은 조각이 캡션에 두 번 나오면 첫 번째만 칠해지니 더 긴 조각을 고른다.",
-	"순서: get_status → list_presets(필드·규칙) → get_rows(쪽 나누기, filter warn·sugg) 또는 find_row → get_suggestions. plan_apply·verify_timeline은 읽기만 한다.",
-	"오류는 {ok:false, code, message, hint} JSON이다. seq-mismatch면 get_status로 지금 시퀀스를 확인하고, busy면 적용이 끝난 뒤, timeout이면 잠시 뒤 다시 부른다. panel-version-mismatch면 쓰기를 멈추고 패널을 새로 고쳐 달라고 한다.",
+	"순서: get_status → list_presets(필드·규칙) → get_rows(쪽 나누기, filter warn·sugg) 또는 find_row → suggest_fields(seq_id·uid·field_id·field_sig·value, 200개까지) → get_suggestions로 확인.",
+	"화자 이름·트랙·기본 프리셋은 set_cast_proposal로 제안한다. 결과가 pending(rid)이면 사용자에게 패널 위쪽 카드에서 [승인]해 달라고 알린다. plan_apply·verify_timeline은 읽기만 한다.",
+	"오류는 {ok:false, code, message, hint} JSON이다. rejected·fields-changed면 results를 보고 고쳐 다시 보낸다(하나라도 틀리면 아무것도 들어가지 않는다). seq-mismatch면 get_status부터, busy면 적용이 끝난 뒤, timeout이면 잠시 뒤 다시 부른다. panel-version-mismatch면 쓰기를 멈추고 패널을 새로 고쳐 달라고 한다.",
 	"자세한 규칙은 get_guide."
 ].join("\n");
 
@@ -54,9 +55,18 @@ const GUIDE = [
 	"- get_suggestions {uid?}: 패널 제안 대기열 (ok·stale·check 문구).",
 	"- plan_apply {uids? | speaker?}: 화자별 배치 계획(추가할 트랙·충돌·작업 수). 타임라인은 바꾸지 않는다.",
 	"- verify_timeline: 타임라인 검수 보고서 (정상·없음·옮겨짐·Premiere에서 고침 …). 읽기만 한다.",
+	"- suggest_fields {seq_id, items: [{uid, field_id, field_sig, value, note?}]}: 캡션이 아닌 필드에 값을 제안한다 (200개까지). 서버가 패널과 같은 core로 먼저 확인하고,",
+	"  하나라도 틀리면 아무것도 넣지 않고 results에 까닭을 준다 (missing-segment·too-many·caption-field·unknown-field·fields-changed …). 통과하면 패널의 제안 대기열에만 들어간다.",
+	"  결과 results[].check('✓ 본문에 있음', '! 본문에 없는 문구' …)를 사용자에게 알려 준다. field_sig는 결과에 그대로 되돌아온다.",
+	"- set_cast_proposal {seq_id, items: [{key, name?, track?('V3'|'auto'), preset_id?, pos_x?, pos_y?}], note?}: 화자 표 변경 제안. 패널 위쪽 승인 카드에 올라간다 (pending, rid).",
+	"",
+	"## seq_id",
+	"- get_status·get_rows·find_row 결과의 seq_id를 쓰기 도구에 그대로 보낸다. 그 사이 사용자가 Premiere에서 시퀀스를 바꾸면 패널이 seq-mismatch로 거절한다",
+	"  (화자 없는 목록의 uid는 줄 번호라 다른 시퀀스에도 같은 uid가 있을 수 있다).",
 	"",
 	"## 승인",
-	"- 타임라인·화자 표·목록을 바꾸는 일은 패널에서 사용자가 한다. 요청 결과가 needs-approval이면 '패널에서 승인해 주세요'라고 알린다.",
+	"- 제안은 패널의 'AI 제안 (N)'과 줄의 제안 칸에 보이고, 사용자가 [적용]해야 속성이 바뀐다. 타임라인에는 사용자가 ▶·↑로 반영한다. 포인트 텍스트 제안은 자동으로 승인되지 않는다.",
+	"- 화자 표·타임라인·목록을 바꾸는 요청은 패널의 승인 카드에서 사용자가 한다. 결과가 pending이거나 needs-approval이면 '패널에서 승인해 주세요'라고 알린다.",
 	"- get_status의 panel.approvals가 0보다 크면 승인을 기다리는 요청이 있다.",
 	"",
 	"## 오류 {ok:false, code, message, hint}",
@@ -65,6 +75,8 @@ const GUIDE = [
 	"- seq-mismatch: 그 사이 시퀀스가 바뀌었다. get_status부터 다시.",
 	"- busy: 패널이 타임라인에 적용하는 중이다. 끝난 뒤 다시.",
 	"- timeout: 패널이 제시간에 답하지 않았다. 잠시 뒤 다시 (검수·계획은 오래 걸릴 수 있다).",
+	"- rejected (suggest_fields): 확인을 통과하지 못한 제안이 있다. results[].error·detail을 보고 고친 뒤 모두 다시 보낸다.",
+	"- fields-changed: 줄의 필드 구조가 바뀌었다. get_rows·find_row로 sig를 다시 받는다.",
 	"- bad-args / not-found: 인자를 확인한다 (message에 까닭이 있다)."
 ].join("\n");
 

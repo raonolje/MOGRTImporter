@@ -1125,6 +1125,21 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
     테스트: `tests/unit/mcp_tools.test.js`, `npm run test:mcp`(`tests/mcp/server_read.test.js`: 진짜 서버를 SDK Client로, 가짜 패널 프로세스 fixture·off·closed·stale·silent,
     그리고 진짜 app.js를 vm으로 띄운 패널과 끝에서 끝), 하드 `s5_mcp`(DEV 패널, 설치된 DEV app.js의 core 해시).
 - M5.3 제안
+  - (M5.3 구현) 쓰기 도구 둘 (readOnlyHint false, destructiveHint false — 패널의 대기열·카드에만 넣는다). 둘 다 먼저 패널 신호와 **설치본 core 해시**를 보고,
+    다르면 패널에 아무것도 보내지 않고 panel-version-mismatch로 거절한다. `seq_id`(get_status·get_rows·find_row 결과에 서버가 싣는다)를 **필수**로 받아
+    패널 runCommand ctx.seqId로 보낸다 — 그 사이 시퀀스가 바뀌면 seq-mismatch (spec에 없는 점: 화자 없는 목록의 uid는 줄 번호라 다른 시퀀스에도 같은 uid가 있다).
+  - `suggest_fields {seq_id, items: [{uid, field_id, field_sig, value, note?}]}` (200개까지): 패널의 새 읽기 명령 `rows.raw {uids}`(줄 sub·_allParams와 그 줄들의
+    프리셋 params·textParamIndex만 — 썸네일은 싣지 않는다)로 입력을 받아 서버가 **설치본 core의 validateSuggestion**을 돌린다. 하나라도 틀리면 아무것도 넣지 않는다
+    (code rejected | fields-changed | not-found, results에 줄마다 error·detail·check). 모두 통과하면 패널 `suggest`(agent, by = 클라이언트 이름, 패널이 같은 core로 다시 확인)
+    → 제안 대기열에만. 결과는 줄마다 field_sig를 그대로 되돌리고 kind·warn·check('✓ 본문에 있음' …)를 준다.
+  - `set_cast_proposal {seq_id, items: [{key, name?, track?('V3'|'auto'), preset_id?, pos_x?, pos_y?}], note?}`: 서버가 cast.get·presets로 키·트랙(V2~V99)·캡션 필드가 있는
+    프리셋·위치(둘 다 0~1)를 먼저 확인하고 패널 `cast.set`(agent)에 보낸다 → needs-approval + rid → 결과 `{pending: true, rid, items}`.
+  - 패널 **승인 카드** `#aiReqBar`(상단 막대 아래, inbox.ts `_aiReqRender`): 대기 중인 agent cast.set 요청마다 "AI 요청 (Codex) · 화자 표: C2(영희) 이름 ‘민수’, 트랙 V5 — 메모"
+    [승인] [거절]. 승인 = runCommand approvals.approve (ui): 안전 지점 'AI: 화자 표 바꾸기 전' → 화자 표 → 히스토리 'AI: 화자 표: …' (인자가 틀린 요청은 오류만 알리고 안전 지점 없음).
+    대기열에 넣을 때·꺼낼 때·heartbeat마다(낡음·시퀀스 전환) 다시 그린다. 적용·가져오기 같은 다른 바꾸는 요청의 카드는 M5.4 (그 전에는 대기열에만 있다가 10분 뒤 버려진다).
+  - 안내문(instructions)·get_guide에 쓰기 도구·seq_id·rejected를 더했다 (1131자, 앞 442자 규칙).
+  - 테스트: `tests/unit/panel_inbox.test.js`(rows.raw — 서버 쪽 validateSuggestion 결과 = 패널 suggest 결과, 승인 카드 거절·승인·틀린 요청), `tests/unit/mcp_tools.test.js`(쓰기 도구 정의·parseTrack),
+    `tests/mcp/server_write.test.js`(진짜 패널(vm)과 20줄 포인트 텍스트·낡은 sig·캡션 필드·섞인 오류·최대 개수 초과·seq_id·'#12 T2'·카드, fixture 패널로 해시 불일치면 명령 0개), 하드 `s5_mcp` (7)~(10).
 - M5.4 승인 카드
 - M5.5 Claude
 

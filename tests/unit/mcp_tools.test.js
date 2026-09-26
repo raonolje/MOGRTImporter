@@ -92,3 +92,22 @@ test("core.js: 설치본 app.js의 core 해시가 heartbeat와 같을 때만 싣
 	r = C.loadCore({ coreHash: want });
 	assert.deepEqual([r.ok, r.code], [false, "core-unavailable"]);
 });
+
+test("쓰기 도구(M5.3): suggest_fields·set_cast_proposal — readOnlyHint·destructiveHint false, seq_id·items 필수, 줄 항목의 필수 칸; parseTrack", () => {
+	const box = T.createToolbox({ dir: "C:/없음" });
+	const sf = box.tools.find((t) => t.name === "suggest_fields");
+	const cp = box.tools.find((t) => t.name === "set_cast_proposal");
+	for (const t of [sf, cp]) {
+		assert.deepEqual([t.annotations.readOnlyHint, t.annotations.destructiveHint, t.annotations.openWorldHint], [false, false, false], t.name);
+		assert.deepEqual(t.inputSchema.required, ["seq_id", "items"], t.name);
+		assert.equal(t.inputSchema.properties.items.type, "array");
+	}
+	assert.deepEqual(sf.inputSchema.properties.items.items.required, ["uid", "field_id", "field_sig", "value"]);
+	assert.deepEqual(Object.keys(cp.inputSchema.properties.items.items.properties), ["key", "name", "track", "preset_id", "pos_x", "pos_y"]);
+	assert.equal(T.checkArgs(sf.inputSchema, { seq_id: "s", items: [{ uid: "a-1", field_id: "T2", field_sig: "x", value: "v" }] }), "");
+	assert.match(T.checkArgs(sf.inputSchema, { seq_id: "s", items: [{ uid: "a-1", fid: "T2", field_sig: "x", value: "v" }] }), /모르는 이름: fid/);
+	assert.match(T.checkArgs(cp.inputSchema, { seq_id: "s", items: [{ key: "C1", pos_x: "0.5" }] }), /pos_x는 숫자/);
+	assert.deepEqual(["V3", "v99", "2", " V10 ", "auto", "AUTO", "자동"].map(T.parseTrack), [2, 98, 1, 9, null, null, null]);
+	["V1", "1", "V100", "V", "x3", "", "3.5"].forEach((v) => assert.equal(T.parseTrack(v), undefined, v));
+	assert.equal(T.SUGG_MAX, 200);
+});

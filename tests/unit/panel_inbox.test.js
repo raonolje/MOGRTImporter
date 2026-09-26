@@ -305,3 +305,83 @@ test("다리 폴더: APPDATA가 없으면 CEP 사용자 데이터 폴더, DEV �
 	noErrors(h);
 	noErrors(h3);
 });
+
+// ── M5.3: rows.raw (서버 쪽 validateSuggestion 입력)와 화자 표 제안 승인 카드 ──
+
+test("rows.raw: 줄 원본(sub·_allParams)·프리셋·없는 uid·한도, 서버가 같은 core로 돌린 validateSuggestion = 패널 suggest 결과", async () => {
+	const h = await boot();
+	linkOn(h);
+	const rows = (await roundTrip(h, cmdMsg("rows", { count: 6 }))).data.rows;
+	let r = await roundTrip(h, cmdMsg("rows.raw", { uids: [rows[0].uid, rows[1].uid, "zz99-1"] }));
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.deepEqual([r.data.seqId, r.data.rows.map((x) => x.uid), r.data.missing], [A.seqId, [rows[0].uid, rows[1].uid], ["zz99-1"]]);
+	assert.deepEqual(r.data.rows[0].sub, { id: rows[0].id, index: rows[0].index, spk: "C1", text: rows[0].text });
+	assert.deepEqual(r.data.rows[0].rs._allParams, h.snapshot().rowStates[rows[0].id]._allParams);
+	assert.deepEqual(Object.keys(r.data.presets), ["preset_3"]);
+	assert.deepEqual(Object.keys(r.data.presets.preset_3).sort(), ["id", "name", "params", "textParamIndex"], "썸네일 같은 큰 칸은 싣지 않는다");
+	assert.equal((await roundTrip(h, cmdMsg("rows.raw", { uids: [] }))).error, "bad-args");
+	assert.equal((await roundTrip(h, cmdMsg("rows.raw", { uids: new Array(201).fill(rows[0].uid) }))).error, "bad-args");
+	// 서버(설치본 core = 이 app.js core)가 rows.raw로 돌린 결과가 패널의 결과와 같다
+	const cases = [
+		[rows[0], "T2", "날씨$$하늘"], [rows[0], "T2", "날씨$$바다"], [rows[0], "T1", "x"], [rows[1], "T2", "영희"], [rows[1], "T9", "x"], [rows[2], "T2", "a$$b$$c$$d"]
+	];
+	const raw = (await roundTrip(h, cmdMsg("rows.raw", { uids: [...new Set(cases.map((c) => c[0].uid))] }))).data;
+	for (const [row, fid, value] of cases) {
+		const x = raw.rows.find((y) => y.uid === row.uid);
+		const v = CORE.validateSuggestion({ sub: x.sub, rs: x.rs, preset: raw.presets[x.rs.presetId], fid, value, sig: row.sig });
+		const p = await roundTrip(h, cmdMsg("suggest", { items: [{ uid: row.uid, fid, value, sig: row.sig }] }));
+		const pr = p.ok ? p.data.results[0] : p.results[0];
+		assert.deepEqual([v.ok, v.error, [...v.warn]], [pr.ok, pr.error, pr.warn], row.uid + " " + fid + " " + value);
+	}
+	noErrors(h);
+});
+
+test("승인 카드: agent의 cast.set → #aiReqBar 요약 · [거절]은 버린다 · [승인]은 안전 지점 'AI: 화자 표 바꾸기 전' → 화자 표 → 히스토리 'AI: …'; 다른 요청은 카드에 없다", async () => {
+	const h = await boot();
+	linkOn(h);
+	const bar = h.$("aiReqBar");
+	assert.equal(bar.style.display, "none", "요청이 없으면 숨는다");
+	let r = await roundTrip(h, cmdMsg("cast.set", { items: [{ key: "C2", name: "민수", track: 4 }, { key: "C1", presetId: "preset_3" }], note: "콘티 3쪽 기준" }));
+	assert.deepEqual([r.ok, r.error], [false, "needs-approval"]);
+	const rid1 = r.rid;
+	assert.equal(bar.style.display, "");
+	let cards = bar.querySelectorAll(".ai-req");
+	assert.equal(cards.length, 1);
+	assert.equal(cards[0].querySelector(".ai-req-text").textContent, "AI 요청 (Codex) · 화자 표: C2(영희) 이름 ‘민수’, 트랙 V5 · C1(철수) 기본 프리셋 ‘합성 자막’ — 콘티 3쪽 기준");
+	// 적용 요청은 이 카드에 나오지 않는다 (M5.4)
+	r = await roundTrip(h, cmdMsg("apply", {}));
+	assert.equal(r.error, "needs-approval");
+	assert.equal(bar.querySelectorAll(".ai-req").length, 1);
+	await h.advance(2000);
+	assert.equal(hb(h).pendingApproval, 2, "heartbeat는 모든 승인 대기 수");
+	// [거절]
+	const nSafe = (h.fs.readJson(P.historySafety(PROJ, A.seqId)) || []).length;
+	bar.querySelector(".ai-req-no").click();
+	await h.flush();
+	assert.equal(bar.querySelectorAll(".ai-req").length, 0);
+	assert.equal(bar.style.display, "none");
+	assert.equal(h.snapshot().mi.cast.C2.name, "영희", "거절하면 그대로");
+	assert.match(h.status().text, /AI 요청을 버렸습니다: 화자 표 바꾸기/);
+	const left = JSON.parse(JSON.stringify(await h.win._mogrtDebug.cmd("approvals.list", {}))).data;
+	assert.deepEqual(left.map((q) => q.op), ["apply"], "cast.set만 빠졌다");
+	assert.ok(left.every((q) => q.rid !== rid1));
+	// [승인]
+	r = await roundTrip(h, cmdMsg("cast.set", { items: [{ key: "C2", name: "민수", track: 4 }] }));
+	bar.querySelector(".ai-req-ok").click();
+	await h.flush();
+	const s = h.snapshot();
+	assert.deepEqual([s.mi.cast.C2.name, s.mi.cast.C2.track], ["민수", 4]);
+	assert.equal(bar.style.display, "none");
+	assert.match(h.status().text, /AI 요청을 승인했습니다: 화자 표 바꾸기 \(C2\)/);
+	const safe = h.fs.readJson(P.historySafety(PROJ, A.seqId));
+	assert.deepEqual([safe.length, safe[0].label], [nSafe + 1, "AI: 화자 표 바꾸기 전"]);
+	assert.equal(h.fs.readJson(P.historyAuto(PROJ, A.seqId))[0].label, "AI: 화자 표: C2 이름 민수, 트랙 V5");
+	// 인자가 틀린 요청은 승인해도 바꾸지 않고 오류를 알린다 (안전 지점 없음)
+	r = await roundTrip(h, cmdMsg("cast.set", { items: [{ key: "C9", name: "x" }] }));
+	assert.match(bar.querySelector(".ai-req-text").textContent, /C9 이름 ‘x’/);
+	bar.querySelector(".ai-req-ok").click();
+	await h.flush();
+	assert.match(h.status().text, /AI 요청을 실행하지 못했습니다: 화자 표에 없는 화자: C9/);
+	assert.equal(h.fs.readJson(P.historySafety(PROJ, A.seqId)).length, nSafe + 1);
+	noErrors(h);
+});

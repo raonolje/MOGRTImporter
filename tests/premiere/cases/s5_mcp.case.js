@@ -6,6 +6,11 @@
  *   (1) get_status: core.match(설치된 DEV app.js core 해시 = heartbeat), seq·줄 수, 클라이언트 by codex
  *   (2) list_presets ↔ 패널 presets, (3) get_rows 화자·쪽, (4) find_row 'C2·12 T?'·'#12' 모호
  *   (5) plan_apply·verify_timeline: 호스트 쓰기 호출 없음, (6) 읽기 도구 5초 안 (계획·검수는 19초 안, 로그)
+ * M5.3 쓰기 도구:
+ *   (7) suggest_fields 20줄(포인트 텍스트, 프리셋 notes의 최대 개수에 맞춤) → 대기열에만 ('AI 제안 (20)'), 속성·타임라인 그대로, field_sig 되돌림
+ *   (8) 낡은 field_sig → fields-changed (아무것도 넣지 않음), (9) 'C2·12 T?'는 find_row로 → 제안
+ *   (10) set_cast_proposal → 패널 위쪽 승인 카드: [거절]은 그대로, [승인]은 안전 지점 'AI: 화자 표 바꾸기 전' → 화자 표 → 히스토리 'AI: …'
+ *   끝에서 제안은 모두 버린다
  * 실행: npm run hard -- s5_mcp
  */
 const fs = require("node:fs");
@@ -123,6 +128,73 @@ async function run(api) {
 			r = await call("get_suggestions", {});
 			assert.deepEqual(r.json.suggestions, []);
 			log("(6) 걸린 시간 " + Object.keys(times).map((k) => k + " " + times[k] + "ms").join(" · "));
+
+			// ── M5.3 ──
+			// (7) suggest_fields 20줄: 제안 대기열에만 (속성·타임라인 그대로), field_sig 되돌림
+			const seq_id = (await call("get_status", {})).json.seq_id;
+			const max = (pr.notes.join(" ").match(/최대\s*(\d+)\s*개/) || [])[1];
+			const pt = (a, b) => (max === undefined || Number(max) >= 2 ? a + "$$" + b : a);
+			const rowsAll = (await call("get_rows", { count: 50 })).json.rows;
+			const pick20 = rowsAll.slice(0, 20);
+			const items = pick20.map((x) => ({ uid: x.uid, field_id: fx.other.fid, field_sig: x.sig, value: x.spk === "C1" ? pt("날씨", "맑음") : pt("바다", "이야기"), note: "S5 한국어 메모 ✓" }));
+			const allBefore = JSON.stringify(pick20.map((x) => (snap.rowStates[x.id] || {})._allParams));
+			await panel(H.PAGE_RECORD_HOST_CALLS);
+			r = await call("suggest_fields", { seq_id, items });
+			assert.equal(r.isError, false, r.text);
+			assert.equal(r.json.queued, 20);
+			r.json.results.forEach((q, i) => assert.deepEqual([q.uid, q.field_id, q.field_sig, q.ok], [items[i].uid, fx.other.fid, items[i].field_sig, true]));
+			assert.ok(r.json.results.every((q) => /본문에 있음/.test(q.check)), JSON.stringify(r.json.results[0]));
+			await H.waitFor(panel, "(document.getElementById('btnSuggestions') || {}).textContent === 'AI 제안 (20)'", { what: "'AI 제안 (20)'" });
+			let s2 = await panel(SNAP);
+			assert.equal(pick20.filter((x) => s2.rowStates[x.id].sugg && s2.rowStates[x.id].sugg[fx.other.fid]).length, 20);
+			assert.equal(JSON.stringify(pick20.map((x) => s2.rowStates[x.id]._allParams)), allBefore, "승인 전에는 속성에 쓰지 않는다");
+			assert.deepEqual((await panel("window.__hostCalls.slice()")).filter((n) => HOST_WRITES.indexOf(n) !== -1), [], "호스트 쓰기 없음");
+			r = await call("get_suggestions", {});
+			assert.ok(r.json.suggestions.length === 20 && r.json.suggestions.every((q) => q.by === "codex" && q.note === "S5 한국어 메모 ✓"));
+			log("(7) suggest_fields 20개 → 대기열 ('AI 제안 (20)'), 속성·타임라인 그대로, 값 '" + items[0].value + "'");
+
+			// (8) 낡은 field_sig는 거절, 아무것도 넣지 않는다
+			r = await call("suggest_fields", { seq_id, items: [Object.assign({}, items[0], { field_sig: "옛 구조" })] });
+			assert.deepEqual([r.isError, r.json.code, r.json.results[0].field_sig], [true, "fields-changed", "옛 구조"]);
+			assert.equal((await call("get_suggestions", {})).json.suggestions.length, 20);
+			log("(8) 낡은 field_sig → fields-changed");
+
+			// (9) 'C2·12 T?' → find_row → 그 줄에 제안
+			const fr = (await call("find_row", { label: "C2" + DOT + "12 " + fx.other.fid })).json;
+			r = await call("suggest_fields", { seq_id, items: [{ uid: fr.uid, field_id: fr.fid, field_sig: fr.sig, value: pt("바다", "이야기") }] });
+			assert.deepEqual([r.isError, r.json.queued], [false, 1]);
+			await H.waitFor(panel, "(document.getElementById('btnSuggestions') || {}).textContent === 'AI 제안 (21)'", { what: "'AI 제안 (21)'" });
+			log("(9) find_row C2·12 → 제안 1개 (" + fr.uid + ")");
+
+			// (10) set_cast_proposal → 승인 카드: [거절]은 그대로, [승인]은 안전 지점 → 화자 표 → 히스토리
+			const castName = (k) => panel("window._mogrtDebug.snapshot().mi.cast." + k + ".name");
+			const name0 = await castName("C2");
+			r = await call("set_cast_proposal", { seq_id, items: [{ key: "C2", name: "S5M 민수", track: "V6" }], note: "하드 시험" });
+			assert.deepEqual([r.isError, r.json.pending], [false, true], r.text);
+			const cardText = "Array.from(document.querySelectorAll('#aiReqBar .ai-req-text')).map((e) => e.textContent)";
+			const cards = await H.waitFor(panel, "(() => { const t = " + cardText + "; return t.length ? t : null; })()", { what: "승인 카드" });
+			assert.match(cards[0], /AI 요청 \(Codex\) · 화자 표: C2\(.+\) 이름 ‘S5M 민수’, 트랙 V6 — 하드 시험/);
+			assert.equal(await castName("C2"), name0, "승인 전에는 그대로");
+			await panel("document.querySelector('#aiReqBar .ai-req-no').click(), true");
+			await H.waitFor(panel, "document.getElementById('aiReqBar').style.display === 'none'", { what: "카드 닫힘" });
+			assert.equal(await castName("C2"), name0, "거절하면 그대로");
+			r = await call("set_cast_proposal", { seq_id, items: [{ key: "C2", name: "S5M 민수", track: "V6" }] });
+			assert.equal(r.json.pending, true);
+			await H.waitFor(panel, "document.querySelectorAll('#aiReqBar .ai-req-ok').length === 1", { what: "승인 카드" });
+			await panel("document.querySelector('#aiReqBar .ai-req-ok').click(), true");
+			await H.waitFor(panel, "window._mogrtDebug.snapshot().mi.cast.C2.name === 'S5M 민수'", { what: "승인 → 화자 표" });
+			s2 = await panel(SNAP);
+			// 히스토리는 패널이 읽는 그대로 (DEV 캐시, window._mogrtDebug._fsRead)
+			const hist = (name) => panel("window._mogrtDebug._fsRead(" + JSON.stringify(root + "/" + s2.keys.proj + "/" + s2.keys.seq + "/" + name) + ")");
+			assert.equal((await hist("history_safety.json"))[0].label, "AI: 화자 표 바꾸기 전");
+			assert.equal((await hist("history_auto.json"))[0].label, "AI: 화자 표: C2 이름 S5M 민수, 트랙 V6");
+			assert.equal(s2.mi.cast.C2.track, 5);
+			assert.deepEqual((await panel("window.__hostCalls.slice()")).filter((n) => HOST_WRITES.indexOf(n) !== -1), [], "화자 표 승인도 타임라인을 바꾸지 않는다");
+			log("(10) set_cast_proposal → 카드 [거절] 그대로 · [승인] 안전 지점 'AI: 화자 표 바꾸기 전' → C2 'S5M 민수' V6");
+
+			// 정리: 제안 버리기
+			r = await panel(H.pageCmd("sugg.reject", { all: true }));
+			assert.deepEqual([r.ok, r.data.removed], [true, 21]);
 		});
 	} finally {
 		if (c) await c.close();
@@ -138,7 +210,7 @@ async function run(api) {
 }
 
 module.exports = {
-	name: "M5.2 MCP 서버 읽기 도구 (SDK stdio ↔ bridge_dev ↔ DEV 패널)",
+	name: "M5.2·M5.3 MCP 서버 읽기·제안 도구 (SDK stdio ↔ bridge_dev ↔ DEV 패널, 승인 카드)",
 	run,
 	setup,
 	linkOn

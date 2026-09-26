@@ -84,6 +84,14 @@ claude mcp add mogrt_importer -- node <repo>/mcp/server.mjs
 | `plan_apply` | ✓ | 화자별 배치 계획 (트랙·충돌·작업 수). 타임라인은 바꾸지 않습니다 |
 | `verify_timeline` | ✓ | 타임라인 검수 보고서 (읽기만) |
 | `get_guide` | ✓ | 자세한 운영 규칙 (패널에 닿지 않음) |
+| `suggest_fields` | | `{seq_id, items: [{uid, field_id, field_sig, value, note?}]}` (200개까지) — 캡션이 아닌 필드에 값 제안. 서버가 **설치본 core의 `validateSuggestion`**으로 먼저 확인하고 하나라도 틀리면 아무것도 넣지 않는다(`rejected`·`fields-changed`·`not-found` + results). 통과하면 패널의 제안 대기열에만 (`field_sig`는 결과에 그대로 되돌아온다) |
+| `set_cast_proposal` | | `{seq_id, items: [{key, name?, track?('V3'\|'auto'), preset_id?, pos_x?, pos_y?}], note?}` — 화자 표 변경 제안. 패널 위쪽 **승인 카드**에 올라가고(`pending: true`, `rid`) 사용자가 [승인]해야 바뀐다 |
+
+- 쓰기 도구 두 개는 `readOnlyHint: false`, `destructiveHint: false`입니다 — 패널의 대기열·카드에만 넣고 속성·타임라인은 사용자가 패널에서 바꿉니다.
+  포인트 텍스트 제안은 자동으로 승인되지 않습니다 (사용자 결정 4).
+- `seq_id`는 `get_status`·`get_rows`·`find_row`가 준 값을 그대로 보냅니다. 그 사이 Premiere에서 시퀀스가 바뀌면 패널이 `seq-mismatch`로 거절합니다
+  (화자 없는 목록의 uid는 줄 번호라 다른 시퀀스에도 같은 uid가 있을 수 있습니다).
+- 쓰기 도구는 설치본 core 해시가 패널과 다르면 패널에 아무것도 보내지 않고 `panel-version-mismatch`로 거절합니다.
 
 서버 안내문(initialize의 `instructions`, 한국어 2048자 이하)은 `lib/guide.js`에 있습니다. Codex는 MCP prompts를 쓰지 않으므로
 규칙은 안내문과 `get_guide`에 둡니다.
@@ -121,6 +129,7 @@ claude mcp add mogrt_importer -- node <repo>/mcp/server.mjs
 | `panel-version-mismatch` | 패널 core와 설치본 core가 다르다 | 패널 새로 고침·Premiere 재시작 (쓰기 도구는 막힘) |
 | `core-unavailable` | 설치본 app.js를 읽지 못했다 | 패널 설치 확인 |
 | `timeout` | 패널이 제시간에 답하지 않았다 | 잠시 뒤 다시 |
+| `rejected` | suggest_fields의 제안 중 확인을 통과하지 못한 것이 있다 (아무것도 넣지 않았다) | results[].error를 보고 고쳐 모두 다시 |
 | `busy` · `seq-mismatch` · `bad-args` · `not-found` · `fields-changed` · `needs-approval` | 패널의 runCommand 결과 | message·hint대로 |
 
 ## 테스트
@@ -128,7 +137,8 @@ claude mcp add mogrt_importer -- node <repo>/mcp/server.mjs
 - `npm test` (저장소 루트, SDK 없이): `tests/unit/mcp_tools.test.js`(도구 정의·안내문·복사한 region 로더가 `tests/lib`와 같은지·설치본 core 싣기),
   `tests/unit/mcp_bridge.test.js`(다리 클라이언트, 진짜 임시 폴더로 패널 하네스와 왕복), `tests/unit/panel_inbox.test.js`(패널 인박스).
 - `npm run test:mcp` (루트, `mcp/`에서 `npm install` 뒤): 진짜 서버를 SDK Client(stdio)로 띄우고 가짜 패널 프로세스(`tests/mcp/fake_panel.js`:
-  fixture 답·꺼짐·닫힘·낡음·무응답, 그리고 진짜 app.js를 vm으로 띄운 패널)와 이야기한다.
+  fixture 답·꺼짐·닫힘·낡음·무응답, 그리고 진짜 app.js를 vm으로 띄운 패널)와 이야기한다. `server_read.test.js`(읽기 도구),
+  `server_write.test.js`(20줄 포인트 텍스트 제안·거절 경우·승인 카드·해시 불일치).
 - 하드 (Premiere, DEV 패널): `npm run hard -- s5_inbox`, `npm run hard -- s5_mcp`.
 
 `lib/loadRegions.js`·`lib/jsmask.js`는 `tests/lib`의 복사본입니다 (바이트까지 같아야 한다 — `mcp_tools.test.js`). 고치면 둘 다 고칩니다.
