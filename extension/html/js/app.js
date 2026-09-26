@@ -11485,6 +11485,377 @@ var modalState = {
 	// 다른 출처로 부른다 (agent가 needs-approval을 받는지 시험할 때). extra: {seqId, build, by}
 	window._mogrtDebug.cmdAs = (source, op, args, extra) => runCommand(op, args, Object.assign({}, extra || {}, { source }));
 	//#endregion
+	//#region src/mi/inbox.ts
+	// ─────────────────────────────────────────────────────────────
+	// AI 연결 (5단계 M5.1): 파일 인박스와 heartbeat. 전용 MCP 서버(mcp/server.mjs)는 이 폴더로만 패널에 닿는다.
+	//   <APPDATA>/MogrtImporter/bridge/  (DEV 설치(빌드 dev-…)는 bridge_dev — 같은 Premiere에 뜬 운영 패널과 명령이 섞이지 않게)
+	//     inbox/<id>.json    서버가 쓴다 (<id>.json.tmp → rename). {v: 1, id, op, args, at(ms), seqId?, build?, by?}
+	//     outbox/<id>.json   패널이 쓴다 (tmp → rename). {v: 1, id, op, at, ok, data | error, detail, rid?, results?, dup?}
+	//     heartbeat.json     'AI 연결 허용'이 켜져 있는 동안 2초마다 (tmp → rename):
+	//                        {v, at, state: "on", panel, host, build, extPath, coreHash, seqId, seqName, projKey, seqKey, keysResolved,
+	//                         busy, processing, pendingApproval, suggestions, rows, pollMs, beatMs}
+	//                        끌 때 한 번 {state: "off"}, 켠 채 패널을 닫으면 {state: "closed"} (서버가 까닭을 알릴 수 있게)
+	//     processed.json     처리한 명령 id와 시각 (2분). 패널을 다시 열어도 같은 명령을 두 번 돌리지 않는다
+	// 'AI 연결 허용'(#aiLinkChk)은 기본 꺼짐이다. 꺼져 있으면 폴더를 읽지도 쓰지도 않는다 (4단계와 같다). 켠 상태는 이 패널의
+	// localStorage에 남는다 (DEV 설치는 접두사를 바꾸므로 키 이름도 운영과 다르다).
+	// 명령은 runCommand(op, args, {source: "agent", seqId, build, by})로만 돈다: 바꾸는 명령은 승인 대기열(needs-approval + rid),
+	// suggest는 제안 대기열에만 넣는다. session.json은 언제나 패널만 쓴다.
+	// 명령은 하나씩 차례로 돈다 (앞 명령이 끝나야 다음 폴링). 2분 넘은 명령은 돌리지 않고 expired로 답한다.
+	// 받은 파일은 처리한 id를 먼저 적고(processed.json) 지운 뒤 돌린다 → 지우지 못하거나 서버가 같은 id를 다시 보내도 두 번 돌지 않는다
+	// (다시 받으면 기억한 응답을 dup: true로 다시 쓴다). 패널이 숨어 있어도 폴링한다 (AI는 숨은 패널에도 묻는다).
+	// ─────────────────────────────────────────────────────────────
+	const AI_POLL_MS = 300;
+	const AI_BEAT_MS = 2000;
+	const AI_CMD_TTL = 2 * 60000;
+	// 서버가 가져가지 않은 응답을 지우는 시간
+	const AI_OUTBOX_TTL = 5 * 60000;
+	// heartbeat의 호스트 버전은 이 간격으로만 다시 묻는다 (ExtendScript 줄을 차지하지 않게)
+	const AI_HOST_PING_MS = 30000;
+	const AI_CMD_MAX_BYTES = 8 * 1024 * 1024;
+	// 폴링 한 번에 돌리는 명령 수
+	const AI_POLL_BATCH = 10;
+	// 같은 id를 다시 받았을 때 다시 쓸 응답: 최근 AI_RESP_KEEP개, 하나에 AI_RESP_KEEP_BYTES까지 (넘으면 결과 코드만)
+	const AI_RESP_KEEP = 32;
+	const AI_RESP_KEEP_BYTES = 256 * 1024;
+	const AI_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+	const AI_LINK_KEY = "MI_aiLink";
+	var _aiOn = false;
+	var _aiPollTimer = null, _aiBeatTimer = null;
+	var _aiPolling = false; // 폴링 한 번이 도는 중 (명령을 기다리는 동안 다음 폴링은 쉰다)
+	var _aiProcessing = null; // 지금 돌리는 명령 id (heartbeat.processing)
+	var _aiProcessed = {}; // id → {at, op, resp}
+	var _aiHost = null, _aiHostAt = 0, _aiPinging = false; // 마지막 호스트 ping {v, build, prefix} (모르면 null)
+	var _aiBeats = 0;
+	var _aiLastErr = "";
+	var _aiDirMemo = null;
+	// 다리 폴더: %APPDATA%/MogrtImporter/bridge (APPDATA가 없으면 CEP 사용자 데이터 폴더). DEV 빌드는 bridge_dev. 모르면 null
+	function _aiBridgeDir() {
+		if (_aiDirMemo) return _aiDirMemo;
+		let base = "";
+		try {
+			const proc = typeof process !== "undefined" && process && process.env ? process : window.cep_node && window.cep_node.process ? window.cep_node.process : _nodeRequire("process");
+			if (proc && proc.env && proc.env.APPDATA) base = String(proc.env.APPDATA);
+		} catch (_) {}
+		if (!base) {
+			try {
+				const cs = window.CSInterface ? new window.CSInterface() : null;
+				base = cs ? String(cs.getSystemPath(SystemPath.USER_DATA) || "") : "";
+			} catch (_) {
+				base = "";
+			}
+		}
+		if (!base) return null;
+		_aiDirMemo = base.replace(/\\/g, "/").replace(/\/$/, "") + "/MogrtImporter/" + (MI_BUILD_PANEL.indexOf("dev-") === 0 ? "bridge_dev" : "bridge");
+		return _aiDirMemo;
+	}
+	// 설치된 확장 폴더 (heartbeat.extPath: 서버가 여기의 html/js/app.js에서 core를 읽는다). 모르면 ""
+	function _aiExtPath() {
+		const root = _getCacheRoot();
+		return root ? root.replace(/\/cache$/, "") : "";
+	}
+	// 파일 하나를 통째로 쓴다: <경로>.tmp에 쓰고 rename (읽는 쪽이 반쯤 쓴 JSON을 보지 않게)
+	function _aiWriteJson(fs, p, obj) {
+		const tmp = p + ".tmp";
+		fs.writeFileSync(tmp, JSON.stringify(obj));
+		fs.renameSync(tmp, p);
+	}
+	function _aiUnlink(fs, p) {
+		try {
+			fs.unlinkSync(p);
+		} catch (_) {}
+	}
+	// 'AI 연결 허용' 켜기·끄기 → 켜졌는가. opts {quiet: 상태 줄에 쓰지 않음, persist: false면 localStorage에 남기지 않음}
+	function _aiSetLink(on, opts) {
+		const o = opts || {};
+		const want = !!on;
+		if (want === _aiOn) {
+			_aiRenderLink();
+			return _aiOn;
+		}
+		const fs = _nodeRequire("fs");
+		const dir = _aiBridgeDir();
+		if (want) {
+			let why = !fs ? "Node 모듈을 쓸 수 없음" : !dir ? "사용자 폴더를 모름" : "";
+			if (!why) {
+				try {
+					fs.mkdirSync(dir + "/inbox", { recursive: true });
+					fs.mkdirSync(dir + "/outbox", { recursive: true });
+				} catch (e) {
+					why = "폴더를 만들지 못함 (" + _errText(e) + ")";
+				}
+			}
+			if (why) {
+				_aiLastErr = why;
+				if (!o.quiet) setStatus("AI 연결을 켜지 못했습니다: " + why, "err");
+				_aiRenderLink();
+				return false;
+			}
+			_aiOn = true;
+			_aiLastErr = "";
+			_aiLoadProcessed(fs, dir);
+			_aiPollTimer = setInterval(_aiPollTick, AI_POLL_MS);
+			_aiBeatTimer = setInterval(_aiBeat, AI_BEAT_MS);
+			_aiBeat();
+			if (!o.quiet) setStatus("AI 연결 허용: 켬 — Codex·Claude가 목록을 읽고 제안할 수 있습니다 (바꾸는 요청은 패널에서 승인해야 실행됩니다)", "ok");
+		} else {
+			_aiOn = false;
+			clearInterval(_aiPollTimer);
+			clearInterval(_aiBeatTimer);
+			_aiPollTimer = _aiBeatTimer = null;
+			_aiLastErr = "";
+			_aiWriteState("off");
+			if (!o.quiet) setStatus("AI 연결 허용: 끔", "ok");
+		}
+		if (o.persist !== false) {
+			try {
+				localStorage.setItem(AI_LINK_KEY, want ? "1" : "0");
+			} catch (_) {}
+		}
+		_aiRenderLink();
+		return _aiOn;
+	}
+	// heartbeat.json에 끝 상태 하나만 쓴다 ("off" | "closed")
+	function _aiWriteState(st) {
+		const fs = _nodeRequire("fs");
+		const dir = _aiBridgeDir();
+		if (!fs || !dir) return;
+		try {
+			_aiWriteJson(fs, dir + "/heartbeat.json", { v: 1, at: Date.now(), state: st, build: MI_BUILD_PANEL });
+		} catch (_) {}
+	}
+	function _aiRenderLink() {
+		const wrap = document.getElementById("aiLink");
+		const chk = document.getElementById("aiLinkChk");
+		if (!wrap || !chk) return;
+		chk.checked = _aiOn;
+		wrap.classList.toggle("on", _aiOn && !_aiLastErr);
+		wrap.classList.toggle("err", !!_aiLastErr);
+		if (_aiLastErr) wrap.title = "AI 연결: " + _aiLastErr;
+		else if (_aiOn) wrap.title = "AI 연결 허용: 켬 — " + (_aiBridgeDir() || "") + "\nCodex·Claude(MCP 서버)가 목록을 읽고 제안할 수 있습니다. 바꾸는 요청은 패널에서 승인해야 실행됩니다";
+		else wrap.title = "AI 연결 허용: 끔 (기본) — 켜면 전용 MCP 서버(Codex·Claude)가 이 패널을 읽고 제안할 수 있습니다";
+	}
+	// ── heartbeat ──
+	function _aiBeatData() {
+		return {
+			v: 1,
+			at: Date.now(),
+			state: "on",
+			panel: { v: 28, build: MI_BUILD_PANEL },
+			host: _aiHost,
+			build: MI_BUILD_PANEL,
+			extPath: _aiExtPath(),
+			coreHash: _coreHash(),
+			seqId: state.currentSequenceId || "",
+			seqName: (_seqLabelInfo && _seqLabelInfo.seqName) || "",
+			projKey: state.currentProjectKey,
+			seqKey: state.currentSequenceKey,
+			keysResolved: _keysResolved,
+			busy: !!(_miBusy || _legacyRun),
+			processing: _aiProcessing,
+			pendingApproval: _agentPrune().length,
+			suggestions: _suggAll().length,
+			rows: state.subtitles.length,
+			pollMs: AI_POLL_MS,
+			beatMs: AI_BEAT_MS
+		};
+	}
+	function _aiBeat() {
+		if (!_aiOn) return;
+		const fs = _nodeRequire("fs");
+		const dir = _aiBridgeDir();
+		if (!fs || !dir) return;
+		_aiBeats++;
+		_aiPingHost();
+		try {
+			_aiWriteJson(fs, dir + "/heartbeat.json", _aiBeatData());
+			if (_aiLastErr) {
+				_aiLastErr = "";
+				_aiRenderLink();
+			}
+		} catch (e) {
+			if (!_aiLastErr) setStatus("AI 연결: heartbeat를 쓰지 못했습니다 — " + _errText(e), "err");
+			_aiLastErr = "heartbeat를 쓰지 못함 (" + _errText(e) + ")";
+			_aiRenderLink();
+		}
+		if (_aiBeats % 5 === 1) _aiSweep(fs, dir);
+	}
+	// 호스트 버전 (heartbeat.host): 적용 중이 아닐 때 AI_HOST_PING_MS마다 한 번 ping (MI_ 호스트가 없으면 null)
+	function _aiPingHost() {
+		if (_miBusy || _legacyRun || _aiPinging || Date.now() - _aiHostAt < AI_HOST_PING_MS) return;
+		_aiPinging = true;
+		_aiHostAt = Date.now();
+		host.mi.ping().then(
+			(p) => { _aiHost = p && p.ok === true ? { v: p.v, build: p.build || "", prefix: p.prefix || "" } : null; },
+			() => { _aiHost = null; }
+		).then(() => { _aiPinging = false; });
+	}
+	// 오래된 파일 정리: 서버가 가져가지 않은 응답(AI_OUTBOX_TTL), 쓰다 만 명령·응답 tmp(AI_CMD_TTL), 처리한 id(AI_CMD_TTL)
+	function _aiSweep(fs, dir) {
+		const now = Date.now();
+		[[dir + "/outbox", /\.json$/, AI_OUTBOX_TTL], [dir + "/outbox", /\.tmp$/, AI_CMD_TTL], [dir + "/inbox", /\.tmp$/, AI_CMD_TTL]].forEach(([d, re, ttl]) => {
+			let names = [];
+			try {
+				names = fs.readdirSync(d);
+			} catch (_) {
+				return;
+			}
+			names.map(String).filter((n) => re.test(n)).forEach((n) => {
+				try {
+					if (now - Number(fs.statSync(d + "/" + n).mtimeMs) > ttl) fs.unlinkSync(d + "/" + n);
+				} catch (_) {}
+			});
+		});
+		const n = Object.keys(_aiProcessed).length;
+		_aiPruneProcessed(now);
+		if (Object.keys(_aiProcessed).length !== n) _aiSaveProcessed(fs, dir);
+	}
+	// ── 처리한 id ──
+	function _aiLoadProcessed(fs, dir) {
+		_aiProcessed = {};
+		try {
+			const o = JSON.parse(String(fs.readFileSync(dir + "/processed.json", "utf8")));
+			const ids = o && typeof o.ids === "object" && o.ids ? o.ids : {};
+			const now = Date.now();
+			Object.keys(ids).forEach((id) => {
+				const at = Number(ids[id]);
+				if (AI_ID_RE.test(id) && isFinite(at) && now - at < AI_CMD_TTL) _aiProcessed[id] = { at, op: "", resp: null };
+			});
+		} catch (_) {}
+	}
+	function _aiSaveProcessed(fs, dir) {
+		const ids = {};
+		Object.keys(_aiProcessed).forEach((id) => { ids[id] = _aiProcessed[id].at; });
+		try {
+			_aiWriteJson(fs, dir + "/processed.json", { v: 1, ids });
+		} catch (e) {
+			console.warn("[MOGRT] AI 연결: processed.json을 쓰지 못함", _errText(e));
+		}
+	}
+	// 2분 지난 id를 버리고, 다시 쓸 응답은 최근 AI_RESP_KEEP개만 기억한다
+	function _aiPruneProcessed(now) {
+		Object.keys(_aiProcessed).forEach((id) => { if (now - _aiProcessed[id].at >= AI_CMD_TTL) delete _aiProcessed[id]; });
+		const withResp = Object.keys(_aiProcessed).filter((id) => _aiProcessed[id].resp).sort((a, b) => _aiProcessed[a].at - _aiProcessed[b].at);
+		withResp.slice(0, Math.max(0, withResp.length - AI_RESP_KEEP)).forEach((id) => { _aiProcessed[id].resp = null; });
+	}
+	// ── 인박스 ──
+	async function _aiPollTick() {
+		if (!_aiOn || _aiPolling) return;
+		const fs = _nodeRequire("fs");
+		const dir = _aiBridgeDir();
+		if (!fs || !dir) return;
+		_aiPolling = true;
+		try {
+			let names;
+			try {
+				names = fs.readdirSync(dir + "/inbox").map(String);
+			} catch (_) {
+				// 폴더가 지워졌으면 다시 만든다 (다음 폴링부터)
+				try {
+					fs.mkdirSync(dir + "/inbox", { recursive: true });
+				} catch (_e) {}
+				return;
+			}
+			const list = names.filter((n) => /\.json$/.test(n)).sort();
+			for (const n of list.slice(0, AI_POLL_BATCH)) {
+				if (!_aiOn) break;
+				const id = n.slice(0, -5);
+				if (!AI_ID_RE.test(id)) {
+					_aiUnlink(fs, dir + "/inbox/" + n); // 서버가 만들 수 없는 이름: 답할 곳이 없다
+					continue;
+				}
+				await _aiHandle(fs, dir, id);
+			}
+		} finally {
+			_aiPolling = false;
+		}
+	}
+	// 명령 파일 하나: 읽기 → (같은 id면 기억한 응답) → 처리한 id 적기 → 지우기 → 확인(2분·형식) → runCommand(agent) → 응답
+	async function _aiHandle(fs, dir, id) {
+		const p = dir + "/inbox/" + id + ".json";
+		let msg = null;
+		let bad = "";
+		try {
+			const st = fs.statSync(p);
+			if (Number(st.size) > AI_CMD_MAX_BYTES) bad = "명령 파일이 너무 크다 (" + st.size + "바이트)";
+			else msg = JSON.parse(String(fs.readFileSync(p, "utf8")));
+		} catch (e) {
+			if (e && e.code === "ENOENT") return;
+			bad = "명령을 읽지 못했다: " + _errText(e);
+		}
+		const prev = _aiProcessed[id];
+		if (prev) {
+			_aiUnlink(fs, p);
+			_aiRespond(fs, dir, id, prev.op, Object.assign({}, prev.resp || _cmdErr("duplicate", "이미 처리한 명령이다: " + id), { dup: true }));
+			return;
+		}
+		const now = Date.now();
+		const op = msg && typeof msg === "object" && typeof msg.op === "string" ? msg.op : "";
+		_aiProcessed[id] = { at: now, op, resp: null };
+		_aiSaveProcessed(fs, dir);
+		_aiUnlink(fs, p);
+		let resp;
+		if (!bad) bad = _aiMsgError(msg, id);
+		if (bad) resp = _cmdErr("bad-args", bad);
+		else if (now - msg.at > AI_CMD_TTL) resp = _cmdErr("expired", Math.round((now - msg.at) / 1000) + "초 전 명령 — " + AI_CMD_TTL / 60000 + "분이 지나 돌리지 않았다");
+		else {
+			const ctx = { source: "agent" };
+			["seqId", "build", "by"].forEach((k) => { if (typeof msg[k] === "string") ctx[k] = msg[k]; });
+			_aiProcessing = id;
+			try {
+				resp = await runCommand(op, msg.args === null ? undefined : msg.args, ctx);
+			} catch (e) {
+				resp = _cmdErr("exception", _errText(e));
+			} finally {
+				_aiProcessing = null;
+			}
+		}
+		let keep = resp;
+		try {
+			if (JSON.stringify(resp).length > AI_RESP_KEEP_BYTES) keep = _cmdErr(resp && resp.ok ? "duplicate" : (resp && resp.error) || "exception", "응답이 커서 다시 보내지 않는다 — 명령을 새 id로 다시 보내세요");
+		} catch (_) {}
+		if (_aiProcessed[id]) _aiProcessed[id].resp = keep;
+		_aiRespond(fs, dir, id, op, resp);
+	}
+	// 명령 형식 확인 → 틀린 까닭 ("" = 맞음). 2분 확인은 부른 쪽이 한다
+	function _aiMsgError(msg, id) {
+		if (!msg || typeof msg !== "object" || Array.isArray(msg)) return "명령은 JSON 객체";
+		if (msg.id !== id) return "id가 파일 이름과 다르다: " + String(msg.id);
+		if (typeof msg.op !== "string" || !msg.op) return "op가 없다";
+		if (typeof msg.at !== "number" || !isFinite(msg.at)) return "at(보낸 시각, ms)이 없다";
+		if (msg.at - Date.now() > AI_CMD_TTL) return "at이 미래다 (시계가 맞지 않다)";
+		return "";
+	}
+	function _aiRespond(fs, dir, id, op, resp) {
+		const out = Object.assign({ v: 1, id, op: op || "", at: Date.now() }, resp || _cmdErr("exception", "응답 없음"));
+		try {
+			_aiWriteJson(fs, dir + "/outbox/" + id + ".json", out);
+		} catch (e) {
+			console.warn("[MOGRT] AI 연결: 응답을 쓰지 못함", id, _errText(e));
+		}
+	}
+	// ── 켜기 칸과 부팅 ──
+	(function _aiBind() {
+		const chk = document.getElementById("aiLinkChk");
+		if (chk) chk.addEventListener("change", () => { _aiSetLink(chk.checked); });
+		let saved = null;
+		try {
+			saved = localStorage.getItem(AI_LINK_KEY);
+		} catch (_) {}
+		// 켠 채 닫았으면 다시 켠다 (모든 region이 준비된 뒤)
+		if (saved === "1") setTimeout(() => { _aiSetLink(true, { quiet: true, persist: false }); }, 0);
+		_aiRenderLink();
+		if (typeof window.addEventListener === "function") window.addEventListener("unload", () => { if (_aiOn) _aiWriteState("closed"); });
+	})();
+	// DEV·하드 테스트 훅 (읽기와 켜기·끄기, 폴링·heartbeat 한 번)
+	window._mogrtDebug.inbox = {
+		dir: () => _aiBridgeDir(),
+		on: () => _aiOn,
+		set: (on) => _aiSetLink(on === true),
+		poll: () => _aiPollTick(),
+		beat: () => { _aiBeat(); return _aiOn; },
+		processed: () => Object.keys(_aiProcessed)
+	};
+	//#endregion
 	//#region src/mi/apply.ts
 	// ─────────────────────────────────────────────────────────────
 	// 레거시 목록(화자 표 없음)의 타임라인 적용 — 바꾸지 않은 v27 호스트 (S1-9)

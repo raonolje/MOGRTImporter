@@ -27,6 +27,8 @@ const INDEX_HTML = path.join(ROOT, "extension", "html", "index.html");
 const JSZIP_JS = path.join(ROOT, "extension", "html", "js", "jszip.min.js");
 const EXT_DIR = "C:/fake/extensions/CEP_MogrtImporter_dev";
 const CACHE_ROOT = EXT_DIR + "/cache";
+// CSInterface.getSystemPath(SystemPath.USER_DATA) (5단계 AI 연결 다리 폴더의 대체 경로. node.env.APPDATA가 있으면 그쪽이 먼저다)
+const USER_DATA_DIR = "C:/fake/AppData/Roaming";
 
 const VOID = new Set(["input", "br", "img", "hr", "meta", "link", "source", "wbr", "area", "base", "col", "embed", "param", "track"]);
 
@@ -570,6 +572,8 @@ const cachePaths = {
  *   localStorage 초기 값
  *   previewExists, previewSetupOk, params, mogrts  호스트 흉내 설정
  *   node      {files: {경로: 바이트|{data, mtimeMs}}} — Node fs(메모리)·zlib·JSZip을 넣는다 (h.nodeFs)
+ *             {env: {APPDATA: …}} — require("process").env (5단계 AI 연결 다리 폴더)
+ *             {fs: 진짜 fs 같은 객체} — 메모리 fs 대신 쓴다 (MCP 테스트가 진짜 폴더로 패널과 이야기할 때. h.nodeFs = 그 객체)
  *   appSrc    app.js 대신 돌릴 소스 (예: git tag v27의 app.js — 단일 화자 DOM이 v27과 같은지 비교할 때)
  */
 async function bootPanel(opts = {}) {
@@ -600,7 +604,7 @@ async function bootPanel(opts = {}) {
 			setItem: (k, v) => ls.set(k, String(v)),
 			removeItem: (k) => ls.delete(k)
 		},
-		SystemPath: { EXTENSION: "extension" },
+		SystemPath: { EXTENSION: "extension", USER_DATA: "userData" },
 		alert: (m) => { throw new Error("alert() 호출: " + m); },
 		confirm: (m) => { throw new Error("confirm() 호출: " + m); },
 		Event: function Event(type, init) { return makeEvent(type, init); },
@@ -616,7 +620,7 @@ async function bootPanel(opts = {}) {
 	const clipboard = [];
 	win.navigator = { language: "ko-KR", clipboard: { writeText: (t) => { clipboard.push(String(t)); return Promise.resolve(); } } };
 	win.CSInterface = function CSInterface() {};
-	win.CSInterface.prototype.getSystemPath = () => EXT_DIR;
+	win.CSInterface.prototype.getSystemPath = (t) => (t === "userData" ? USER_DATA_DIR : EXT_DIR);
 	// 처리기는 글자를 돌려주거나, 약속(느린 호출 흉내: 워치독 시험)을 돌려준다
 	win.CSInterface.prototype.evalScript = (script, cb) => {
 		const { fn, args } = parseCall(script);
@@ -638,8 +642,9 @@ async function bootPanel(opts = {}) {
 	// opts.node: CEP의 Node(require)와 index.html이 먼저 로드하는 JSZip을 넣는다 (S1-11 굽기). 없으면 둘 다 없다(운영 밖 기본값)
 	let nodeFs = null;
 	if (opts.node) {
-		nodeFs = makeNodeFs(opts.node.files);
+		nodeFs = opts.node.fs || makeNodeFs(opts.node.files);
 		const mods = { fs: nodeFs, zlib: require("node:zlib"), path: require("node:path") };
+		if (opts.node.env) mods.process = { env: Object.assign({}, opts.node.env), platform: "win32" };
 		win.require = (name) => {
 			const k = String(name).replace(/^node:/, "");
 			if (!mods[k]) throw new Error("하네스에 없는 Node 모듈: " + name);
@@ -699,4 +704,4 @@ async function bootPanel(opts = {}) {
 	return h;
 }
 
-module.exports = { bootPanel, CACHE_ROOT, EXT_DIR, parseCall, buildDocument, projKeyOf, seqKeyOf, cachePaths };
+module.exports = { bootPanel, CACHE_ROOT, EXT_DIR, USER_DATA_DIR, parseCall, buildDocument, projKeyOf, seqKeyOf, cachePaths };

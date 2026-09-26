@@ -44,7 +44,7 @@ ui/subtitleList 3375 · main.ts 3862
 | `src/ui/cast.ts` | subtitleList 앞 | |
 | `src/mi/apply.ts` | main.ts 앞 | |
 | `src/mi/commands.ts` | main.ts 앞 | |
-| `src/mi/inbox.ts` | | 5단계 |
+| `src/mi/inbox.ts` | commands.ts 바로 뒤 | 5단계 (M5.1 인박스·heartbeat) |
 
 ### 0.2 사용자 결정 (2026-09-24, 구속력 있음)
 
@@ -1099,6 +1099,17 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
 
 - M5.0 클라이언트 스파이크
 - M5.1 인박스와 heartbeat(extPath, coreHash)
+  - (M5.1 구현) region `src/mi/inbox.ts`(commands.ts 뒤). 다리 폴더 `%APPDATA%/MogrtImporter/bridge` (APPDATA가 없으면 CEP `SystemPath.USER_DATA`).
+    **DEV 빌드(dev-…)는 `bridge_dev`** — 같은 Premiere에 운영 패널이 떠 있어도 하드 테스트 명령이 운영 세션에 가지 않게 (spec에 없는 점). MCP 서버는 `MI_BRIDGE_DIR`로 고른다.
+    `inbox/<id>.json`(서버, tmp → rename) → 300 ms 폴링 → 처리한 id를 `processed.json`에 먼저 적고 파일을 지운 뒤 `runCommand(op, args, {source: "agent", seqId, build, by})`
+    → `outbox/<id>.json`(tmp → rename). 명령은 하나씩 차례로, 2분 지난 명령은 `expired`, 같은 id는 한 번만(다시 받으면 기억한 응답에 `dup: true`,
+    패널을 다시 열어 응답을 모르면 `duplicate`). `heartbeat.json` 2초마다: `{v, at, state: "on", panel, host(30초마다 ping, 적용 중에는 묻지 않음), build, extPath,
+    coreHash(= status와 같은 _coreHash: 설치된 app.js core region의 fnv1a32), seqId, seqName, projKey, seqKey, keysResolved, busy, processing, pendingApproval(승인 대기 수),
+    suggestions, rows, pollMs, beatMs}`. 상단 `#aiLinkChk` 'AI 연결 허용'은 기본 꺼짐이고 꺼져 있으면 폴더를 읽지도 쓰지도 않는다.
+    끌 때 한 번 `{state: "off"}`, 켠 채 패널을 닫으면(unload) `{state: "closed"}`를 쓴다 — 서버가 '꺼짐'과 '닫힘'을 가려 알리게 (spec의 'heartbeat 없음'을 이렇게 읽었다).
+    켠 상태는 패널 localStorage(`MI_aiLink`, DEV는 접두사가 바뀐다)에 남아 다시 열면 켜진다. 오래된 응답(5분)·쓰다 만 tmp(2분)는 heartbeat가 지운다.
+    node 쪽 클라이언트는 의존성 없는 `mcp/lib/bridge.js`(checkPanel: off·closed·낡음·없음, call: 시간 초과면 가져가지 않은 명령을 거둔다) — 서버·테스트·하드 케이스가 같이 쓴다.
+    테스트: `tests/unit/panel_inbox.test.js`(하네스, 메모리 fs), `tests/unit/mcp_bridge.test.js`(진짜 임시 폴더로 하네스 패널과 왕복), 하드 `s5_inbox`.
 - M5.2 읽기 도구 + find_row, 설치본 core 로드, 해시 확인
 - M5.3 제안
 - M5.4 승인 카드
