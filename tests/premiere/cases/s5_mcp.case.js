@@ -99,6 +99,7 @@ async function run(api) {
 
 			// (3) get_rows
 			r = await call("get_rows", { speaker: "C2", count: 5 });
+			if (!r.json || !Array.isArray(r.json.rows)) throw new Error("get_rows 결과: " + String(r.text).slice(0, 600));
 			assert.deepEqual([r.json.total, r.json.rows.length], [12, 5]);
 			assert.deepEqual(r.json.rows.map((x) => x.text), fx.c2.slice(0, 5).map((x) => x[2]));
 			r = await call("get_rows", { from: 24, count: 50 });

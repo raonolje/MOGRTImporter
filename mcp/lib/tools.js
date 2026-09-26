@@ -221,18 +221,18 @@ function createToolbox(o) {
 			if (a.speaker !== undefined) args.spk = a.speaker;
 			if (a.from !== undefined) args.from = a.from;
 			if (a.filter !== undefined) args.filter = a.filter;
-			// seq_id는 heartbeat의 시퀀스: 패널이 지금도 그 시퀀스일 때만 읽는다 (그 사이 바뀌었으면 seq-mismatch —
-			// 다른 시퀀스의 줄에 옛 seq_id가 붙으면 화자 없는 목록의 uid(줄 번호)가 돌아온 시퀀스의 줄에 맞아 버린다)
-			const seq_id = String(ctx.hb.seqId || "");
-			return ok(Object.assign({ seq_id }, await panel(ctx, "rows", args, { seqId: seq_id })));
+			// seq_id는 패널이 이 명령을 처리한 그때의 시퀀스(응답의 seqId)다. heartbeat 값은 2초까지 늦어서
+			// 시퀀스를 막 바꾼 뒤에는 틀릴 수 있다(하드 s5_mcp에서 seq-mismatch로 실측). 옛 패널이면 heartbeat 값으로 대신한다
+			const resp = await panel(ctx, "rows", args, { raw: true });
+			return ok(Object.assign({ seq_id: String(resp.seqId || ctx.hb.seqId || "") }, resp.data));
 		});
 	def("find_row", "줄 찾기",
 		"사람이 말한 줄 주소('#12', '12', 'C2·12', '#12 T2')를 지금 목록의 줄로 바꾼다 → seq_id, uid, label, text(캡션 문장), fields, sig(field_sig), 필드를 적었으면 field {fid, displayName, value, caption}. 쓰기 전에 사용자에게 문장을 확인한다.",
 		obj({ label: str("줄 주소. 예: '#12', 'C2·12', '#12 T2' (다화자에서 번호가 겹치면 화자를 붙인다)") }, ["label"]), READ,
 		async (a, ctx) => {
 			await panelUp(ctx);
-			const seq_id = String(ctx.hb.seqId || ""); // get_rows와 같다
-			return ok(Object.assign({ seq_id }, await panel(ctx, "resolve", { label: a.label }, { seqId: seq_id })));
+			const resp = await panel(ctx, "resolve", { label: a.label }, { raw: true }); // seq_id는 get_rows와 같다 (응답의 seqId)
+			return ok(Object.assign({ seq_id: String(resp.seqId || ctx.hb.seqId || "") }, resp.data));
 		});
 	def("get_suggestions", "제안 대기열",
 		"패널의 AI 제안 대기열: 줄·필드·값·by·ok(지금 검증 통과)·stale(캡션·구조가 바뀌어 다시 확인 필요)·check(확인 문구). 사용자가 패널에서 [적용]하기 전에는 아무것도 바뀌지 않는다.",

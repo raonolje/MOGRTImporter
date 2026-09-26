@@ -11854,7 +11854,8 @@ var modalState = {
 		return "";
 	}
 	function _aiRespond(fs, dir, id, op, resp) {
-		const out = Object.assign({ v: 1, id, op: op || "", at: Date.now() }, resp || _cmdErr("exception", "응답 없음"));
+		// seqId: 명령을 처리한 그때의 패널 시퀀스 (heartbeat는 2초까지 늦을 수 있어, 읽기 결과의 시퀀스 표시는 이 값을 쓴다)
+		const out = Object.assign({ v: 1, id, op: op || "", at: Date.now(), seqId: state.currentSequenceId || "" }, resp || _cmdErr("exception", "응답 없음"));
 		try {
 			_aiWriteJson(fs, dir + "/outbox/" + id + ".json", out);
 		} catch (e) {

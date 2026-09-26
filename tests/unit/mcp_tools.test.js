@@ -113,7 +113,7 @@ test("쓰기 도구(M5.3): suggest_fields·set_cast_proposal — readOnlyHint·d
 });
 
 // ── M5.1~M5.3 리뷰: 다리(B)를 흉내 내고 도구가 패널에 무엇을 보내는지 본다 ──
-test("도구 → 패널 (다리 흉내): get_rows·find_row는 heartbeat의 seq_id로 읽는다(그 사이 바뀌면 seq-mismatch), 빈 seq_id도 쓰기 명령에 싣는다, 패널이 모르는 명령은 panel-version-mismatch", async () => {
+test("도구 → 패널 (다리 흉내): get_rows·find_row는 seq_id 없이 읽고 응답의 seqId(처리한 그때의 시퀀스)로 표시한다, 빈 seq_id도 쓰기 명령에 싣는다, 패널이 모르는 명령은 panel-version-mismatch", async () => {
 	const B = require("../../mcp/lib/bridge");
 	const orig = { checkPanel: B.checkPanel, call: B.call };
 	const hb = { v: 1, state: "on", at: Date.now(), seqId: "seq-A", extPath: path.join(ROOT, "extension"), coreHash: regionHash("src/mi/core.ts") };
@@ -124,7 +124,7 @@ test("도구 → 패널 (다리 흉내): get_rows·find_row는 heartbeat의 seq_
 	B.checkPanel = async () => ({ ok: true, hb, age: 0 });
 	B.call = async (dir, op, args, opts) => {
 		sent.push({ op, seqId: opts.seqId });
-		const head = { v: 1, id: "m-1", op, at: Date.now() };
+		const head = { v: 1, id: "m-1", op, at: Date.now(), seqId: panelSeq };
 		if (opts.seqId !== undefined && String(opts.seqId) !== panelSeq) return Object.assign(head, { ok: false, error: "seq-mismatch", detail: "지금 시퀀스: " + panelSeq });
 		if (!Object.prototype.hasOwnProperty.call(known, op)) return Object.assign(head, { ok: false, error: "bad-args", detail: "모르는 명령: " + op });
 		return Object.assign(head, { ok: true, data: known[op] });
@@ -136,12 +136,12 @@ test("도구 → 패널 (다리 흉내): get_rows·find_row는 heartbeat의 seq_
 		assert.deepEqual([!!r.isError, J(r).seq_id], [false, "seq-A"]);
 		r = await box.call("find_row", { label: "#12 T2" });
 		assert.deepEqual([!!r.isError, J(r).seq_id, J(r).uid], [false, "seq-A", "12"]);
-		assert.deepEqual(sent.map((m) => [m.op, m.seqId]), [["rows", "seq-A"], ["resolve", "seq-A"]], "읽기도 heartbeat의 seq_id를 싣는다");
-		// heartbeat(seq-A) 뒤 패널이 seq-B로 바뀌었다 → B의 줄에 seq_id A가 붙지 않고 seq-mismatch
+		assert.deepEqual(sent.map((m) => [m.op, m.seqId]), [["rows", undefined], ["resolve", undefined]], "읽기는 seq_id를 싣지 않는다");
+		// heartbeat(seq-A)가 늦은 사이 패널이 seq-B로 바뀌었다 → 읽기는 되고, B의 줄에는 응답의 seq-B가 붙는다 (heartbeat의 A가 아니다)
 		panelSeq = "seq-B";
 		for (const [name, args] of [["get_rows", {}], ["find_row", { label: "#12" }]]) {
 			r = await box.call(name, args);
-			assert.deepEqual([r.isError, J(r).code], [true, "seq-mismatch"], name);
+			assert.deepEqual([!!r.isError, J(r).seq_id], [false, "seq-B"], name);
 		}
 		// 빈 seq_id: 그대로 싣는다 → 패널(seq-B)이 거절한다
 		sent.length = 0;
