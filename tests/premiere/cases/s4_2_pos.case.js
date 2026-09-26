@@ -191,6 +191,8 @@ module.exports = {
 				await H.waitFor(panel, "(() => { const s = " + SNAP + "; return s.subtitles.every((x) => (s.rowStates[x.id]._allParams || []).length > 0); })()", { timeoutMs: 120000, what: "줄 속성" });
 				// 이 프로젝트의 cast_defaults에 위치가 남아 있으면 '변경 안 함'으로 시작한다
 				for (const K of ["C1", "C2", "C3"]) assert.equal(await panel(pageSetPos(K, "")), "");
+				// 쌓기는 기본으로 켜져 있다(2026-09-26 사용자 결정) → (0)~(4)는 쌓기 없이 보고, (5)에서 켠다
+				assert.equal(await panel(pageStack(false)), false, "쌓기 끔으로 시작");
 				await panel(H.PAGE_UNCHECK_ALL);
 
 				// ═══ (0) 위치 '변경 안 함' ▶ → Motion 그대로 ═══
