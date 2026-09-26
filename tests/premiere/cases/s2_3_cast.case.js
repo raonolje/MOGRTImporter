@@ -193,10 +193,19 @@ module.exports = {
 				log("(7)(8) 단일 화자: 화자 표 없음, v27 줄 모양, 되살리기 자리 v27");
 			});
 		} finally {
-			await panel(H.pageSetMiCast(null));
-			if (defBefore) fs.writeFileSync(defPath, defBefore);
-			else if (fs.existsSync(defPath)) fs.unlinkSync(defPath);
-			log("cast_defaults.json 되돌림: " + (defBefore ? "시작 전 내용" : "지움 (시작 전에는 없었다)"));
+			// 파일을 먼저 되돌린다: 패널 호출(CDP)이 실패해도 DEV 캐시의 프로젝트 파일은 제자리로 (S3-4 리뷰, s3_4_e2e와 같은 순서)
+			try {
+				if (defBefore) fs.writeFileSync(defPath, defBefore);
+				else if (fs.existsSync(defPath)) fs.unlinkSync(defPath);
+				log("cast_defaults.json 되돌림: " + (defBefore ? "시작 전 내용" : "지움 (시작 전에는 없었다)"));
+			} catch (e) {
+				log("경고: cast_defaults.json을 되돌리지 못했다 — " + e.message);
+			}
+			try {
+				await panel(H.pageSetMiCast(null));
+			} catch (e) {
+				log("경고: 다화자 기본값 되돌리기 실패 — " + e.message);
+			}
 		}
 	}
 };

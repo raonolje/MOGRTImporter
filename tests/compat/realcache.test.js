@@ -331,3 +331,188 @@ test("운영 캐시 (S3-4): 레거시 목록을 화자로 나눈다 — 세션 �
 	}
 	t.diagnostic("나눈 세션 " + sessions + "개, 줄 " + rows + "개 (시작·문장 중복 " + dups + "개, 확인 필요 " + ambiguous + "개, 휴지통 항목 배정 " + trashAssigned + "개)");
 });
+
+test("운영 캐시 (S3-4 (8), 하드 s3_4_real 준비): 같은 규칙으로 고른 세션을 작업 파일로 불러오고(다른 시퀀스 → id 새로) 번갈아 C1·C2 합성 SRT를 가져오면 분배 창이 뜨고 짝 없는 줄 없이 줄마다 제 화자, 프리셋·후반 작업 그대로", { skip }, async (t) => {
+	// 하드 케이스는 DEV 캐시(--seed-cache로 복사한 운영 캐시)에서 같은 함수로 세션을 고르고, 같은 작업 파일·같은 SRT를 CDP로 넣은 뒤
+	// ▶로 T_ 스크래치 시퀀스에 놓는다. 여기서는 Premiere 없이 그 앞까지(패널 전체 + 메모리 cep.fs) — 분배 결과가 하드의 전제다
+	const core = loadRegions(["src/mi/core.ts"]);
+	const RS = require("../premiere/lib/realSessions");
+	const { srtOf } = require("../premiere/lib/hard");
+	const FT = 10594584000; // 23.976 (T_23976)
+	let sessions = 0;
+	let rows = 0;
+	let amb = 0;
+	let changed = 0;
+	let clamped = 0;
+	let zero = 0;
+	for (const s of RS.seededSessions(ROOT)) {
+		const where = s.proj + "/" + s.seq.slice(-8);
+		const { work, rows: n, capped } = RS.workOf(s, RS.MAX_ROWS);
+		const h = await bootPanel({ seq: FAKE_SEQ, files: { [P.presets(FAKE_PROJ)]: s.presetsText } });
+		await h.advance(1000);
+		await h.dropWork("s3_4_real.json", work);
+		let snap = h.snapshot();
+		assert.equal(snap.subtitles.length, n, where + ": 불러온 줄 수");
+		assert.equal(snap.mi.remapped, true, where + ": 다른 시퀀스의 작업 (id 새로)");
+		const pidOf = (rs) => (rs && rs.presetId && s.presets[rs.presetId] ? rs.presetId : "");
+		assert.deepEqual(snap.subtitles.map((x) => pidOf(snap.rowStates[x.id])), work.subtitles.map((x) => pidOf(work.rowStates[x.id])), where + ": 줄마다 프리셋 그대로");
+		const before = {};
+		const pidBefore = {};
+		snap.subtitles.forEach((x) => {
+			before[x.id] = JSON.stringify(snap.rowStates[x.id]._allParams || []);
+			pidBefore[x.id] = pidOf(snap.rowStates[x.id]);
+		});
+		const sp = RS.splitByTurn(snap.subtitles, core.normText);
+		await h.dropSrts([{ name: "C1.srt", content: srtOf(sp.cues.C1) }, { name: "C2.srt", content: srtOf(sp.cues.C2) }]);
+		assert.ok(h.$("importModal").classList.contains("open"), where + ": 가져오기 창");
+		assert.equal(h.$("impLegacyMode").value, "split", where + ": 분배 모드");
+		const info = h.$("impLegacyInfo").textContent;
+		assert.ok(info.indexOf("기존 목록 (화자 없음, " + n + "줄) → ") === 0, where + ": " + info);
+		assert.doesNotMatch(info, /짝 없음/, where + ": 짝 없는 줄 없음");
+		const a = h.$("impAmbList").querySelectorAll(".imp-amb").length;
+		h.$("impOk").click();
+		await h.flush();
+		snap = h.snapshot();
+		assert.equal(snap.subtitles.length, n, where + ": 줄 수 그대로");
+		const wrong = snap.subtitles.filter((x) => x.spk !== sp.keyOf[x.id]).length;
+		assert.ok(snap.subtitles.every((x) => x.spk === "C1" || x.spk === "C2"), where + ": 줄마다 화자");
+		assert.ok(wrong <= a, where + ": 제 화자가 아닌 줄 " + wrong + "개 (확인 필요 " + a + "개까지)");
+		snap.subtitles.forEach((x) => {
+			const rs = snap.rowStates[x.id];
+			assert.ok(rs && pidOf(rs) === pidBefore[x.id], where + " id " + x.id + ": 프리셋");
+			// 캡션 필드는 병합이 SRT 문장으로 다시 쓸 수 있다 (태그 지우기 등). 캡션이 아닌 속성은 그대로
+			const preset = rs.presetId ? s.presets[rs.presetId] : null;
+			const f = preset ? core.resolveFid(JSON.parse(before[x.id]), core.captionFid(preset), preset.params) : null;
+			const strip = (l) => l.filter((p) => p && (!f || p.index !== f.index));
+			assert.equal(JSON.stringify(strip(rs._allParams || [])), JSON.stringify(strip(JSON.parse(before[x.id]))), where + " id " + x.id + ": 캡션이 아닌 속성");
+			if (rs.mm) changed++;
+		});
+		// ▶가 놓을 프레임 (화자 안 겹침은 앞 줄 끝을 맞추고, 길이가 0이면 건너뛴다)
+		const fr = core.speakerFrames(snap.subtitles, FT);
+		Object.keys(fr).forEach((id) => { if (fr[id].zero) zero++; else if (fr[id].clamped) clamped++; });
+		noErrors(h, where);
+		t.diagnostic(where + ": " + n + "줄" + (capped ? " (앞 " + RS.MAX_ROWS + "줄만)" : "") + ", C1 " + sp.cues.C1.length + " · C2 " + sp.cues.C2.length + ", 확인 필요 " + a);
+		sessions++;
+		rows += n;
+		amb += a;
+	}
+	t.diagnostic("세션 " + sessions + "개, 줄 " + rows + "개 (확인 필요 " + amb + "개, 병합 표시가 붙은 줄 " + changed + "개, 화자 안 겹침으로 끝을 맞출 줄 " + clamped + "개, 길이 0 " + zero + "개)");
+});
+
+test("운영 캐시 (S3-4 (8), premiereSim): 하드 s3_4_real과 같은 흐름 — 실제 세션을 불러와 C1·C2로 나누고 ▶ → 줄마다 화자별 프레임 ±1프레임, 화자마다 트랙 하나, 다시 계획 0개 (Premiere 없이)", { skip }, async (t) => {
+	// 가짜 Premiere(premiereSim)의 템플릿은 실제 프리셋의 지금 속성 목록(이름·순서·기본값)으로 만든다. 옛 구조 줄은 이름으로 쓴다.
+	// 네이티브 프리셋 줄이 있는 세션은 굽기(실제 .mogrt)가 필요해 여기서는 건너뛰고 수만 센다 (하드 케이스는 놓는다)
+	const core = loadRegions(["src/mi/core.ts"]);
+	const RS = require("../premiere/lib/realSessions");
+	const { srtOf } = require("../premiere/lib/hard");
+	const { createSim, FT, aeTextValue } = require("../lib/premiereSim");
+	const HOST_FNS = ["ping", "getTracks", "readClipTexts", "ensureVideoTracks", "placeChunk", "removeClips"];
+	const F = FT.f23976;
+	const tplParams = (preset) => preset.params.slice().sort((a, b) => a.index - b.index).map((p) => {
+		const ty = String(p.type || "").toLowerCase();
+		if (ty === "text") return { displayName: p.displayName, value: typeof p.rawValue === "string" && p.rawValue.indexOf("\"textEditValue\"") !== -1 ? p.rawValue : aeTextValue(p.value) };
+		if (ty === "color") return { displayName: p.displayName, value: Number(p.rawValue) || 4294967295 };
+		if (ty === "boolean") return { displayName: p.displayName, value: String(p.value) === "true" };
+		const v = Number(p.value);
+		return { displayName: p.displayName, value: String(p.value == null ? "" : p.value) !== "" && isFinite(v) ? v : String(p.value == null ? "" : p.value) };
+	});
+	const settle = async (h) => {
+		for (let i = 0; i < 4000; i++) {
+			await h.flush();
+			if (h.$("preflightModal").classList.contains("open") || !h.win._mogrtDebug.miBusy()) return;
+		}
+		throw new Error("적용이 끝나지 않았다");
+	};
+	let sessions = 0;
+	let placedAll = 0;
+	let nativeSkipped = 0;
+	for (const s of RS.seededSessions(ROOT)) {
+		const where = s.proj + "/" + s.seq.slice(-8);
+		const { work, rows: n } = RS.workOf(s, RS.MAX_ROWS);
+		const used = {};
+		work.subtitles.forEach((x) => {
+			const rs = work.rowStates[x.id];
+			if (rs && rs.presetId && s.presets[rs.presetId]) used[rs.presetId] = s.presets[rs.presetId];
+		});
+		if (Object.keys(used).some((id) => core.isNativeList(used[id].params))) {
+			nativeSkipped++;
+			t.diagnostic(where + ": 네이티브 프리셋 줄이 있어 건너뜀 (하드 케이스 몫)");
+			continue;
+		}
+		const sim = createSim();
+		const seq = sim.addSequence({ name: FAKE_SEQ.seqName, id: FAKE_SEQ.seqId, ft: F, tracks: 7 });
+		const tpls = {};
+		Object.keys(used).forEach((id) => {
+			const m = used[id].mogrtPath;
+			if (tpls[m]) return;
+			tpls[m] = true;
+			sim.addTemplate(m, { kind: "ae", name: used[id].name, params: tplParams(used[id]) });
+		});
+		const h = await bootPanel({ seq: FAKE_SEQ, files: { [P.presets(FAKE_PROJ)]: s.presetsText } });
+		HOST_FNS.forEach((fn) => {
+			h.host.handlers["MI_" + fn] = (json) => sim.callRaw("MI_" + fn, json === undefined ? undefined : JSON.stringify(json));
+		});
+		await h.advance(1000);
+		h.$("trackSel").value = "2";
+		h.change(h.$("trackSel"));
+		await h.dropWork("s3_4_real.json", work);
+		let snap = h.snapshot();
+		const sp = RS.splitByTurn(snap.subtitles, core.normText);
+		await h.dropSrts([{ name: "C1.srt", content: srtOf(sp.cues.C1) }, { name: "C2.srt", content: srtOf(sp.cues.C2) }]);
+		h.$("impOk").click();
+		await h.flush();
+		// 하드 케이스와 같이: 줄 상태의 체크를 풀고 ▶ (점검 창이 뜨면 [적용])
+		if (Object.values(h.snapshot().rowStates).some((rs) => rs && rs.checked)) h.$("btnToggleSelect").click();
+		h.$("btnApply").click();
+		await settle(h);
+		let pf = null;
+		if (h.$("preflightModal").classList.contains("open")) {
+			pf = h.$("pfSummary").querySelectorAll(".pf-line").map((e) => e.textContent);
+			h.$("pfOk").click();
+			await settle(h);
+		}
+		const status = h.status().text;
+		assert.doesNotMatch(status, /실패|중단|중지/, where + ": " + status);
+		const pl = JSON.parse(JSON.stringify(await h.win._mogrtDebug.cmd("plan", {})));
+		assert.equal(pl.ok, true, where + ": " + JSON.stringify(pl).slice(0, 300));
+		assert.deepEqual([Object.keys(pl.data.plan.ops), pl.data.plan.conflicts.length], [[], 0], where + ": 다시 계획하면 0개 " + JSON.stringify(pl.data.plan.ops));
+		const skipped = {};
+		const why = {};
+		pl.data.plan.skipped.forEach((x) => { skipped[x.id] = x.why; why[x.why] = (why[x.why] || 0) + 1; });
+		assert.deepEqual(Object.keys(why).filter((w) => ["no-preset", "zero-length", "no-caption-field", "no-params"].indexOf(w) === -1), [], where + ": 건너뛴 까닭 " + JSON.stringify(why));
+		snap = h.snapshot();
+		const salt = snap.mi.salt;
+		const scan = sim.call("MI_getTracks", { seqId: seq.id, build: "@@BUILD@@", tracks: null });
+		const idx = core.scanIndex(scan, salt);
+		assert.deepEqual([idx.stale.length, Object.keys(idx.dup).length], [0, 0], where + ": 옛 gen·같은 태그 중복 없음");
+		const want = core.speakerFrames(snap.subtitles, F);
+		const bad = [];
+		const tracksOf = {};
+		let placed = 0;
+		snap.subtitles.forEach((x) => {
+			const c = idx.current[salt + "-" + x.id];
+			if (skipped[x.id]) {
+				if (c) bad.push(x.id + " 건너뛴 줄에 클립");
+				return;
+			}
+			if (!c) { bad.push(x.id + " 클립 없음"); return; }
+			const w = want[x.id];
+			if (Math.abs(c.sf - w.sf) > 1 || Math.abs(c.ef - w.ef) > 1) bad.push(x.id + " " + c.sf + "~" + c.ef + " / " + w.sf + "~" + w.ef);
+			(tracksOf[x.spk] = tracksOf[x.spk] || {})[c.track] = true;
+			placed++;
+		});
+		assert.deepEqual(bad, [], where + ": 줄마다 화자별 프레임 ±1");
+		assert.equal(Object.keys(idx.own).length, placed, where + ": 남은 우리 클립 없음");
+		assert.deepEqual(Object.keys(tracksOf.C1 || { 2: true }), ["2"], where + ": C1은 기본 트랙 V3");
+		assert.ok(!tracksOf.C2 || (Object.keys(tracksOf.C2).length === 1 && !tracksOf.C2[2]), where + ": C2는 자기 트랙 하나");
+		seq.tracks.forEach((tr, ti) => {
+			const c = tr.clips.slice().sort((a, b) => a.s - b.s);
+			for (let i = 1; i < c.length; i++) assert.ok(c[i - 1].e <= c[i].s, where + ": V" + (ti + 1) + " 겹침");
+		});
+		noErrors(h, where);
+		t.diagnostic(where + ": " + n + "줄 → 놓음 " + placed + (pf ? " · 점검 창 " + pf.length + "줄" : "") + " · 건너뜀 " + JSON.stringify(why) + " · " + status);
+		sessions++;
+		placedAll += placed;
+	}
+	t.diagnostic("세션 " + sessions + "개 적용 (네이티브라 건너뜀 " + nativeSkipped + "), 놓은 줄 " + placedAll + "개");
+});

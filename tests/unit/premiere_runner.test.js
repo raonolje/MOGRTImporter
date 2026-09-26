@@ -8,7 +8,8 @@ const path = require("node:path");
 const { checkGuard, guard, GuardError } = require("../premiere/lib/guard");
 const { Cdp, checkPort, checkProdFile, pickTarget, parseCliArgs } = require("../premiere/cdp");
 const R = require("../premiere/run");
-const { caseFiles } = require("../premiere/suite");
+const { caseFiles, failHint } = require("../premiere/suite");
+const H = require("../premiere/lib/hard");
 
 const SMOKE = path.join(__dirname, "..", "premiere", "smoke.expr.txt");
 const TEST_PROJ = "C:\\Users\\RAONOLJE\\Documents\\MI_test\\MI_test.prproj";
@@ -243,4 +244,62 @@ test("Cdp.reload: load 이벤트를 기다리고 그동안의 콘솔을 돌려�
 	const c = new Cdp(ws, { url: "x" }, { timeoutMs: 1000 });
 	const logs = await c.reload({ settleMs: 0 });
 	assert.deepEqual(logs, ["[log] \"부팅\"", "[EXCEPTION] TypeError: x"]);
+});
+
+test("suite failHint: 시간 초과(케이스 대기·CDP)에만 모달 안내를 붙인다", () => {
+	assert.match(failHint("시간 초과(240000ms): 화자별 적용이 끝나지 않았다 — 마지막 문구: 배치 중 전체 3/120"), /모달/);
+	assert.match(failHint("시간 초과(30000ms): 검수 창 — 마지막 값: null"), /모달/);
+	assert.match(failHint("시간 초과(120000ms): Runtime.evaluate"), /모달/);
+	assert.equal(failHint("V3 클립 수: 2 !== 3"), null);
+	assert.equal(failHint(undefined), null);
+});
+
+test("hard miApplyButton (S3-4 리뷰): 끝나지 않으면 '시간 초과(…ms)' 문구에 마지막 진행·워치독 문구를 싣고 스위트가 모달 안내를 붙인다", async () => {
+	const seen = [];
+	// ExtendScript가 막혀도 페이지는 돈다: 바쁨이 풀리지 않고 워치독 문구가 보인다
+	const panel = async (expr) => {
+		seen.push(expr);
+		if (expr === H.PAGE_MI_APPLY_STATE) return { pf: null, busy: true, text: "화자별 배치 중… 전체 8/120", watch: "Premiere에 대화상자가 떠 있을 수 있습니다", confirm: null };
+		if (expr === H.PAGE_STATUS) return { text: "", cls: "" };
+		return true;
+	};
+	let err = null;
+	try {
+		await H.miApplyButton({ panel }, null, { timeoutMs: 20 });
+	} catch (e) {
+		err = e;
+	}
+	assert.ok(err, "시간이 넘으면 실패한다");
+	assert.match(err.message, /^시간 초과\(20ms\): 화자별 적용이 끝나지 않았다 — 마지막 문구: 화자별 배치 중… 전체 8\/120 · 워치독: Premiere에 대화상자가 떠 있을 수 있습니다$/);
+	assert.match(failHint(err.message), /모달/);
+	assert.ok(seen.some((x) => /btnApply/.test(x)), "▶를 눌렀다");
+});
+
+test("hard miApplyButton: 점검 창 대신 확인창(체크된 줄)이 뜨면 [취소]로 닫고 그 문구로 실패한다. 점검 창이면 onPf 뒤 [적용]", async () => {
+	const clicks = [];
+	let n = 0;
+	const panel1 = async (expr) => {
+		if (/click\(\)/.test(expr)) clicks.push(expr);
+		if (expr === H.PAGE_MI_APPLY_STATE) return { pf: null, busy: false, text: "", watch: "", confirm: "3개 자막이 선택되어 있습니다." };
+		return true;
+	};
+	await assert.rejects(H.miApplyButton({ panel: panel1 }, null, { timeoutMs: 1000 }), /확인창을 띄웠다 \(체크된 줄\?\): 3개 자막이 선택되어 있습니다\./);
+	assert.ok(clicks.some((x) => /confirmNo/.test(x)), "[취소]");
+	clicks.length = 0;
+	const pfs = [];
+	const panel2 = async (expr) => {
+		if (/click\(\)/.test(expr)) clicks.push(expr);
+		if (expr === H.PAGE_MI_APPLY_STATE) {
+			n++;
+			if (n === 1) return { pf: { lines: ["배치 2줄: C1 철수 V3 1 · C2 영희 V4 1"] }, busy: true, text: "", watch: "", confirm: null };
+			if (n === 2) return { pf: null, busy: true, text: "화자별 배치 중… 전체 2/2", watch: "", confirm: null };
+			return { pf: null, busy: false, text: "", watch: "", confirm: null };
+		}
+		if (expr === H.PAGE_STATUS) return { text: "화자별 배치: 놓음 2", cls: "ok" };
+		return true;
+	};
+	const r = await H.miApplyButton({ panel: panel2 }, async (pf) => pfs.push(pf.lines[0]), { timeoutMs: 5000 });
+	assert.deepEqual(pfs, ["배치 2줄: C1 철수 V3 1 · C2 영희 V4 1"]);
+	assert.ok(clicks.some((x) => /pfOk/.test(x)), "[적용]");
+	assert.deepEqual([r.status.text, r.progress], ["화자별 배치: 놓음 2", ["화자별 배치 중… 전체 2/2"]]);
 });

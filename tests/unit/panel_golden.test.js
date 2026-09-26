@@ -1,10 +1,12 @@
 "use strict";
 // 단일 화자 골든 (패널 전체): SRT 하나 → 프리셋 → ▶ 가 v27과 같은 호스트 페이로드와 같은 session.json을 만든다.
 // 이 테스트는 v27 app.js(git tag v27)에서도 그대로 통과해야 한다 — 단일 화자 경로가 바뀌지 않았다는 증거다.
+// ↑(한 줄 갱신)는 같은 흐름을 v27 app.js와 나란히 돌려 비교한다 (S3-4 리뷰: spec (1) 'import, preset, apply, ↑').
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const { bootPanel, cachePaths: P } = require("../lib/panelHarness");
 const { build } = require("../fixtures/presets_synth");
 
@@ -63,4 +65,58 @@ test("단일 화자: SRT → 프리셋 → ▶ 페이로드와 session.json이 v
 	assert.deepEqual(h.fs.readJson(P.settings(PROJ, A.seqId)), { trackValue: "3" });
 	const errs = h.errors().map((e) => String(e.message || e).slice(0, 300));
 	assert.deepEqual(errs, []);
+});
+
+// ↑ (한 줄 갱신, v27 updateClipAtTime): 같은 흐름을 지금 app.js와 v27 app.js(git tag v27)에서 돌려 호스트 호출·session.json이 같은지 본다
+function v27Src() {
+	return execFileSync("git", ["show", "v27:extension/html/js/app.js"], { cwd: path.join(__dirname, "..", ".."), encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+}
+async function upFlow(appSrc) {
+	const { presets } = build();
+	const p3 = presets.preset_3;
+	const h = await bootPanel({
+		seq: A,
+		appSrc,
+		mogrts: [{ name: p3.name, path: p3.mogrtPath }],
+		files: { [P.presets(PROJ)]: { presets: { preset_3: p3 }, presetTrash: [], nextPresetId: 4 } }
+	});
+	h.host.handlers.updateClipAtTime = () => "SUCCESS: 클립 업데이트 완료";
+	await h.advance(1000);
+	await h.dropSrt("golden_crlf.srt", GOLDEN);
+	[1, 2, 3].forEach((i) => { h.$("sel-" + i).value = "preset_3"; h.change(h.$("sel-" + i)); });
+	h.$("trackSel").value = "3";
+	h.change(h.$("trackSel"));
+	h.$("btnApply").click();
+	await h.flush();
+	// 2번 줄 속성창의 캡션 textarea를 고치고 ↑
+	const ta = h.$("params-2").querySelectorAll(".mogrt-text-area")[0];
+	ta.value = "↑로 고친 합성 자막";
+	ta.dispatchEvent({ type: "input" });
+	h.$("row-2").querySelector(".btn-update").click();
+	await h.flush();
+	return { h, calls: h.host.calls.filter((c) => c.fn === "updateClipAtTime" || c.fn === "applyToTimeline").map((c) => [c.fn, c.args[0]]) };
+}
+
+test("단일 화자 ↑: 캡션을 고친 줄의 updateClipAtTime 페이로드·상태·session.json이 v27 app.js와 바이트까지 같다", async () => {
+	const now = await upFlow();
+	const old = await upFlow(v27Src());
+	assert.deepEqual(now.calls.map((c) => c[0]), ["applyToTimeline", "updateClipAtTime"], "▶ 한 번, ↑ 한 번");
+	assert.deepEqual(now.calls, old.calls, "호스트에 보낸 글자 그대로 (v27)");
+	const { presets } = build();
+	const p3 = presets.preset_3;
+	const params = JSON.parse(JSON.stringify(p3.params));
+	const cap = params.find((p) => p.index === p3.textParamIndex);
+	cap.value = "↑로 고친 합성 자막";
+	const raw = JSON.parse(cap.rawValue);
+	raw.textEditValue = cap.value;
+	raw.fontTextRunLength = [cap.value.length];
+	cap.rawValue = JSON.stringify(raw);
+	assert.deepEqual(JSON.parse(now.calls[1][1]), { videoTrackIndex: 3, startSec: 4.5, endSec: 6, mogrtPath: p3.mogrtPath, params }, "2번 줄 시간 그대로, 고친 캡션");
+	assert.deepEqual(now.h.status(), old.h.status(), "상태 줄");
+	assert.match(now.h.status().text, /^\[2\] 클립 업데이트 완료$/);
+	const saved = now.h.fs.readJson(P.session(PROJ, A.seqId));
+	assert.deepEqual(saved, old.h.fs.readJson(P.session(PROJ, A.seqId)), "session.json 그대로 (v27)");
+	assert.deepEqual(Object.keys(saved), ["subtitles", "rowStates", "trashBin", "nextId"]);
+	assert.deepEqual(Object.keys(saved.rowStates[2]).sort(), ["_allParams", "checked", "open", "params", "presetId"], "ap·mm 없음");
+	assert.deepEqual(now.h.errors().map((e) => String(e.message || e).slice(0, 300)), []);
 });

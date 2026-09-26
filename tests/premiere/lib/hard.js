@@ -443,6 +443,62 @@ async function safeApplyClick(api, wantN) {
 	return { confirm: c, status: st };
 }
 
+// ── 화자별 배치 ▶ (S2-4 _miApply, S3-4 케이스 공용) ──
+
+/**
+ * ▶ 진행 상태: 점검 창(열렸으면 요약 줄·빠진 줄·고친 클립 선택지), 바쁨, 진행 문구(#miBusyText), 워치독 문구(#miBusyWatch, 보일 때만),
+ * 확인창(열렸으면 문구 — 체크된 줄이 있으면 ▶가 '선택된 n개만?'을 먼저 묻는다). 점검 창 줄에는 화자 키·이름·트랙·수만 있다 (자막 문장 없음)
+ */
+const PAGE_MI_APPLY_STATE = "(() => { const m = document.getElementById('preflightModal'); let pf = null;" +
+	" if (m && m.classList.contains('open')) { const opt = (id) => { const cb = document.getElementById(id); const row = cb.closest('label');" +
+	"  return { shown: row.style.display !== 'none', checked: cb.checked, text: row.querySelector('span').textContent }; };" +
+	"  pf = { lines: Array.from(document.querySelectorAll('#pfSummary .pf-line')).map((e) => e.textContent), orphans: opt('pfOrphans'), edited: opt('pfOverwriteEdited') }; }" +
+	" const w = document.getElementById('miBusyWatch'); const cm = document.getElementById('confirmModal');" +
+	" return { pf, busy: window._mogrtDebug.miBusy(), text: (document.getElementById('miBusyText') || {}).textContent || ''," +
+	"  watch: w && w.style.display !== 'none' ? w.textContent : ''," +
+	"  confirm: cm && cm.classList.contains('open') ? document.getElementById('confirmMessage').textContent : null }; })()";
+/**
+ * 화자 줄 ▶: ▶ → (점검 창이 뜨면 onPf(창 정보) 뒤 [적용]) → 끝날 때까지. 진행 문구('… 전체 n/m')를 모은다 → {pf, status, ms, progress}.
+ * onPf가 던지면 [취소]로 닫고 다시 던진다 (패널이 적용 중으로 남지 않게). 체크된 줄이 있어 확인창이 뜨면 [취소]로 닫고 실패한다
+ * (부르는 쪽이 먼저 PAGE_UNCHECK_ALL).
+ * opts.timeoutMs(기본 240000)를 넘기면 '시간 초과(…ms): 화자별 적용 …'으로 실패한다 — Premiere 모달(메모리 경고 등)이
+ * ExtendScript를 막아도 페이지는 돌아 이 문구가 나오고, 스위트가 모달 안내를 덧붙인다. 마지막 진행·워치독 문구를 싣는다
+ */
+async function miApplyButton(api, onPf, opts = {}) {
+	const { panel } = api;
+	const limit = opts.timeoutMs || 240000;
+	await panel(PAGE_CLEAR_STATUS);
+	const t0 = Date.now();
+	await panel("document.getElementById('btnApply').click(), true");
+	let pf = null;
+	const progress = [];
+	for (;;) {
+		const st = await panel(PAGE_MI_APPLY_STATE);
+		if (st.confirm !== null && !st.busy && !pf) {
+			await panel("document.getElementById('confirmNo').click(), true");
+			throw new Error("▶가 점검 창 대신 확인창을 띄웠다 (체크된 줄?): " + st.confirm);
+		}
+		if (st.pf && !pf) {
+			pf = st.pf;
+			try {
+				if (onPf) await onPf(pf);
+			} catch (e) {
+				await panel("document.getElementById('pfCancel').click(), true");
+				throw e;
+			}
+			await panel("document.getElementById('pfOk').click(), true");
+			continue;
+		}
+		if (/전체 \d+\/\d+$/.test(st.text) && progress.indexOf(st.text) === -1) progress.push(st.text);
+		if (!st.busy && !st.pf) break;
+		if (Date.now() - t0 > limit) {
+			throw new Error("시간 초과(" + limit + "ms): 화자별 적용이 끝나지 않았다 — 마지막 문구: " + (st.text || "(없음)") + (st.watch ? " · 워치독: " + st.watch : ""));
+		}
+		await sleep(500);
+	}
+	return { pf, status: await panel(PAGE_STATUS), ms: Date.now() - t0, progress };
+}
+
 /** DEV 캐시 루트인지 확인한다 (운영 캐시에는 절대 쓰지 않는다) → 루트 */
 async function devCacheRoot(panel) {
 	const root = await panel("window._mogrtDebug.getCacheRoot()");
@@ -457,5 +513,5 @@ module.exports = {
 	PAGE_ROWS, PAGE_STATUS, PAGE_ALERT, PAGE_UNCHECK_ALL, PAGE_PRESET_OPTIONS, PAGE_MOGRT_OPTIONS, PAGE_RECORD_HOST_CALLS, PAGE_IMPORT_MODAL,
 	reloadClean, waitKeys, waitMogrts, createPresetViaModal, ensurePreset, confirmYes, waitStatus, devCacheRoot,
 	jsxTrackProps, propValue, jsxPlaceMogrt, waitConfirm, PAGE_CLEAR_STATUS, pageSelectTrack, pageCheckRow, pageTypeField,
-	srtOf, pickPresetForMogrt, loadRowsWithPreset, safeApplyClick
+	srtOf, pickPresetForMogrt, loadRowsWithPreset, safeApplyClick, PAGE_MI_APPLY_STATE, miApplyButton
 };

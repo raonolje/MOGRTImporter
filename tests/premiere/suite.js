@@ -31,6 +31,15 @@ function parse(argv) {
 	return o;
 }
 
+/**
+ * 실패 문구 뒤에 덧붙일 안내 줄 (없으면 null). 시간 초과(케이스의 '시간 초과(…ms): …'·CDP 호출 시간 초과)는 대개
+ * Premiere 모달(메모리 경고 등)이 ExtendScript를 막은 것이다 — 페이지는 돌아 케이스의 대기 루프가 먼저 끝난다
+ */
+function failHint(message) {
+	if (!/시간 초과/.test(String(message || ""))) return null;
+	return "     Premiere에 모달(메모리 경고 등)이 떠 있는지 확인 — 닫고 Premiere를 다시 시작한 뒤 이 케이스부터 (docs/TESTING.md §5)";
+}
+
 function caseFiles(filters) {
 	const dir = path.join(DIR, "cases");
 	if (!fs.existsSync(dir)) return [];
@@ -72,8 +81,8 @@ async function main(argv) {
 			} catch (e) {
 				results.push({ rel, ok: false, ms: Date.now() - t0, msg: e.message });
 				console.log("FAIL " + rel + " — " + e.message);
-				// 시간 초과는 대개 Premiere 모달(메모리 경고 등)이 ExtendScript를 막은 것이다
-				if (/시간 초과/.test(e.message)) console.log("     Premiere에 모달(메모리 경고 등)이 떠 있는지 확인 — 닫고 Premiere를 다시 시작한 뒤 이 케이스부터 (docs/TESTING.md §5)");
+				const hint = failHint(e.message);
+				if (hint) console.log(hint);
 				if (e instanceof GuardError) break; // 테스트가 시퀀스를 바꿨다면 더 진행하지 않는다
 			}
 		}
@@ -92,4 +101,4 @@ if (require.main === module) {
 	main(process.argv.slice(2)).then((code) => { process.exitCode = code; }, (e) => { console.log("FATAL " + e.stack); process.exitCode = 1; });
 }
 
-module.exports = { main, caseFiles, parse };
+module.exports = { main, caseFiles, parse, failHint };
