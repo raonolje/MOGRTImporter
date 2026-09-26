@@ -18,7 +18,8 @@
  *   - nodeId는 처음 읽을 때 발급한다 (S0-3 §3 7). 자르기(razor)는 뒤 조각에 새 nodeId, 이름은 같다 (#1b).
  *   - start·inPoint·end 대입은 그 값만 바꾼다 (S0-3 b). move(Δ)는 상대 이동, 겹침 검사 없음, 순서를 다시 매기지 않는다 (r).
  *   - remove(false,false)는 true, 두 번째는 false. 지운 클립 참조는 계속 읽힌다 (#6).
- *   - 키가 있는 속성(isTimeVarying)의 setValue·setColorValue는 무시된다 (#8, S0-3 g).
+ *   - 키가 있는 속성(isTimeVarying)의 setValue·setColorValue는 무시된다 (#8, S0-3 g). setTimeVarying 호출 수는 S.counts.setTimeVarying.
+ *   - 모든 클립에 Opacity와 Motion(Position [0.5, 0.5] = 원래 자리, Scale) 컴포넌트가 있다 (S4-1 화면 위치).
  *   - 네이티브: getMGTComponent() null, projectItem null, 이름 "Graphic", Source Text 초깃값은 한 글자 (#23, S0-3 w).
  *   - 같은 템플릿의 projectItem은 공유된다 (#7). overwriteClip(pi)은 템플릿의 oldParams(옛 구조)를 놓을 수 있다 (S0-3 x ③).
  *   - JSON은 hostscript의 ES3 폴리필을 쓴다 (vm의 JSON을 지운다 — Premiere ExtendScript에는 JSON이 없다).
@@ -87,7 +88,7 @@ function createSim(opts = {}) {
 		overwriteFails: false,
 		moveFails: false,
 		moveSkewNext: 0,
-		counts: { importMGT: 0, overwriteClip: 0, setValue: 0, nativeTextWrites: 0, addTracks: 0 }
+		counts: { importMGT: 0, overwriteClip: 0, setValue: 0, nativeTextWrites: 0, addTracks: 0, setTimeVarying: 0 }
 	};
 
 	// ── 모델 ──
@@ -185,9 +186,12 @@ function createSim(opts = {}) {
 				return true;
 			},
 			isTimeVarying: () => p.keyed,
-			setTimeVarying: (b) => { p.keyed = !!b; return true; },
-			addKey: () => true,
-			setValueAtKey: () => true,
+			setTimeVarying: (b) => { S.counts.setTimeVarying++; p.keyed = !!b; if (!b) p.keys = []; return true; },
+			// 키: 시간(ticks)과 값만 기억한다 (보간은 흉내 내지 않는다 — 키가 있으면 getValue·setValue는 지금 값 그대로)
+			addKey: (t) => { const k = ticksOf(t); p.keys = (p.keys || []).filter((x) => x.t !== k).concat([{ t: k, v: clone(p.value) }]); return true; },
+			setValueAtKey: (t, v) => { const x = (p.keys || []).find((q) => q.t === ticksOf(t)); if (x) x.v = clone(v); return true; },
+			getKeys: () => (p.keys || []).slice().sort((x, y) => x.t - y.t).map((x) => T(x.t)),
+			getValueAtKey: (t) => { const x = (p.keys || []).find((q) => q.t === ticksOf(t)); return x ? clone(x.v) : null; },
 			areKeyframesSupported: () => true,
 			getMinValue: () => (p.min === undefined ? NaN : p.min),
 			getMaxValue: () => (p.max === undefined ? NaN : p.max)
@@ -417,6 +421,16 @@ function createSim(opts = {}) {
 		keyMotion(m) {
 			const mot = m.comps.find((x) => x.matchName === "AE.ADBE Motion");
 			mot.props[0].keyed = true;
+		},
+		// 템플릿·사용자의 Opacity 키 (Position 키가 아니다)
+		keyOpacity(m) {
+			const op = m.comps.find((x) => x.matchName === "AE.ADBE Opacity");
+			op.props[0].keyed = true;
+		},
+		// Motion Position 값 [x, y] (모델)
+		posOf(m) {
+			const mot = m.comps.find((x) => x.matchName === "AE.ADBE Motion");
+			return mot ? clone(mot.props[0].value) : null;
 		},
 		// 호스트 함수 호출: payload가 있으면 패널 _callMi처럼 JSON(U+2028/2029 이스케이프) 문자열 하나로 넘긴다 → 파싱한 결과
 		callRaw(fn, argSrc) {

@@ -706,6 +706,14 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   2. isTimeVarying이면 keyframed를 돌려주고 쓰지 않는다.
   3. 아니면 setValue 후 다시 읽어 ±0.001 안인지 확인한다.
   - setTimeVarying(false)는 절대 부르지 않는다.
+  - (S4-1 구현) Position 속성 하나의 키만 본다: 템플릿의 Opacity 페이드 같은 다른 키는 막지 않는다. isTimeVarying이 예외를 던지면(키 여부를 모름) 쓰지 않고 failed.
+    받는 값은 유한한 숫자이고 ±10 안이어야 한다 (쌓기는 0 밑으로 갈 수 있지만, 그 밖은 픽셀 좌표를 잘못 보낸 것으로 보고 bad-item).
+  - (S4-1 구현) `MI_placeChunk`는 작업이 끝나 클립이 남은 결과(placed·updated·replaced·moved·adopted·partial)에만 motion을 쓰고, 결과에 `motion`(none|applied|keyframed|failed)·
+    `pos`(쓴 뒤 값)·`pos0`(기존 클립 update·adopt·move의 쓰기 전 값 — 되돌리기용)를 둔다. 위치를 쓰지 못해도 작업 상태는 바꾸지 않는다.
+    'before' 스냅숏(`MI__snapOf`: move·replace·moveRegen·legacyMove·removeClips)에 `pos`·`posKeyed`를 더했다 (옛 클립을 되놓을 때 위치도 되돌린다).
+    `MI_readClipTexts`는 `want.pos`면 `pos`·`posKeyed`를 준다.
+  - (S4-1 구현) `MI_setMotion`은 spec 상태에 `locked`(잠긴 트랙, 풀지 않는다)를 더하고, key가 uid면 이름의 태그(uid·g)를 확인한다(다르면 notFound reason tag).
+    같은 태그 클립이 둘이면(자르기) ambiguous. 결과에 쓰기 전 값 `x0`·`y0`, 예산 7초와 `done`(placeChunk와 같다), 200개 상한.
 - **재배치 클립**(moveRegen, legacyMove, replace)에는 pos를 다시 적용한다. 효과가 있는 클립은 기본적으로 다시 놓지 않는다.
 - **동시 발화 쌓기**(기본 끔): `stackLevels`로 동시에 보이는 묶음 안에서 castOrder 순서로 층을 매긴다. y = y0 − 층 × stackDy × 줄 수.
 - **테스트**: 읽기 확인, 키프레임 보존, 40개 10초 이내, 재배치 뒤 pos 재적용, 사용자 눈으로 확인.

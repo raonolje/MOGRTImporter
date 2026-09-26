@@ -855,10 +855,14 @@
 			// {minCount} → {ok, before, after, added} | add-failed
 			ensureTracks: (payload) => _callMi("ensureVideoTracks", payload),
 			// {frameTicks, budgetMs, items: [{key, op, g, track, sf, ef, keepTime, own, mogrtPath, durSec, params, name, guard, motion, removeAfter}]}
-			// → {ok, done, results: [{key, status, …, before}], damaged, dur, comps, ms}. done < items.length면 예산이 다 됐다
+			// → {ok, done, results: [{key, status, …, before, motion, pos, pos0}], damaged, dur, comps, ms}. done < items.length면 예산이 다 됐다.
+			// motion {x, y}가 있으면 작업 뒤 Position을 쓴다 (S4-1: 결과 motion none|applied|keyframed|failed)
 			placeChunk: (payload) => _callMi("placeChunk", payload),
 			// {items: [{key, track, nodeId, expectName}]} → {ok, results: [{key, status: removed|notFound|notOurs|locked|failed, before}]}
-			removeClips: (payload) => _callMi("removeClips", payload)
+			removeClips: (payload) => _callMi("removeClips", payload),
+			// ── 화면 위치 (S4-1). Motion Position만 쓴다 (0~1, MOGRT 자체 레이아웃 기준). 키가 있으면 쓰지 않는다 ──
+			// {budgetMs, items: [{key, g, track, nodeId, x, y}] (200개까지)} → {ok, done, results: [{key, status: applied|keyframed|notFound|ambiguous|locked|failed, x, y, x0, y0}], ms}
+			setMotion: (payload) => _callMi("setMotion", payload)
 		},
 
 		// 호스트 함수가 아니라 ExtendScript 식이다. 프리뷰 캡처 임시 경로용으로,
@@ -12044,7 +12048,7 @@ var modalState = {
 		return { ok: true, ping };
 	}
 	// DEV·하드 테스트 훅: 호스트 확인과 v28 호출을 패널 어댑터 그대로 부른다 (build·seqId·U+2028 이스케이프 포함).
-	// hostMi는 host.mi 그 자체 (ping·getTracks·readTexts·ensureTracks·placeChunk·removeClips)
+	// hostMi는 host.mi 그 자체 (ping·getTracks·readTexts·ensureTracks·placeChunk·removeClips·setMotion)
 	window._mogrtDebug.miHostOk = () => _miHostOk();
 	window._mogrtDebug.callMi = (name, payload) => _callMi(name, payload);
 	window._mogrtDebug.hostMi = host.mi;

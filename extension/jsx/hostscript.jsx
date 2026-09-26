@@ -2928,6 +2928,7 @@ function MI__checkItem(it) {
     if (it.params !== undefined && it.params !== null && !MI__isArr(it.params)) return "params";
     if (it.name !== undefined && it.name !== null && typeof it.name !== "string") return "name";
     if (it.guard !== undefined && it.guard !== null && !MI__isArr(it.guard)) return "guard";
+    if (it.motion !== undefined && it.motion !== null && !MI__motionOk(it.motion)) return "motion";
     return "";
 }
 /* 놓을 자리 확인 (순수). list = 트랙의 클립 [{id, s, e}] (ticks), [sfT, efT)에 놓고 [sfT, hiT)까지 덮인다 (hiT = sf + max(ef−sf, D)).
@@ -2991,6 +2992,32 @@ function MI__nextStart(list, fromT, skip) {
 function MI__saltOf(key) {
     var m = /^([a-z0-9]{4})-\d+$/.exec(String(key === null || key === undefined ? "" : key));
     return m ? m[1] : "";
+}
+
+/* ── 화면 위치의 순수 규칙 (S4-1, 계획서 §10, spec position) ── */
+
+/* Motion Position 되읽기 허용 오차 (정규화 값 0~1, MOGRT 자체 레이아웃 기준 — 화면 좌표가 아니다, Q5/Q7) */
+var MI__POS_EPS = 0.001;
+/* 받는 위치 값의 범위. 쌓기(y0 − 층 × 간격 × 줄 수)는 0 밑으로 갈 수 있지만, 이 범위를 넘으면 픽셀 좌표를 잘못 보낸 것이다 */
+var MI__POS_LIM = 10;
+/* MI_setMotion 한 번에 받는 수 상한 (패널은 40개씩 보낸다) */
+var MI__MOTION_MAX = 200;
+/* 클립이 남아 있는 결과 상태 (위치를 쓸 수 있다) */
+var MI__OK_ST = { placed: true, updated: true, replaced: true, moved: true, adopted: true, partial: true };
+
+/* 위치 값 {x, y}가 쓸 만한가 (유한한 숫자, ±MI__POS_LIM 안) */
+function MI__motionOk(m) {
+    if (!m || typeof m !== "object" || MI__isArr(m)) return false;
+    var ok = function (v) { return typeof v === "number" && isFinite(v) && v >= -MI__POS_LIM && v <= MI__POS_LIM; };
+    return ok(m.x) && ok(m.y);
+}
+/* getValue() 결과 → [x, y] (숫자 둘이 아니면 null). Position은 [x, y] 배열로 읽힌다 */
+function MI__vec2(v) {
+    if (v === null || v === undefined || typeof v === "string" || typeof v.length !== "number" || v.length < 2) return null;
+    var x = Number(v[0]);
+    var y = Number(v[1]);
+    if (!isFinite(x) || !isFinite(y)) return null;
+    return [x, y];
 }
 /* MI_PURE_END */
 
@@ -3369,8 +3396,9 @@ function MI_getTracks(payloadStr) {
 }
 
 /* 후보 클립의 무거운 읽기 (한 번에 40개까지)
-   payload {seqId, build, items: [{track, nodeId}], want: {texts, lay, deco, params}} (want가 없으면 texts·lay·deco)
-   → {ok, results: [{nodeId, found, track, sf, ef, name, kind, pin, texts?, lay?, deco?, params?}], ms}
+   payload {seqId, build, items: [{track, nodeId}], want: {texts, lay, deco, params, pos}} (want가 없으면 texts·lay·deco)
+   → {ok, results: [{nodeId, found, track, sf, ef, name, kind, pin, texts?, lay?, deco?, params?, pos?, posKeyed?}], ms}
+   pos: Motion Position [x, y] (S4-1, 없으면 null), posKeyed: 그 속성에 키가 있다.
    트랙마다 nodeId 표를 한 번만 만든다 */
 function MI_readClipTexts(payloadStr) {
     var t0 = MI__now();
@@ -3408,6 +3436,11 @@ function MI_readClipTexts(payloadStr) {
                     if (want.lay) r.lay = MI__lay(c, kind);
                     if (want.deco) r.deco = MI__deco(c);
                     if (want.params) r.params = MI__readParams(c, kind);
+                    if (want.pos) {
+                        var ps = MI__posRead(c);
+                        r.pos = ps.pos;
+                        r.posKeyed = ps.keyed;
+                    }
                 }
             }
             results.push(r);
@@ -3670,7 +3703,8 @@ function MI__readback(r, c, ti, ft, withDeco) {
     if (withDeco) r.deco = MI__deco(c);
     return kind;
 }
-/* 되돌리기용 'before' 스냅숏 {track, sf, ef, g, name, kind, m, pi, params} (m은 패널이 아는 템플릿 경로 own.m) */
+/* 되돌리기용 'before' 스냅숏 {track, sf, ef, g, name, kind, m, pi, params, pos, posKeyed} (m은 패널이 아는 템플릿 경로 own.m).
+   pos·posKeyed: Motion Position (S4-1) — 되돌리기가 옛 클립을 다시 놓을 때 위치도 되돌린다 (키가 있으면 되돌릴 수 없다) */
 function MI__snapOf(c, ti, ft, m) {
     var b = MI__brief(c, ti, ft);
     var kind = MI__kind(c);
@@ -3679,7 +3713,8 @@ function MI__snapOf(c, ti, ft, m) {
     try { pi = c.projectItem; } catch (e) { pi = null; }
     var piId = null;
     try { piId = pi ? String(pi.nodeId) : null; } catch (e2) { piId = null; }
-    return { track: ti, sf: b.sf, ef: b.ef, g: tg ? tg.g : null, name: b.name, kind: kind, m: m ? String(m) : null, pi: piId, params: MI__readParams(c, kind) };
+    var ps = MI__posRead(c);
+    return { track: ti, sf: b.sf, ef: b.ef, g: tg ? tg.g : null, name: b.name, kind: kind, m: m ? String(m) : null, pi: piId, params: MI__readParams(c, kind), pos: ps.pos, posKeyed: ps.keyed };
 }
 
 /* ── 새로 놓기: 자리 확인 → 이웃 스냅숏 → importMGT/overwriteClip → 끝 → 이웃 머리 되돌리기 ── */
@@ -4329,10 +4364,14 @@ function MI_ensureVideoTracks(payloadStr) {
 /* 배치 청크 (작업 7종). payload {seqId, build, frameTicks, budgetMs(기본 7000), items: [
      {key, op: place|update|replace|move|moveRegen|adopt|legacyMove, g, track, sf, ef, keepTime,
       own: {track, sf, nodeId, m?} | null, mogrtPath, durSec, params: [ParamDef], name: 글자 | null,
-      guard: [nodeId], motion: null, removeAfter: {track, nodeId} | null}]}
+      guard: [nodeId], motion: {x, y} | null, removeAfter: {track, nodeId} | null}]}
    → {ok, done, results: [{key, status, track, sf, ef, g, nodeId, clamped, reason, detail?, name, kind, texts, lay, pin,
-      skipped, keyed, before, motion, deco?}], damaged: [nodeId], dur: {경로: 초}, comps: {경로: 개수}, ms}
+      skipped, keyed, before, motion, pos?, pos0?, motionDetail?, deco?}], damaged: [nodeId], dur: {경로: 초}, comps: {경로: 개수}, ms}
    status: placed|updated|replaced|moved|adopted|partial|conflict|ambiguous|locked|stale-plan|misplaced|failed
+   - motion (S4-1): 작업이 끝나 클립이 남으면(OK 상태) 마지막에 Motion Position을 쓴다 (MI__motionPos). 다시 놓은 클립
+     (place·replace·moveRegen·legacyMove)은 템플릿 기본 위치에서 시작하므로 늘 다시 쓴다. 결과 motion: none(보내지 않음)|applied|
+     keyframed(키가 있어 쓰지 않음, 값 그대로)|failed, pos = 쓴 뒤 되읽은 [x, y], pos0 = 기존 클립(update·adopt·move)의 쓰기 전 값
+     (되돌리기가 쓴다). 위치를 쓰지 못해도 작업 상태는 바꾸지 않는다
    - 첫 루프: 모든 작업의 기존 클립을 찾고 'before'를 읽는다 (어떤 배치보다 먼저).
    - 둘째 루프: 작업마다 따로 try/catch. 트랙이 없으면 failed no-track(importMGT는 없는 번호를 마지막 트랙에 놓는다, #14),
      잠겼으면 locked. 예산(budgetMs)을 넘으면 새 작업을 시작하지 않는다 (done < items.length, 첫 작업은 늘 한다).
@@ -4400,6 +4439,7 @@ function MI_placeChunk(payloadStr) {
                 } else {
                     MI__opRegen(ctx, it, pr, r);
                 }
+                if (it.motion !== undefined && it.motion !== null && MI__OK_ST[r.status] === true && r.nodeId) MI__opMotion(ctx, it, r);
             } catch (e2) {
                 r.status = "failed";
                 r.reason = "exception";
@@ -4472,6 +4512,184 @@ function MI_removeClips(payloadStr) {
             results.push(r);
         }
         return MI__json({ ok: true, results: results, ms: MI__now() - t0 });
+    } catch (e2) {
+        return MI__fail("exception", MI__errText(e2));
+    }
+}
+
+/* ══ 화면 위치 (S4-1, 계획서 §10, spec position) ══
+   MOGRT에는 위치 파라미터가 없다(Q6) → 클립의 Motion 컴포넌트 Position을 쓴다. 값은 0~1 정규화이고 MOGRT 자체 레이아웃 기준이다
+   ((0.5, 0.5) = 원래 자리. 화면 좌표가 아니다: 아래에 붙는 박스 자막을 y 0.8로 옮기면 화면 밖으로 나간다, Q5/Q7).
+   - Motion은 matchName "AE.ADBE Motion"인 첫 컴포넌트, Position은 그 첫 속성이다. 현지화된 displayName("모션"·"위치")으로 찾지 않는다.
+   - 키가 있는 Position(isTimeVarying)에는 쓰지 않고 keyframed로 알린다: setValue는 true를 돌려주지만 무시되고(spike #8),
+     setTimeVarying(false)는 사용자의 키를 지운다 — 그래서 절대 부르지 않고, 강제로 쓰는 선택지도 두지 않는다.
+   - 템플릿 자체의 키(네이티브 템플릿의 Opacity 페이드 등)는 Position에 키가 없으면 막지 않는다 (Position 속성만 본다). */
+
+/* 클립의 Motion Position 속성 (없으면 null) */
+function MI__motionProp(c) {
+    var n = 0;
+    try { n = c.components.numItems; } catch (e) { return null; }
+    for (var i = 0; i < n; i++) {
+        var cp = null;
+        var mn = "";
+        try { cp = c.components[i]; mn = String(cp.matchName); } catch (e2) { continue; }
+        if (mn !== "AE.ADBE Motion") continue;
+        try { return cp.properties.numItems > 0 ? cp.properties[0] : null; } catch (e3) { return null; }
+    }
+    return null;
+}
+/* 지금 위치 → {pos: [x, y] | null, keyed} (쓰지 않는다) */
+function MI__posRead(c) {
+    var o = { pos: null, keyed: false };
+    var pr = MI__motionProp(c);
+    if (!pr) return o;
+    try { o.pos = MI__vec2(pr.getValue()); } catch (e) { o.pos = null; }
+    try { o.keyed = pr.isTimeVarying() === true; } catch (e2) { o.keyed = false; }
+    return o;
+}
+/* 위치 쓰기 → {status: applied|keyframed|failed, x, y (지금 값), x0, y0 (쓰기 전 값), detail}.
+   키가 있으면 쓰지 않는다. 키가 있는지 알 수 없어도(isTimeVarying 예외) 쓰지 않는다 — 키 있는 속성의 setValue는 조용히 무시된다.
+   쓴 뒤 다시 읽어 ±MI__POS_EPS 안이어야 applied */
+function MI__motionPos(c, x, y) {
+    var o = { status: "failed", x: null, y: null, x0: null, y0: null, detail: "" };
+    var pr = MI__motionProp(c);
+    if (!pr) {
+        o.detail = "Motion 컴포넌트 없음";
+        return o;
+    }
+    var cur = null;
+    try { cur = MI__vec2(pr.getValue()); } catch (e) { cur = null; }
+    if (cur) {
+        o.x0 = cur[0];
+        o.y0 = cur[1];
+        o.x = cur[0];
+        o.y = cur[1];
+    }
+    var tv = null;
+    try { tv = pr.isTimeVarying() === true; } catch (e1) { tv = null; }
+    if (tv === null) {
+        o.detail = "키 여부를 읽지 못함";
+        return o;
+    }
+    if (tv) {
+        o.status = "keyframed";
+        return o;
+    }
+    try {
+        pr.setValue([x, y], true);
+    } catch (e2) {
+        o.detail = MI__errText(e2);
+        return o;
+    }
+    var now = null;
+    try { now = MI__vec2(pr.getValue()); } catch (e3) { now = null; }
+    o.x = now ? now[0] : null;
+    o.y = now ? now[1] : null;
+    if (!now || Math.abs(now[0] - x) > MI__POS_EPS || Math.abs(now[1] - y) > MI__POS_EPS) {
+        o.detail = "되읽기 " + (now ? now[0] + ", " + now[1] : "없음");
+        return o;
+    }
+    o.status = "applied";
+    return o;
+}
+/* MI_placeChunk 작업 뒤 위치 (작업이 남긴 클립 r.nodeId에). 예외가 나도 작업 결과는 그대로 두고 motion만 failed */
+function MI__opMotion(ctx, it, r) {
+    try {
+        var c = MI__find(ctx, r.track, r.nodeId);
+        if (!c) {
+            r.motion = "failed";
+            r.motionDetail = "클립을 다시 찾지 못함";
+            return;
+        }
+        var m = MI__motionPos(c, Number(it.motion.x), Number(it.motion.y));
+        r.motion = m.status;
+        r.pos = m.x === null ? null : [m.x, m.y];
+        /* 기존 클립의 쓰기 전 값 (새로 놓은 클립은 템플릿 기본값이라 적지 않는다) */
+        if ((it.op === "update" || it.op === "adopt" || it.op === "move") && m.x0 !== null) r.pos0 = [m.x0, m.y0];
+        if (m.detail) r.motionDetail = m.detail;
+    } catch (e) {
+        r.motion = "failed";
+        r.motionDetail = MI__errText(e);
+    }
+}
+
+/* 위치만 쓴다 (패널 '위치만 다시 적용', 계획서 §8 ⋯ 메뉴). 속성·이름·시간은 건드리지 않는다.
+   payload {seqId, build, budgetMs(기본 7000), items: [{key, g, track, nodeId, x, y}]}
+   → {ok, done, results: [{key, status: applied|keyframed|notFound|ambiguous|locked|failed, x, y, x0, y0, reason?, detail?}], ms}
+   - 클립은 nodeId로 찾는다. key가 uid("salt-id")면 이름의 태그가 key·g와 같아야 한다 (아니면 notFound reason tag — 스캔 뒤 바뀌었다).
+     같은 태그(uid·gen) 클립이 트랙에 둘 이상이면(자르기, spike #1b) 한쪽만 옮기지 않게 ambiguous.
+   - 잠긴 트랙은 locked (풀지 않는다). x·y가 숫자가 아니면 failed bad-item.
+   - 예산(budgetMs)을 넘으면 새 항목을 시작하지 않는다 (done < items.length, 첫 항목은 늘 한다) */
+function MI_setMotion(payloadStr) {
+    var t0 = MI__now();
+    try {
+        var p = MI__parse(payloadStr);
+        var g = MI__guard(p);
+        if (g.err) return MI__fail(g.err, g.detail);
+        var items = p.items;
+        if (!MI__isArr(items)) return MI__fail("bad-payload", "items는 배열");
+        if (items.length > MI__MOTION_MAX) return MI__fail("bad-payload", "items는 " + MI__MOTION_MAX + "개까지 (" + items.length + ")");
+        var budget = typeof p.budgetMs === "number" && p.budgetMs > 0 ? p.budgetMs : 7000;
+        var ctx = MI__ctx(g.seq, MI__ft(g.seq));
+        var results = [];
+        var done = 0;
+        for (var i = 0; i < items.length; i++) {
+            if (i > 0 && MI__now() - t0 >= budget) break;
+            var it = items[i] || {};
+            var r = { key: typeof it.key === "string" ? it.key : "", status: "", x: null, y: null, x0: null, y0: null };
+            try {
+                if (!MI__isInt(it.track) || it.track < 0 || it.nodeId === undefined || it.nodeId === null || String(it.nodeId) === "" || !MI__motionOk({ x: it.x, y: it.y })) {
+                    r.status = "failed";
+                    r.reason = "bad-item";
+                } else if (!MI__track(g.seq, it.track)) {
+                    r.status = "notFound";
+                    r.reason = "no-track";
+                } else if (MI__locked(MI__track(g.seq, it.track))) {
+                    r.status = "locked";
+                } else {
+                    var c = MI__find(ctx, it.track, it.nodeId);
+                    var salt = MI__saltOf(r.key);
+                    var tg = null;
+                    if (c && salt) {
+                        try { tg = MI__parseTag(String(c.name)); } catch (e0) { tg = null; }
+                    }
+                    if (!c) {
+                        r.status = "notFound";
+                    } else if (salt && (!tg || tg.salt + "-" + tg.id !== r.key || (MI__isInt(it.g) && tg.g !== it.g))) {
+                        r.status = "notFound";
+                        r.reason = "tag";
+                        try { r.detail = String(c.name); } catch (e1) {}
+                    } else {
+                        var same = 0;
+                        if (tg) {
+                            var ix = MI__tagIndex(ctx, it.track);
+                            for (var k = 0; k < ix.length; k++) {
+                                if (ix[k].uid === r.key && ix[k].g === tg.g) same++;
+                            }
+                        }
+                        if (same > 1) {
+                            r.status = "ambiguous";
+                            r.detail = "같은 태그 클립 " + same + "개";
+                        } else {
+                            var m = MI__motionPos(c, it.x, it.y);
+                            r.status = m.status;
+                            r.x = m.x;
+                            r.y = m.y;
+                            r.x0 = m.x0;
+                            r.y0 = m.y0;
+                            if (m.detail) r.detail = m.detail;
+                        }
+                    }
+                }
+            } catch (e) {
+                r.status = "failed";
+                r.reason = "exception";
+                r.detail = MI__errText(e);
+            }
+            results.push(r);
+            done++;
+        }
+        return MI__json({ ok: true, done: done, results: results, ms: MI__now() - t0 });
     } catch (e2) {
         return MI__fail("exception", MI__errText(e2));
     }
