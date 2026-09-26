@@ -1216,6 +1216,13 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 .cast-name { width: 80px; font-size: 10px; padding: 1px 4px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #ddd; border-radius: 3px; }
 .cast-track, .cast-preset { font-size: 10px; padding: 1px 3px; background: #2a2a2a; border: 1px solid #444; color: #ccc; border-radius: 3px; }
 .cast-preset { max-width: 140px; }
+/* 화면 위치 (.cast-pos, 직접이면 .cast-x·.cast-y)와 동시 발화 쌓기 (#castStack), 4단계 */
+.cast-pos { font-size: 10px; padding: 1px 3px; background: #2a2a2a; border: 1px solid #444; color: #ccc; border-radius: 3px; max-width: 110px; }
+.cast-x, .cast-y { width: 46px; font-size: 10px; padding: 1px 3px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #ddd; border-radius: 3px; }
+#castStack { display: flex; align-items: center; gap: 4px; color: #aaa; }
+#castStack label { display: flex; align-items: center; gap: 3px; cursor: pointer; }
+#castStackDy { width: 46px; font-size: 10px; padding: 0 3px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #ddd; border-radius: 3px; }
+#castStackDy:disabled { opacity: 0.5; }
 .cast-count { margin-left: auto; color: #888; white-space: nowrap; }
 .cast-more { font-size: 11px; line-height: 1; padding: 1px 6px; background: none; border: 1px solid #3a3a3a; color: #aaa; border-radius: 3px; cursor: pointer; }
 .cast-more:hover { background: #333; color: #ddd; }
@@ -1337,6 +1344,10 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
     <div id="castBar" style="display:none;">
       <div id="castHead">
         <span id="castTitle">화자 0명</span>
+        <span id="castStack" style="display:none;" title="동시 발화 쌓기 (4단계): 같은 때 보이는 여러 화자의 자막을 화자 순서대로 위로 쌓습니다. 기본 끔">
+          <label><input type="checkbox" id="castStackChk"> 동시 발화 쌓기</label>
+          <input type="number" id="castStackDy" min="0.01" max="0.5" step="0.01" value="0.12" title="쌓기 간격: 한 줄 높이 (MOGRT 자체 배치 기준 0~1, 기본 0.12). 여러 줄 자막은 줄 수만큼 곱합니다">
+        </span>
         <button class="btn-cast-fold" id="btnCastFold" title="화자 표 접기/펼치기">접기</button>
       </div>
       <div id="castRows"></div>

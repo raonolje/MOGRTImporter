@@ -2459,13 +2459,14 @@
 				cast = mi.cast[K];
 				if (!cast) {
 					// 새 화자: 이름 = 입력 > 프로젝트 기본값(cast_defaults) > 키. 프리셋은 고른 값, 고르지 않았으면(undefined) 기본값.
-					// 색은 기본값이 다른 화자와 겹치지 않으면 그것, 아니면 비어 있는 첫 색
+					// 색은 기본값이 다른 화자와 겹치지 않으면 그것, 아니면 비어 있는 첫 색. 위치(4단계)는 기본값 (없으면 null = 건드리지 않음)
 					const dflt = c.castDefaults && c.castDefaults[K] ? c.castDefaults[K] : null;
 					const dColor = dflt && typeof dflt.color === "number" && dflt.color >= 0 && dflt.color < CAST_COLORS &&
 						!Object.keys(mi.cast).some((k) => mi.cast[k] && mi.cast[k].color === dflt.color) ? dflt.color : null;
 					const pid = presetOk(f.presetId) ? f.presetId : f.presetId === undefined && dflt && presetOk(dflt.presetId) ? dflt.presetId : "";
 					cast = { name: nm || (dflt && dflt.name) || K, track: null, autoTrack: null, presetId: pid, color: dColor !== null ? dColor : castColorFree(mi.cast),
-						file: info.name || "", path: info.path || null, size: typeof info.size === "number" ? info.size : null, mtime: typeof info.mtime === "number" ? info.mtime : null, pos: null };
+						file: info.name || "", path: info.path || null, size: typeof info.size === "number" ? info.size : null, mtime: typeof info.mtime === "number" ? info.mtime : null,
+						pos: dflt ? roundPos(dflt.pos) : null };
 					mi.cast[K] = cast;
 				} else {
 					if (nm) cast.name = nm;
@@ -3546,9 +3547,112 @@
 			return s.replace(/\r\n?/g, "\n");
 		})));
 	}
-	// 줄이 타임라인에 원하는 모습의 해시 (applied.h): 프리셋·필드 서명·쓴 속성 값·트랙·프레임·템플릿·클립 이름·위치
+	// 줄이 타임라인에 원하는 모습의 해시 (applied.h): 프리셋·필드 서명·쓴 속성 값·트랙·프레임·템플릿·클립 이름·위치.
+	// 위치(motion)는 따로 얹는다 (4단계): 위치가 없으면 v1.2(S2-4)의 해시와 같고(intentBase), 있으면 그 위에 motionHash.
+	// → 위치만 바뀐 줄은 기본 부분(applied.hb)이 같아 계획이 위치만 보낸다 (planPlacement)
+	function intentBase(o) {
+		return fnv1a32(stableJson({ p: o.presetId || "", s: o.sig || "", f: o.fh || {}, t: o.track, sf: o.sf, ef: o.ef, m: normPath(o.m), n: o.name || "", mo: null }));
+	}
+	function motionHash(hb, mo) {
+		return posOk(mo) ? fnv1a32(String(hb) + "|mo|" + stableJson(roundPos(mo))) : String(hb);
+	}
 	function intentHash(o) {
-		return fnv1a32(stableJson({ p: o.presetId || "", s: o.sig || "", f: o.fh || {}, t: o.track, sf: o.sf, ef: o.ef, m: normPath(o.m), n: o.name || "", mo: o.motion || null }));
+		return motionHash(intentBase(o), o.motion || null);
+	}
+	// ── 화면 위치 (4단계, 계획서 §10, spec position) ──
+	// 위치는 클립 Motion Position (0~1 정규화, MOGRT 자체 레이아웃 기준. (0.5, 0.5) = 원래 자리. 화면 좌표가 아니다, Q5/Q7).
+	// 화자 표 cast[K].pos: null = '변경 안 함'(기본, Motion을 건드리지 않는다) | {x, y}. 아래 선택지의 ±0.15는 S4-3에서 눈으로 맞춘다
+	const CAST_POS_CHOICES = [["orig", "원래 자리", 0.5, 0.5], ["left", "왼쪽", 0.35, 0.5], ["right", "오른쪽", 0.65, 0.5], ["top", "위", 0.5, 0.35]];
+	// 동시 발화 쌓기 간격 기본값 (줄 하나 높이, 세션마다 mi.stackDy)과 쌓은 y의 하한
+	const STACK_DY_DEFAULT = 0.12;
+	const STACK_Y_MIN = -1;
+	// 위치 값인가 {x, y} (유한한 숫자)
+	function posOk(p) {
+		return !!p && typeof p === "object" && !Array.isArray(p) && typeof p.x === "number" && isFinite(p.x) && typeof p.y === "number" && isFinite(p.y);
+	}
+	// 소수 넷째 자리로 (쌓기 계산의 부동소수 잡음이 해시를 바꾸지 않게) → {x, y} | null
+	function roundPos(p) {
+		if (!posOk(p)) return null;
+		const r = (v) => Math.round(v * 10000) / 10000;
+		return { x: r(p.x), y: r(p.y) };
+	}
+	function samePos(a, b) {
+		const ra = roundPos(a);
+		const rb = roundPos(b);
+		return ra === null || rb === null ? ra === rb : ra.x === rb.x && ra.y === rb.y;
+	}
+	// 화자 위치의 선택지 이름: "" (null = 변경 안 함) | orig | left | right | top | custom (직접)
+	function castPosKind(pos) {
+		if (!posOk(pos)) return "";
+		const hit = CAST_POS_CHOICES.find((c) => samePos(pos, { x: c[2], y: c[3] }));
+		return hit ? hit[0] : "custom";
+	}
+	// 자막 줄 수 (빈 줄은 세지 않는다, 최소 1)
+	function lineCount(text) {
+		const n = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "").length;
+		return Math.max(1, n);
+	}
+	// 동시 발화 쌓기 (#castStackChk, 기본 끔): 화자 줄의 프레임 구간(speakerFrames)을 시작 순으로 훑어 겹치는 구간이 이어진 묶음
+	// (동시에 보이는 줄들)을 만들고, 두 화자 이상인 묶음 안에서 그 묶음의 화자를 castOrder 순서로 층 0, 1, 2…에 둔다.
+	// 끝과 시작이 맞닿은 줄은 겹치지 않는다 (쌓지 않는다). 같은 화자는 한 층이다.
+	// lines = 묶음에서 줄이 가장 많은 자막의 줄 수 (y = y0 − 층 × stackDy × lines, rowMotions)
+	//   rows: 화자 줄 [sub] (spk·startSec·endSec·text, lines가 숫자면 그것을 줄 수로), cast·castOrder (castOrder에 없는 화자는 C번호 순으로 뒤에)
+	// → {줄 id: {level, lines, group}} (두 화자 이상인 묶음의 줄만)
+	function stackLevels(rows, cast, castOrder, frameTicks) {
+		const cs = cast || {};
+		const live = (rows || []).filter((s) => s && s.spk && cs[s.spk]);
+		const fr = speakerFrames(live, frameTicks);
+		const list = live.filter((s) => fr[s.id] && !fr[s.id].zero).map((s) => ({ s, sf: fr[s.id].sf, ef: fr[s.id].ef }))
+			.sort((a, b) => a.sf - b.sf || a.ef - b.ef || a.s.id - b.s.id);
+		const order = castOrder || [];
+		const rank = (K) => {
+			const i = order.indexOf(K);
+			return i === -1 ? order.length + castKeyNum(K) : i;
+		};
+		const out = {};
+		let group = [];
+		let hi = -Infinity;
+		let gi = 0;
+		const flush = () => {
+			const keys = [];
+			group.forEach((g) => { if (keys.indexOf(g.s.spk) === -1) keys.push(g.s.spk); });
+			if (keys.length >= 2) {
+				keys.sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
+				const lines = Math.max(...group.map((g) => (typeof g.s.lines === "number" && g.s.lines > 0 ? g.s.lines : lineCount(g.s.text))));
+				group.forEach((g) => { out[g.s.id] = { level: keys.indexOf(g.s.spk), lines, group: gi }; });
+				gi++;
+			}
+			group = [];
+			hi = -Infinity;
+		};
+		list.forEach((x) => {
+			if (group.length && x.sf >= hi) flush();
+			group.push(x);
+			if (x.ef > hi) hi = x.ef;
+		});
+		if (group.length) flush();
+		return out;
+	}
+	// 줄마다 원하는 위치 → {줄 id: {mo: {x, y} | null, mb: 쌓기 전 자리 | null, level}} (rows = 화자 줄 전부)
+	//   mo: 화자 위치 cast[K].pos (null = 건드리지 않는다). 쌓기가 켜져 있고 층이 1 이상이면 y = (pos.y ?? 0.5) − 층 × stackDy × lines,
+	//   x = pos.x ?? 0.5 (그때 mb = 쌓기 전 자리 {pos.x ?? 0.5, pos.y ?? 0.5} — 쌓기가 풀리면 계획이 그 자리로 되돌린다)
+	function rowMotions(rows, mi, frameTicks) {
+		const m = mi || miDefault();
+		const cast = m.cast || {};
+		const dy = typeof m.stackDy === "number" && isFinite(m.stackDy) ? m.stackDy : STACK_DY_DEFAULT;
+		const lv = m.stack === true ? stackLevels(rows, cast, m.castOrder, frameTicks) : {};
+		const out = {};
+		(rows || []).forEach((s) => {
+			if (!s || !s.spk || !cast[s.spk]) return;
+			const pos = roundPos(cast[s.spk].pos);
+			const l = lv[s.id];
+			if (l && l.level > 0) {
+				// 화면 밖으로 한참 나가도 쓸모가 없다 → STACK_Y_MIN에서 멈춘다 (호스트는 ±10 밖의 값을 받지 않는다)
+				const b = pos || { x: 0.5, y: 0.5 };
+				out[s.id] = { mo: roundPos({ x: b.x, y: Math.max(STACK_Y_MIN, b.y - l.level * dy * l.lines) }), mb: b, level: l.level };
+			} else out[s.id] = { mo: pos, mb: null, level: l ? l.level : 0 };
+		});
+		return out;
 	}
 	// 줄 → 프레임 {id: {sf, ef, clamped, zero}}: sf = frameOf(시작), ef = max(sf + 1, frameOf(끝)).
 	// 같은 화자 안에서 겹치면 앞 줄의 끝을 뒤 줄 시작에 맞춘다 (시작 순, 같은 시작이면 목록 순). 길이가 0이 되면 zero
@@ -3661,16 +3765,19 @@
 			if (id && guard.indexOf(id) === -1) guard.push(id);
 		});
 		const item = { key: op.uid, op: op.op, g: op.g, track: op.track, sf: op.sf, ef: op.ef, keepTime: !!op.keepTime, own: op.own || null,
-			mogrtPath: op.m || "", durSec: op.durSec || 0, params: op.params || [], name: op.name === undefined ? null : op.name, guard, motion: null, removeAfter: op.removeAfter || null };
+			mogrtPath: op.m || "", durSec: op.durSec || 0, params: op.params || [], name: op.name === undefined ? null : op.name, guard, motion: roundPos(op.motion), removeAfter: op.removeAfter || null };
 		return item;
 	}
-	// 결과 → applied 항목 {g, m, ls, h, fh, rh, k, t, sf, ef, cef}. prev = 그 uid의 지난 applied 항목 (없으면 undefined)
+	// 결과 → applied 항목 {g, m, ls, h, fh, rh, k, t, sf, ef, cef, (4단계) mo?, hb?, mb?}. prev = 그 uid의 지난 applied 항목 (없으면 undefined)
 	//   t·sf·ef는 줄이 원한 자리(제자리 갱신이어도), cef는 클립의 실제 끝.
 	//   효과가 있어 옮기지 않은 제자리 갱신(op.stay)은 클립이 있는 자리를 적는다 → 다음 계획도 시간 변경을 보고 decorated로 둔다
 	//   partial(키프레임·옛 버전이라 못 쓴 속성, r.skipped·r.keyed = 이름): 못 쓴 속성의 fh를 빼고 h를 비운다
 	//     → 다음 계획이 그 속성을 다시 보내고(그대로로 보지 않는다) 줄의 병합 표시(mm)도 남는다
 	//   rh(Premiere에서 고침을 보는 기준)는 텍스트를 쓴 작업(새 클립, 텍스트 속성을 보냄)일 때만 되읽은 값으로 바꾼다.
 	//     텍스트를 쓰지 않은 작업(시간만 옮김·끝만·이름만·텍스트 아닌 속성)은 prev.rh를 그대로 둔다 — 고친 문장을 우리 것으로 받아들이지 않게
+	//   위치 (4단계): mo = 클립에 있다고 보는 위치 (op.mo: 보낸 motion, 보내지 않았으면 지난 mo를 이어 받은 값), hb = 위치를 뺀 의도 해시
+	//     (mo가 있을 때만 — 없으면 h가 곧 기본 해시), mb = 쌓기 전 자리 (쌓았을 때만). 보낸 위치를 쓰지 못했으면(키가 있음·실패)
+	//     h를 비우고 mo·mb는 지난 값 → 다음 계획이 위치만 다시 보낸다 (키가 있으면 또 알린다). 위치가 없던 줄의 항목 모양은 v1.2 그대로
 	function appliedEntryOf(op, r, prev) {
 		const partial = !!r && r.status === "partial";
 		let fh = op.fhAll || {};
@@ -3682,11 +3789,12 @@
 		}
 		const wroteText = opCreates(op) || (op.params || []).some((p) => p && p.type === "text");
 		const at = op.intent && !op.stay ? op.intent : { t: op.track, sf: op.sf, ef: op.ef };
-		return {
+		const moBad = posOk(op.motion) && !!r && r.motion !== "applied";
+		const e = {
 			g: r && typeof r.g === "number" ? r.g : op.g,
 			m: op.m || "",
 			ls: clipLs(r && r.lay),
-			h: partial ? "" : op.h,
+			h: partial || moBad ? "" : op.h,
 			fh,
 			rh: !wroteText && prev && typeof prev.rh === "string" ? prev.rh : textsHash((r && r.texts) || []),
 			k: (r && r.kind) || op.kind || "",
@@ -3695,6 +3803,12 @@
 			ef: at.ef,
 			cef: r && typeof r.ef === "number" ? r.ef : op.ef
 		};
+		const mo = moBad ? (prev ? roundPos(prev.mo) : null) : roundPos(op.mo);
+		const mb = moBad ? (prev ? roundPos(prev.mb) : null) : roundPos(op.mb);
+		if (mo) e.mo = mo;
+		if (mb) e.mb = mb;
+		if (!partial && (mo || moBad) && typeof op.hb === "string" && op.hb) e.hb = op.hb;
+		return e;
 	}
 	// 새로 놓는 자리 확인 (호스트의 자리 확인 occupy와 같은 규칙, 프레임 단위). list = 트랙의 클립 [{id, sf, ef, own}]
 	// (own = 우리가 보호하고 되살릴 수 있는 클립: 머리를 되돌리는 이웃), [sf, ef)에 놓고 [sf, sf + max(ef − sf, D))까지 덮인다.
@@ -3822,13 +3936,19 @@
 	//   rows     대상 줄 [{sub, rs, preset, baked: {path, key, durSec} | null, bakeWhy, oldBaked: 전에 네이티브로 놓은 사본 경로 | null}]
 	//   allRows  살아 있는 줄 전부 [sub] (같은 화자 겹침 맞춤·화자 구간·목록에 없는 클립)
 	//   trash    {줄 id: why} 휴지통 항목 (목록에서 빠진 줄의 클립을 미리 체크할지)
-	//   mi       {salt, cast, castOrder, applied, legacyTrack}
+	//   mi       {salt, cast, castOrder, applied, legacyTrack, stack, stackDy}
 	//   base     기본 트랙 (#trackSel)
 	//   scan     호스트 getTracks 결과 {frameTicks, numVideoTracks, tracks}
 	//   details  {nodeId: readClipTexts 결과 {kind, pin, texts, lay, deco}}
 	//   durs     {normPath(템플릿): 길이 초}
 	//   opts     {adopt, adoptUncertain, adoptForeign, moveLegacy, orphans: "pre"|"all"|"none", cleanupStale, replaceMissing,
 	//             overwriteEdited, restoreMoved, moveDecorated, upgradeOld, single, forceRegen: {줄 id: true}}
+	// 화면 위치 (4단계): 줄마다 원하는 위치(rowMotions: 화자 위치·쌓기)를 작업의 motion에 싣는다.
+	//   원하는 위치가 null('변경 안 함')이면 같은 클립 작업(update·move)은 위치를 보내지 않고, 새 클립(place·replace·moveRegen·legacyMove·
+	//   순환을 끊은 놓기)과 인식(adopt)은 지난 위치(applied.mo)를 다시 보낸다 — 다시 놓은 클립은 템플릿 기본 위치에서 시작한다.
+	//   쌓았던 줄(applied.mb)이 이제 쌓이지 않으면 쌓기 전 자리로 되돌린다.
+	//   의도 해시 = 기본 해시(위치 뺌) + 위치: 위치만 바뀐 줄(applied.hb가 지금 기본 해시와 같다)은 되읽기 없이 위치만 보내는
+	//   update(속성·이름·끝 없음, keepTime)가 된다 (plan.motionOnly)
 	// → 계획 {ops (단계 순), removals, tracks, blocked, minCount, needReads (아직 되읽지 않은 클립 — 읽고 다시 계획), 목록·수}
 	function planPlacement(inp) {
 		const o = Object.assign({ adopt: true, adoptUncertain: false, adoptForeign: true, moveLegacy: true, orphans: "pre", cleanupStale: true, replaceMissing: true,
@@ -3850,11 +3970,14 @@
 			adopt: { certain: 0, uncertain: 0 }, foreignAdopt: { certain: 0, uncertain: 0 }, legacyMove: 0, legacyKept: [], legacyDecorated: 0,
 			overlaps: 0, staleLayoutRows: 0, oldVersionSkipped: 0, cleanup: [], orphans: [], perSpeaker: {},
 			// 우리 클립이 있는 줄의 지금 의도 해시 {줄 id: h} (검수가 applied.h와 비교해 '미적용'을 가른다, S3-3)
-			intentOf: {}
+			intentOf: {},
+			// 위치만 바뀌어 위치만 보내는 줄 [id] (4단계)
+			motionOnly: []
 		};
 		const idx = scanIndex(scan, salt);
 		const all = (inp.allRows || (inp.rows || []).map((r) => r.sub)).filter(Boolean);
 		const fr = speakerFrames(all, ft);
+		const motions = rowMotions(all, mi, ft);
 		const rowSpk = {};
 		const spans = {};
 		all.forEach((s) => {
@@ -3999,7 +4122,16 @@
 			const ap = x.ap && typeof x.ap === "object" ? x.ap : null;
 			const sig = fieldSignature(params);
 			const baseOp = { id: sub.id, uid: x.uid, K: x.K, kind: wantKind(x), m, durSec, D, fhAll, presetId: rs.presetId || "", nk: x.native ? x.r.baked.key : null };
-			const hOf = (g, t, sf, ef) => intentHash({ presetId: rs.presetId, sig, fh: fhAll, track: t, sf, ef, m, name: nameOf(g) });
+			// 위치 (4단계): moWant = 원하는 위치 (null = 건드리지 않는다. 쌓았던 줄이 이제 쌓이지 않으면 쌓기 전 자리), moEff = 클립에 있어야 할 위치
+			// (원하는 위치, 없으면 지난 위치 applied.mo — 해시와 다시 놓는 클립에 쓴다), mbNow = 쌓기 전 자리 (쌓을 때만)
+			const rmo = motions[sub.id] || { mo: null, mb: null };
+			const moWant = rmo.mo || (ap ? roundPos(ap.mb) : null);
+			const mbNow = rmo.mo && rmo.mb ? rmo.mb : null;
+			const moEff = moWant || (ap ? roundPos(ap.mo) : null);
+			const hbOf = (g, t, sf, ef) => intentBase({ presetId: rs.presetId, sig, fh: fhAll, track: t, sf, ef, m, name: nameOf(g) });
+			const hOf = (g, t, sf, ef) => motionHash(hbOf(g, t, sf, ef), moEff);
+			// 작업의 위치 칸: send = 호스트에 보낼 위치 (같은 클립 작업은 moWant, 새 클립·인식은 moEff)
+			const mvf = (g, send) => ({ motion: send || null, mo: moEff, mb: mbNow, hb: hbOf(g, T, x.sf, x.ef) });
 			const writes = (op) => opCreates(op) || (op.params || []).some((p) => p && p.type === "text");
 			const cur = x.cur;
 			if (!cur) {
@@ -4025,7 +4157,7 @@
 				if (pending) return skip(x, "pending");
 				claims.push({ scored, finish: (pick) => {
 					const place = () => {
-						ops.push(Object.assign({}, baseOp, { op: "place", phase: 4, g, track: T, sf: x.sf, ef: x.ef, own: null, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: null }));
+						ops.push(Object.assign({}, baseOp, { op: "place", phase: 4, g, track: T, sf: x.sf, ef: x.ef, own: null, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: null }, mvf(g, moEff)));
 					};
 					if (pick && pick.c.track === T) {
 						const c = pick.c;
@@ -4039,11 +4171,11 @@
 						if (Math.abs(c.sf - x.sf) <= 1) {
 							// 제자리 인식: 이름(태그)·속성·끝
 							ops.push(Object.assign({}, baseOp, { op: "adopt", phase: x.ef < c.ef ? 2 : 5, g, track: T, sf: c.sf, ef: x.ef, keepTime: false, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
-								src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, intent: { t: T, sf: x.sf, ef: x.ef } }));
+								src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, intent: { t: T, sf: x.sf, ef: x.ef } }, mvf(g, moEff)));
 						} else {
 							// 옛 자리(ap·mmPrev)에 있는 클립: 인식하면서 줄 시간으로 옮긴다 (TrackItem.move: 효과·키가 남는다)
 							ops.push(Object.assign({}, baseOp, { op: "move", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own, params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef),
-								src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, adopting: true }));
+								src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name, adopting: true }, mvf(g, moEff)));
 						}
 						return;
 					}
@@ -4055,7 +4187,7 @@
 							plan.legacyMove++;
 							ownIds[c.nodeId] = true;
 							ops.push(Object.assign({}, baseOp, { op: "legacyMove", phase: 3, g, track: T, sf: x.sf, ef: x.ef, own: null, removeAfter: { track: c.track, nodeId: c.nodeId },
-								params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name }));
+								params, name: nameOf(g), h: hOf(g, T, x.sf, x.ef), src: { track: c.track, sf: c.sf, ef: c.ef, nodeId: c.nodeId, name: c.name }, srcName: c.name }, mvf(g, moEff)));
 							return;
 						}
 						if (deco) plan.legacyDecorated++;
@@ -4079,10 +4211,20 @@
 			const cef = ap && typeof ap.cef === "number" ? ap.cef : x.ef;
 			const hNow = hOf(g0, T, x.sf, x.ef);
 			plan.intentOf[sub.id] = hNow;
-			if (!o.forceRegen[sub.id] && ap && ap.h === hNow && ((same && Math.abs(cur.ef - cef) <= 1) || (!same && !retime))) {
+			const inPlace = (same && Math.abs(cur.ef - cef) <= 1) || (!same && !retime);
+			if (!o.forceRegen[sub.id] && ap && ap.h === hNow && inPlace) {
 				plan.none.push(sub.id);
 				if (!same) plan.userMoved.push(sub.id);
 				plan.rowOps[sub.id] = { none: true };
+				return;
+			}
+			// 위치만 바뀌었다 (화자 위치·쌓기, 또는 지난번에 위치를 쓰지 못했다): 기본 해시(applied.hb, 위치가 없던 항목은 h)가 지금과 같으면
+			// 되읽기 없이 위치만 보낸다 — 속성·이름·끝은 그대로 (keepTime)
+			const hbWas = ap ? (typeof ap.hb === "string" && ap.hb ? ap.hb : !posOk(ap.mo) ? ap.h : "") : "";
+			if (!o.forceRegen[sub.id] && ap && inPlace && moWant && hbWas && hbWas === hbOf(g0, T, x.sf, x.ef)) {
+				plan.motionOnly.push(sub.id);
+				ops.push(Object.assign({}, baseOp, { op: "update", phase: 2, g: g0, track: cur.track, sf: cur.sf, ef: cur.ef, keepTime: true, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
+					params: [], name: null, h: hNow, src: { track: cur.track, sf: cur.sf, ef: cur.ef, nodeId: cur.nodeId, name: cur.name, g: g0 }, intent: { t: T, sf: x.sf, ef: x.ef }, motionOnly: true }, mvf(g0, moWant)));
 				return;
 			}
 			const d = detailOf(cur);
@@ -4126,7 +4268,7 @@
 				const t = same || retime ? T : cur.track;
 				const sf = same || retime ? x.sf : cur.sf;
 				const ef = same || retime ? x.ef : Math.max(cur.sf + 1, cur.ef);
-				const op = Object.assign({}, baseOp, { op: "replace", phase: 3, g: regenG, track: t, sf, ef, own: Object.assign({ m: ownM || null }, regenOwn), params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), src, intent: { t: T, sf: x.sf, ef: x.ef } });
+				const op = Object.assign({}, baseOp, { op: "replace", phase: 3, g: regenG, track: t, sf, ef, own: Object.assign({ m: ownM || null }, regenOwn), params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), src, intent: { t: T, sf: x.sf, ef: x.ef } }, mvf(regenG, moEff));
 				if (!o.forceRegen[sub.id] && guardEdited(op)) return;
 				if (oldVer && o.upgradeOld) plan.oldVersionSkipped++;
 				ops.push(op);
@@ -4134,7 +4276,7 @@
 			}
 			if (same) {
 				const op = Object.assign({}, baseOp, { op: "update", phase: x.ef < cur.ef ? 2 : x.ef > cur.ef ? 5 : 2, g: g0, track: cur.track, sf: x.sf, ef: x.ef, keepTime: false, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
-					params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } });
+					params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } }, mvf(g0, moWant));
 				if (guardEdited(op)) return;
 				ops.push(op);
 				return;
@@ -4144,7 +4286,8 @@
 				if (cur.track === T) {
 					// alt: 순환을 끊을 때(orderOps '먼저 지우고 새로 놓기')의 모양 — 새 클립은 템플릿 기본값이라 속성 전부, 다음 gen 태그
 					const op = Object.assign({}, baseOp, { op: "move", phase: 3, g: g0, track: T, sf: x.sf, ef: x.ef, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
-						params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src, alt: { g: regenG, params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef) } });
+						params: changed, name: cur.name === nameOf(g0) ? null : nameOf(g0), h: hNow, src,
+						alt: { g: regenG, params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), motion: moEff, hb: hbOf(regenG, T, x.sf, x.ef) } }, mvf(g0, moWant));
 					if (guardEdited(op)) return;
 					ops.push(op);
 					return;
@@ -4153,7 +4296,7 @@
 					plan.decorated.push(sub.id);
 					stay = true;
 				} else {
-					const op = Object.assign({}, baseOp, { op: "moveRegen", phase: 3, g: regenG, track: T, sf: x.sf, ef: x.ef, own: regenOwn, params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), src });
+					const op = Object.assign({}, baseOp, { op: "moveRegen", phase: 3, g: regenG, track: T, sf: x.sf, ef: x.ef, own: regenOwn, params, name: nameOf(regenG), h: hOf(regenG, T, x.sf, x.ef), src }, mvf(regenG, moEff));
 					if (guardEdited(op)) return;
 					ops.push(op);
 					return;
@@ -4167,7 +4310,7 @@
 			const name = cur.name === nameOf(g0) ? null : nameOf(g0);
 			if (stay && !changed.length && name === null) return skip(x, "decorated", "효과·키프레임이 있는 클립 (옮기지 않음)");
 			const op = Object.assign({}, baseOp, { op: "update", phase: 2, g: g0, track: cur.track, sf: cur.sf, ef: cur.ef, keepTime: true, own: { track: cur.track, sf: cur.sf, nodeId: cur.nodeId },
-				params: changed, name, h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } }, stay ? { stay: true } : {});
+				params: changed, name, h: hNow, src, intent: { t: T, sf: x.sf, ef: x.ef } }, stay ? { stay: true } : {}, mvf(g0, moWant));
 			if (guardEdited(op)) return;
 			ops.push(op);
 		});
@@ -4325,18 +4468,32 @@
 		if (!t || t.uid !== key) return s;
 		return s.replace(CLIP_TAG_RE, makeClipTag(t.salt, t.id, g));
 	}
-	// 항목 하나의 작업 전 클립 (없었으면 null): {nodeId, track, sf, ef(null = 모름), g, name, kind, m, pi, params}
+	// 항목 하나의 작업 전 클립 (없었으면 null): {nodeId, track, sf, ef(null = 모름), g, name, kind, m, pi, params, pos0, pos}
+	//   pos0 = 우리 작업이 같은 클립의 위치를 바꿨을 때 그 전 값 (호스트 결과 pos0 → 기록 e.pos0, 4단계) → 제자리 되돌리기가 되쓴다
+	//   pos  = 지운·바꾼 옛 클립의 위치 ('before' 스냅숏 pos, 키가 있었으면 null) → 옛 클립을 되놓을 때 되쓴다
 	function undoOriginOf(cat, e) {
 		const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
 		const str = (v) => (v === undefined || v === null ? null : String(v));
+		const vec = (v) => (Array.isArray(v) && v.length >= 2 ? roundPos({ x: Number(v[0]), y: Number(v[1]) }) : null);
+		// 위치 칸은 있을 때만 싣는다 (위치가 없던 기록의 origin 모양은 그대로)
+		const withPos = (o, pos0, pos) => {
+			if (pos0) o.pos0 = pos0;
+			if (pos) o.pos = pos;
+			return o;
+		};
 		if (!e || cat === "created") return null;
 		if (cat === "updated" || cat === "adopted") {
 			const f = e.from || {};
-			return { nodeId: String(e.nodeId == null ? "" : e.nodeId), track: num(f.track) !== null ? f.track : e.track, sf: num(f.sf) !== null ? f.sf : e.sf, ef: num(f.ef), g: null,
-				name: str(f.name), kind: e.k || "", m: str(e.m), pi: null, params: (cat === "updated" ? e.before : f.params) || [] };
+			return withPos({ nodeId: String(e.nodeId == null ? "" : e.nodeId), track: num(f.track) !== null ? f.track : e.track, sf: num(f.sf) !== null ? f.sf : e.sf, ef: num(f.ef), g: null,
+				name: str(f.name), kind: e.k || "", m: str(e.m), pi: null, params: (cat === "updated" ? e.before : f.params) || [] }, vec(e.pos0), null);
 		}
 		const s = cat === "removed" ? e : e.from || {};
-		return { nodeId: str(s.nodeId) || "", track: s.track, sf: s.sf, ef: num(s.ef), g: num(s.g), name: str(s.name), kind: s.kind || e.k || "", m: str(s.m), pi: str(s.pi), params: s.params || [] };
+		return withPos({ nodeId: str(s.nodeId) || "", track: s.track, sf: s.sf, ef: num(s.ef), g: num(s.g), name: str(s.name), kind: s.kind || e.k || "", m: str(s.m), pi: str(s.pi), params: s.params || [] },
+			vec(e.pos0), s.posKeyed ? null : vec(s.pos));
+	}
+	// 되놓는 옛 클립에 쓸 위치: 스냅숏 위치가 원래 자리(0.5, 0.5)가 아닐 때만 (새 클립은 템플릿 기본 위치에서 시작한다) → {x, y} | null
+	function undoPlaceMotion(o) {
+		return o && posOk(o.pos) && !samePos(o.pos, { x: 0.5, y: 0.5 }) ? o.pos : null;
 	}
 	// 기록을 key마다 순서대로 묶는다 (한 실행에서 한 줄이 여러 번 바뀔 수 있다: 이웃이 망가져 다시 놓기, 순환을 끊은 먼저 지우기).
 	// 따로 되놓는 제거(옛 gen·목록에서 빠진 줄의 클립)는 묶지 않는다 → {chains: [{key, id, cats, origin, final}], lone: [removed 항목]}
@@ -4433,7 +4590,7 @@
 			if (!o.m) return skip(key, id, "template-unknown");
 			const dur = durOf(o.m);
 			const op = { uid, key, id, op: "place", phase: 4, g: g || 0, track: o.track, sf: o.sf, ef: Math.max(o.sf + 1, typeof o.ef === "number" ? o.ef : o.sf + 1), own: null, removeAfter: null,
-				m: o.m, durSec: dur, D: Dof(dur), params: o.params || [], name: name || null, src: null, undo: kind };
+				m: o.m, durSec: dur, D: Dof(dur), params: o.params || [], name: name || null, src: null, undo: kind, motion: undoPlaceMotion(o) };
 			ops.push(op);
 			return op;
 		};
@@ -4483,12 +4640,12 @@
 				if (ourMove) {
 					if (retimed) return skip(ch.key, ch.id, "retimed", posText);
 					ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: "move", phase: 3, g: fin.g, track: c.track, sf: org.sf, ef: efT, own, removeAfter: null, m: fin.m || org.m,
-						durSec: durOf(fin.m || org.m), D: 0, params: org.params, name, src, alt: { name: org.name || c.name }, undo: "move" });
+						durSec: durOf(fin.m || org.m), D: 0, params: org.params, name, src, alt: { name: org.name || c.name, motion: org.pos0 || undoPlaceMotion(org) }, undo: "move", motion: org.pos0 || null });
 				} else {
 					// 시작은 그대로 (spec: updated → update keepTime with before). 우리 작업이 바꾼 끝은 지금 자리가 작업 뒤 그대로일 때만 되돌린다
 					const keep = retimed || Math.abs(efT - c.ef) < 1;
 					ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: "update", phase: !keep && efT > c.ef ? 5 : 2, g: fin.g, track: c.track, sf: c.sf, ef: keep ? c.ef : efT, keepTime: keep, own,
-						removeAfter: null, m: fin.m || org.m, params: org.params, name, src, undo: "restore" });
+						removeAfter: null, m: fin.m || org.m, params: org.params, name, src, undo: "restore", motion: org.pos0 || null });
 				}
 				out.acts[ch.key] = ops[ops.length - 1].undo;
 				return;
@@ -4500,7 +4657,7 @@
 			const dur = durOf(org.m);
 			ops.push({ uid: ch.key, key: ch.key, id: ch.id, op: org.track === c.track ? "replace" : "moveRegen", phase: 3, g: g2, track: org.track, sf: org.sf,
 				ef: Math.max(org.sf + 1, typeof org.ef === "number" ? org.ef : org.sf + 1), own: Object.assign({ m: fin.m || null }, own), removeAfter: null, m: org.m, durSec: dur, D: Dof(dur),
-				params: org.params, name: uidKey ? undoRetag(org.name, ch.key, g2) : org.name || null, src, undo: "replace" });
+				params: org.params, name: uidKey ? undoRetag(org.name, ch.key, g2) : org.name || null, src, undo: "replace", motion: undoPlaceMotion(org) });
 			out.acts[ch.key] = "replace";
 		});
 		lone.forEach((e, i) => {
@@ -4566,7 +4723,7 @@
 			const tg = parseClipTag(s.name);
 			return { uid: "fix:" + s.nodeId, key: "fix:" + s.nodeId, id: 0, op: cur ? "replace" : "place", phase: 4, g: tg ? tg.g : 0, track: s.track, sf: s.sf, ef: Math.max(s.sf + 1, s.ef),
 				own: cur ? { track: cur.track, sf: cur.sf, nodeId: cur.nodeId, m: s.m } : null, removeAfter: null, m: s.m, durSec: dur, D: ft > 0 ? Math.round((dur * TICKS_PER_SEC) / ft) : 0,
-				params: s.params || [], name: s.name || null, src: null, snap: s };
+				params: s.params || [], name: s.name || null, src: null, snap: s, motion: undoPlaceMotion(s) };
 		});
 		const sim = simulateOps(st, ops, []);
 		return { ops: sim.ok, bad: sim.bad };
@@ -4818,7 +4975,7 @@
 					if (tChanged) why = "템플릿이 바뀜";
 					else if (!ap) why = "마지막 적용 기록 없음";
 					else if (rs.mm) why = "바뀐 줄 (변경 표시)";
-					else if (hNow !== undefined && hNow !== ap.h) why = "패널에서 바뀐 값이 있음";
+					else if (hNow !== undefined && hNow !== ap.h) why = plan && Array.isArray(plan.motionOnly) && plan.motionOnly.indexOf(sub.id) !== -1 ? "위치가 바뀜" : "패널에서 바뀐 값이 있음";
 					if (why) add("unapplied", Object.assign({}, at, { detail: why }));
 				}
 			}
@@ -8075,9 +8232,11 @@ var modalState = {
 	// 화자 표 (#castBar), 화자 칩 (#speakerChips), 필터 다시 걸기 (S2-3)
 	//
 	// 화자 표는 state.mi.cast / castOrder (session.json의 mi, cast.json 사본). 화자가 있을 때만 보인다 → 단일 화자 화면은 v27 그대로.
-	//   한 줄에 한 화자: 색 점(누르면 8색 순환) · 키(누르면 그 화자만 보기) · 이름 · 트랙("자동 (V4)" 또는 고정) · 기본 프리셋 · 줄 수 · ⋯
+	//   한 줄에 한 화자: 색 점(누르면 8색 순환) · 키(누르면 그 화자만 보기) · 이름 · 트랙("자동 (V4)" 또는 고정) · 기본 프리셋 ·
+	//   화면 위치(4단계 .cast-pos, 직접이면 .cast-x·.cast-y) · 줄 수 · ⟳ · ⋯
 	//   ⋯ 메뉴: 이 화자 줄에 기본 프리셋 적용 (안전 지점 '기본 프리셋 일괄 적용 전: C2', 다른 프리셋이 걸린 줄이 있으면 묻는다),
-	//          이 화자 줄 선택, 화자 삭제 (줄은 휴지통으로)
+	//          이 화자 줄 선택, 위치만 다시 적용 (4단계, _miPosOnly), 화자 삭제 (줄은 휴지통으로)
+	//   머리: 화자가 둘 이상이면 동시 발화 쌓기 (#castStackChk, 간격 #castStackDy)
 	//   고치면 session.json·cast.json(saveSessionToStorage)과 프로젝트의 cast_defaults.json을 쓰고 히스토리에 자동 항목을 남긴다.
 	//   색 점은 자주 누르는 표시라 히스토리에는 남기지 않는다 (저장은 한다).
 	//   트랙 표시는 core resolveTracks를 스캔 없이 돌린 미리보기다 (_castTrackPreview). 실제 배치는 타임라인 스캔으로 다시 정한다.
@@ -8152,6 +8311,7 @@ var modalState = {
 			return;
 		}
 		bar.style.display = "";
+		_renderCastStack(order.length);
 		const folded = _castFolded();
 		bar.classList.toggle("folded", folded);
 		const title = document.getElementById("castTitle");
@@ -8262,6 +8422,7 @@ var modalState = {
 			const pid = preset.value;
 			_castSetItems([{ key: K, presetId: pid }], { label: "화자 기본 프리셋: " + K + " " + (pid ? state.presets[pid].name || pid : "없음") });
 		});
+		const pos = _castPosEls(K);
 		const cnt = document.createElement("span");
 		cnt.className = "cast-count";
 		cnt.textContent = count + "줄";
@@ -8282,9 +8443,111 @@ var modalState = {
 			e.stopPropagation();
 			_openCastMenu(row, K);
 		});
-		[dot, key, name, track, preset, cnt, re, more].forEach((el) => row.appendChild(el));
+		[dot, key, name, track, preset].concat(pos, [cnt, re, more]).forEach((el) => row.appendChild(el));
 		return row;
 	}
+	// ── 화면 위치 칸 (.cast-pos, 4단계) ──
+	// 선택지: 변경 안 함(null, 기본 — Motion을 건드리지 않는다) · 원래 자리 · 왼쪽 · 오른쪽 · 위 (core CAST_POS_CHOICES) · 직접 (x·y 0~1, 0.01 단위).
+	// 값은 클립 Motion Position이다: MOGRT 자체 배치 기준 0~1이고 (0.5, 0.5)가 원래 자리다 (화면 좌표가 아니다).
+	// '직접'을 고르면 x·y 칸이 나오고, 칸을 고쳐야 저장한다 (원래 자리와 같은 값이어도 '직접' 칸이 닫히지 않게 화자별로 기억한다).
+	// 바꾸면 _castSetItems (session.json·cast.json·cast_defaults.json·히스토리). 다음 ▶는 위치만 바뀐 줄에 위치만 보낸다.
+	// '변경 안 함'으로 되돌려도 클립은 그대로다 — 원래 자리로 옮기려면 '원래 자리'를 고른다
+	var _castPosCustom = {}; // {K: true} '직접'을 고른 화자 (창마다, 저장하지 않는다)
+	function _castPosEls(K) {
+		const c = state.mi.cast[K];
+		const cur = posOk(c.pos) ? roundPos(c.pos) : null;
+		const kind = _castPosCustom[K] ? "custom" : castPosKind(cur);
+		const sel = document.createElement("select");
+		sel.className = "cast-pos";
+		sel.title = "화면 위치 (클립 Motion Position — MOGRT 자체 배치 기준 0~1, 원래 자리 = 0.5, 0.5). 변경 안 함이면 Motion을 건드리지 않습니다";
+		[["", "위치: 변경 안 함"]].concat(CAST_POS_CHOICES.map((x) => [x[0], x[1]]), [["custom", "직접"]]).forEach(([v, t]) => {
+			const o = document.createElement("option");
+			o.value = v;
+			o.textContent = t;
+			sel.appendChild(o);
+		});
+		sel.value = kind;
+		const mk = (cls, v, label) => {
+			const inp = document.createElement("input");
+			inp.type = "number";
+			inp.className = cls;
+			inp.min = "0";
+			inp.max = "1";
+			inp.step = "0.01";
+			inp.value = String(v);
+			inp.title = label + " (0~1, 원래 자리 0.5)";
+			inp.style.display = kind === "custom" ? "" : "none";
+			return inp;
+		};
+		const xi = mk("cast-x", cur ? cur.x : 0.5, "가로 위치 x");
+		const yi = mk("cast-y", cur ? cur.y : 0.5, "세로 위치 y");
+		const label = (p) => "화자 위치: " + K + " " + (p ? (CAST_POS_CHOICES.find((x) => x[0] === castPosKind(p)) || [0, p.x + ", " + p.y])[1] : "변경 안 함");
+		sel.addEventListener("change", () => {
+			const v = sel.value;
+			if (v === "custom") {
+				_castPosCustom[K] = true;
+				xi.style.display = "";
+				yi.style.display = "";
+				return;
+			}
+			delete _castPosCustom[K];
+			const hit = CAST_POS_CHOICES.find((x) => x[0] === v);
+			const p = hit ? { x: hit[2], y: hit[3] } : null;
+			_castSetItems([{ key: K, pos: p }], { label: label(p) });
+		});
+		const commit = () => {
+			const x = parseFloat(xi.value);
+			const y = parseFloat(yi.value);
+			const unit = (n) => isFinite(n) && n >= 0 && n <= 1;
+			if (!unit(x) || !unit(y)) {
+				setStatus(K + " 위치는 0~1 사이 숫자입니다 (원래 자리 0.5, 0.5)", "err");
+				renderCastBar();
+				return;
+			}
+			const p = roundPos({ x, y });
+			_castSetItems([{ key: K, pos: p }], { label: "화자 위치: " + K + " " + p.x + ", " + p.y });
+		};
+		xi.addEventListener("change", commit);
+		yi.addEventListener("change", commit);
+		return [sel, xi, yi];
+	}
+	// 동시 발화 쌓기 (#castStackChk, #castStackDy, 기본 끔): 화자가 둘 이상일 때만 보인다. 바꾸면 session.json·cast.json·히스토리
+	function _renderCastStack(n) {
+		const box = document.getElementById("castStack");
+		const chk = document.getElementById("castStackChk");
+		const dy = document.getElementById("castStackDy");
+		if (!box || !chk || !dy) return;
+		box.style.display = n >= 2 ? "" : "none";
+		chk.checked = state.mi.stack === true;
+		dy.value = String(typeof state.mi.stackDy === "number" && isFinite(state.mi.stackDy) ? state.mi.stackDy : STACK_DY_DEFAULT);
+		dy.disabled = !chk.checked;
+	}
+	document.getElementById("castStackChk")?.addEventListener("change", (e) => {
+		e.stopPropagation();
+		const on = !!document.getElementById("castStackChk").checked;
+		if (on === (state.mi.stack === true)) return;
+		state.mi.stack = on;
+		saveSessionToStorage();
+		_saveHistoryOnAction("동시 발화 쌓기: " + (on ? "켬" : "끔"));
+		_renderCastStack(_castKeys().length);
+		setStatus("동시 발화 쌓기 " + (on ? "켬" : "끔") + " — 다음 적용(▶)이나 '위치만 다시 적용'에서 위치를 보냅니다", "ok");
+	});
+	document.getElementById("castStackDy")?.addEventListener("change", (e) => {
+		e.stopPropagation();
+		const el = document.getElementById("castStackDy");
+		const v = parseFloat(el.value);
+		if (!isFinite(v) || v <= 0 || v > 0.5) {
+			setStatus("쌓기 간격은 0보다 크고 0.5 이하입니다 (기본 " + STACK_DY_DEFAULT + ")", "err");
+			_renderCastStack(_castKeys().length);
+			return;
+		}
+		const dy = Math.round(v * 1000) / 1000;
+		if (dy === state.mi.stackDy) return;
+		state.mi.stackDy = dy;
+		saveSessionToStorage();
+		_saveHistoryOnAction("쌓기 간격: " + dy);
+		_renderCastStack(_castKeys().length);
+	});
 	// 트랙 선택지: "자동 (V4)" + V2..V10 (다른 화자가 쓰는 트랙은 "(철수)", 아직 없는 트랙은 "(새로 만듦)")
 	function _fillCastTrackOptions(sel, K, pv) {
 		const c = state.mi.cast[K];
@@ -8433,12 +8696,14 @@ var modalState = {
 				_closeCastMenu();
 				if (act === "preset") _castApplyDefaultPreset(K);
 				else if (act === "select") _castSelectRows(K);
+				else if (act === "pos") _miPosOnly(K);
 				else if (act === "delete") _castDelete(K);
 			});
 			menu.appendChild(b);
 		};
 		item("이 화자 줄에 기본 프리셋 적용", "preset");
 		item("이 화자 줄 선택", "select");
+		item("위치만 다시 적용", "pos");
 		item("화자 삭제 (줄은 휴지통으로)", "delete", "danger");
 		row.appendChild(menu);
 		_castMenuEl = menu;
@@ -8688,7 +8953,8 @@ var modalState = {
 		if (!K || mi.cast[K]) return;
 		const d = _loadCastDefaults()[K] || null;
 		const color = d && typeof d.color === "number" && !Object.keys(mi.cast).some((k) => mi.cast[k] && mi.cast[k].color === d.color) ? d.color : castColorFree(mi.cast);
-		mi.cast[K] = { name: (d && d.name) || K, track: null, autoTrack: null, presetId: d && d.presetId && state.presets[d.presetId] ? d.presetId : "", color, file: "", path: null, size: null, mtime: null, pos: null };
+		mi.cast[K] = { name: (d && d.name) || K, track: null, autoTrack: null, presetId: d && d.presetId && state.presets[d.presetId] ? d.presetId : "", color, file: "", path: null, size: null, mtime: null,
+			pos: d ? roundPos(d.pos) : null };
 		if (mi.castOrder.indexOf(K) === -1) mi.castOrder = sortCastKeys(mi.castOrder.concat([K]));
 	}
 
@@ -12327,6 +12593,7 @@ var modalState = {
 			lines.push(["새 비디오 트랙 " + n + "개" + (made.length ? " (" + made.join(", ") + ")" : "") + (n > 4 ? " — 4개가 넘습니다. 기본 트랙과 화자 트랙을 확인하세요" : ""), n > 4 ? "warn" : ""]);
 		}
 		if (plan.overlaps) lines.push(["같은 화자 겹침 " + plan.overlaps + "곳 → 앞 자막 끝 맞춤", ""]);
+		if (plan.motionOnly && plan.motionOnly.length) lines.push(["위치만 바뀐 줄 " + plan.motionOnly.length + "개 → 위치만 보냄 (속성·끝 그대로)", ""]);
 		plan.blocked.forEach((b) => lines.push([b.keys.join("과 ") + "가 " + tn(b.track) + "에서 겹칩니다 — 트랙을 바꾸세요", "err"]));
 		const conflictN = plan.conflicts.filter((c) => c.why !== "pinned-overlap").length;
 		if (conflictN) lines.push(["다른 클립과 겹쳐 건너뜀 " + conflictN + "줄", "err"]);
@@ -12421,6 +12688,13 @@ var modalState = {
 		if (st === "misplaced") return "다른 트랙에 놓여 지움";
 		return "실패: " + (r.reason || st || "응답 없음") + (r.detail ? " " + r.detail : "");
 	}
+	// 위치 결과 문구 (줄 표시, 4단계): 보낸 위치를 쓰지 못했을 때만. 키가 있는 Position은 사용자 애니메이션이라 그대로 두고 알린다
+	function _miMotionText(op, r) {
+		if (!op || !posOk(op.motion) || !r) return "";
+		if (r.motion === "keyframed") return "키프레임이 있어 위치를 바꾸지 않음";
+		if (r.motion !== "applied") return "위치를 쓰지 못함" + (r.motionDetail ? " (" + r.motionDetail + ")" : "");
+		return "";
+	}
 	// 계획에서 건너뛴 줄에 까닭을 적고, 보낼 줄·그대로인 줄의 지난 표시는 지운다
 	function _miMarkRows(plan) {
 		Object.keys(plan.rowOps).forEach((k) => {
@@ -12497,8 +12771,17 @@ var modalState = {
 				const secOf = (f) => (f * ctx.ft) / TICKS_PER_SEC;
 				rs.ap = Object.assign(apRecord(sub, rs, preset, op.track, op.nk), { s: secOf(op.sf), e: secOf(op.ef) });
 			} else rs.ap = apRecord(sub, rs, preset, T, op.nk);
-			_setRowRes(op.id, partial ? "속성 " + ((r.skipped || []).length + (r.keyed || []).length) + "개 적용 안 됨" + ((r.keyed || []).length ? " (키프레임)" : " (옛 버전)") : stay ? MI_SKIP_TEXT.decorated : null);
+			const notes = [];
+			if (partial) notes.push("속성 " + ((r.skipped || []).length + (r.keyed || []).length) + "개 적용 안 됨" + ((r.keyed || []).length ? " (키프레임)" : " (옛 버전)"));
+			else if (stay) notes.push(MI_SKIP_TEXT.decorated);
+			const mt = _miMotionText(op, r);
+			if (mt) notes.push(mt);
+			_setRowRes(op.id, notes.length ? notes.join(" · ") : null);
 			_refreshRowMarks(sub);
+		}
+		if (posOk(op.motion)) {
+			if (r.motion === "keyframed") ctx.stats.motionKeyed++;
+			else if (r.motion !== "applied") ctx.stats.motionFailed++;
 		}
 		if (opCreates(op) && preset && !isNativeList(preset.params)) _miLearn(preset, op, r, res, ctx);
 		else if (opCreates(op) && preset && isNativeList(preset.params) && r.deco && !ctx.learned["deco:" + op.presetId]) {
@@ -12537,6 +12820,8 @@ var modalState = {
 		const base = { key: op.uid, g: typeof r.g === "number" ? r.g : op.g, track: r.track, sf: r.sf, nodeId: String(r.nodeId || ""), rh: textsHash(r.texts || []),
 			n: ctx.laN++, id: op.id, op: op.op, k: r.kind || op.kind || "", m: op.m || "", ef: r.ef, dur: op.durSec || 0 };
 		if (ctx.repairing) base.fix = true;
+		// 같은 클립의 위치를 바꿨다 (4단계): 쓰기 전 값 → 되돌리기가 되쓴다 (다시 놓은 클립의 옛 위치는 'before' 스냅숏 pos)
+		if (r.motion === "applied" && Array.isArray(r.pos0)) base.pos0 = [r.pos0[0], r.pos0[1]];
 		const srcPos = op.src ? { track: op.src.track, sf: op.src.sf, ef: op.src.ef, name: op.src.name || "" } : null;
 		const cat = _laCat(op);
 		if (cat === "created") la.created.push(base);
@@ -12610,6 +12895,7 @@ var modalState = {
 		const s = ctx.stats;
 		return { ok: !ctx.error && !ctx.aborted, stopped: !!ctx.stopped, error: ctx.error || null, created: s.created, updated: s.updated, moved: s.moved, adopted: s.adopted,
 			replaced: s.replaced, removed: s.removed, partial: s.partial, conflict: s.conflict, failed: s.failed, none: plan ? plan.none.length : 0,
+			motionOnly: plan && plan.motionOnly ? plan.motionOnly.length : 0, motionKeyed: s.motionKeyed || 0, motionFailed: s.motionFailed || 0,
 			skipped: plan ? Object.keys(plan.rowOps).filter((k) => plan.rowOps[k] && plan.rowOps[k].skip).length : 0,
 			ops: plan ? plan.ops.length + plan.removals.length : 0, tracksAdded: ctx.tracksAdded || 0, runId: ctx.la ? ctx.la.runId : null, saltRecovered: !!ctx.saltRecovered };
 	}
@@ -12617,7 +12903,10 @@ var modalState = {
 		const parts = [];
 		[["created", "놓음"], ["updated", "갱신"], ["moved", "옮김"], ["adopted", "인식"], ["replaced", "교체"], ["removed", "지움"]].forEach(([k, t]) => { if (rep[k]) parts.push(t + " " + rep[k]); });
 		if (rep.none) parts.push("그대로 " + rep.none);
+		if (rep.motionOnly) parts.push("위치만 " + rep.motionOnly);
 		if (rep.partial) parts.push("일부 속성 빠짐 " + rep.partial);
+		if (rep.motionKeyed) parts.push("위치 키프레임 " + rep.motionKeyed + " (바꾸지 않음)");
+		if (rep.motionFailed) parts.push("위치 실패 " + rep.motionFailed);
 		if (rep.conflict) parts.push("충돌 " + rep.conflict);
 		if (rep.failed) parts.push("실패 " + rep.failed);
 		if (rep.skipped) parts.push("건너뜀 " + rep.skipped);
@@ -12677,7 +12966,7 @@ var modalState = {
 			const base = _trackValueNum();
 			ctx = {
 				seqId: String(ping.seqId), ft, seqTok: _importSeqToken(), base: base === null ? 2 : base, legacyN, rowIn: {}, durs: {}, details: {}, created: {}, nodeToUid: {},
-				damaged: [], byId: {}, stats: { created: 0, updated: 0, moved: 0, adopted: 0, replaced: 0, removed: 0, removeFailed: 0, partial: 0, conflict: 0, failed: 0 },
+				damaged: [], byId: {}, stats: { created: 0, updated: 0, moved: 0, adopted: 0, replaced: 0, removed: 0, removeFailed: 0, partial: 0, conflict: 0, failed: 0, motionKeyed: 0, motionFailed: 0 },
 				spkDone: {}, spkTotal: {}, spkOk: {}, doneOps: 0, totalOps: 0, learned: {}, presetsDirty: false, la: null, stopped: false, aborted: false, error: null
 			};
 			state.subtitles.forEach((s) => { ctx.byId[s.id] = s; });
@@ -12784,7 +13073,184 @@ var modalState = {
 		if (ctx.error) setStatus(MI_STOPPED_MSG + ": " + ctx.error + " — " + text, "err");
 		else if (ctx.aborted) setStatus("시퀀스가 바뀌어 멈췄습니다 — " + text, "err");
 		else if (ctx.stopped) setStatus("중지함 — 다시 적용하면 이어서 진행 · " + text, "err");
-		else setStatus(text, rep.conflict || rep.failed || rep.skipped || rep.partial ? "err" : "ok");
+		else setStatus(text, rep.conflict || rep.failed || rep.skipped || rep.partial || rep.motionKeyed || rep.motionFailed ? "err" : "ok");
+	}
+	// ─────────────────────────────────────────────────────────────
+	// 위치만 다시 적용 (화자 ⋯ 메뉴, 4단계) — 계획서 §8·§10, spec position
+	//   화자 K의 줄 가운데 타임라인에 우리 클립(가장 높은 gen 하나)이 있는 줄에 원하는 위치(core rowMotions: 화자 위치·쌓기, 쌓았던 줄은 쌓기 전 자리)를
+	//   MI_setMotion으로 40개씩 쓴다. 호스트는 Position만 쓴다 — 속성·이름·시간은 그대로. 키가 있는 Position은 쓰지 않고 줄에 알린다.
+	//   위치가 '변경 안 함'이고 쌓은 줄도 없으면 보내지 않는다. 스캔은 ▶와 같은 트랙·창 (_miScanTracks, 줄 자리 ±30초).
+	//   결과: applied의 위치(mo·mb)와 의도 해시(기본 해시 hb를 알면 h = hb + 새 위치) → 다음 ▶는 그 줄을 그대로로 본다.
+	//   last_apply에 새 기록(updated, 속성 없음, 쓰기 전 위치 pos0) → '↶ 마지막 적용 되돌리기'가 위치를 되돌린다.
+	// → {ok, applied, keyed, failed, noClip, dup, stopped} | {ok: false, error}
+	// ─────────────────────────────────────────────────────────────
+	const MOTION_BATCH = 40;
+	async function _miPosOnly(K) {
+		const c = state.mi && state.mi.cast ? state.mi.cast[K] : null;
+		if (!c) return { ok: false, error: "no-speaker" };
+		if (_miBusy || _legacyRun) {
+			setStatus("타임라인 적용이 이미 실행 중입니다", "err");
+			return { ok: false, error: "busy" };
+		}
+		if (!_keysResolved) {
+			setStatus("시퀀스를 열면 적용할 수 있습니다", "err");
+			return { ok: false, error: "no-sequence" };
+		}
+		const nm = K + " " + _castName(K);
+		const subs = state.subtitles.filter((s) => s && s.spk === K);
+		if (!subs.length) {
+			setStatus(nm + ": 줄이 없습니다", "err");
+			return { ok: false, error: "no-rows" };
+		}
+		_miBusy = true;
+		_miCancel = false;
+		const seqTok0 = _importSeqToken();
+		const st = { applied: 0, keyed: 0, failed: 0, noClip: 0, dup: 0, noPos: 0, stopped: false };
+		let la = null;
+		try {
+			const chk = await _miStartCheck(seqTok0);
+			if (!chk.ok) return chk;
+			const seqId = String(chk.ping.seqId);
+			const ft = Number(chk.ping.frameTicks);
+			if (!state.mi.salt) {
+				setStatus(nm + ": 아직 화자별로 적용하지 않았습니다 — ▶로 먼저 적용하세요", "err");
+				return { ok: false, error: "no-salt" };
+			}
+			const motions = rowMotions(state.subtitles.filter((s) => s && s.spk), state.mi, ft);
+			const want = [];
+			subs.forEach((s) => {
+				const a = state.mi.applied[state.mi.salt + "-" + s.id] || null;
+				const rm = motions[s.id] || { mo: null, mb: null };
+				const mo = rm.mo || (a ? roundPos(a.mb) : null);
+				if (mo) want.push({ sub: s, mo, mb: rm.mo && rm.mb ? rm.mb : null });
+				else st.noPos++;
+			});
+			if (!want.length) {
+				setStatus(nm + ": 위치가 '변경 안 함'입니다 — 화자 표에서 위치를 고른 뒤 다시 적용하세요", "err");
+				return Object.assign({ ok: false, error: "no-pos" }, st);
+			}
+			let lo = Infinity;
+			let hi = -Infinity;
+			want.forEach((w) => {
+				lo = Math.min(lo, frameOf(w.sub.startSec, ft));
+				hi = Math.max(hi, frameOf(w.sub.endSec, ft));
+				const a = state.mi.applied[state.mi.salt + "-" + w.sub.id];
+				if (a && typeof a.sf === "number") {
+					lo = Math.min(lo, a.sf);
+					hi = Math.max(hi, typeof a.cef === "number" ? a.cef : a.ef);
+				}
+			});
+			const pad = frameOf(SCAN_PAD_SEC + PLACE_DUR_FALLBACK * 2, ft);
+			_miShowBusy("타임라인 읽는 중…");
+			const base = _trackValueNum();
+			const scan = await _miCallWatch(() => host.mi.getTracks({ seqId, tracks: _miScanTracks(subs, base === null ? 2 : base), fromFrame: Math.max(0, lo - pad), toFrame: hi + pad }));
+			if (!scan || scan.ok !== true) throw _miHostFail("getTracks", scan);
+			_miNumTracks = scan.numVideoTracks;
+			const idx = scanIndex(scan, state.mi.salt);
+			const items = [];
+			want.forEach((w) => {
+				const uid = state.mi.salt + "-" + w.sub.id;
+				if (idx.dup[uid]) {
+					st.dup++;
+					_setRowRes(w.sub.id, "중복 (같은 태그 클립 " + idx.dup[uid].length + "개) — 위치를 쓰지 않음");
+					return;
+				}
+				const cur = idx.current[uid];
+				if (!cur) {
+					st.noClip++;
+					return;
+				}
+				items.push({ w, uid, cur });
+			});
+			if (!items.length) {
+				setStatus(nm + ": 위치를 쓸 클립이 타임라인에 없습니다" + (st.dup ? " (중복 " + st.dup + ")" : ""), "err");
+				return Object.assign({ ok: false, error: "no-clips" }, st);
+			}
+			la = _laNew(seqId, state.mi.salt, items.length, false);
+			la.posOnly = K;
+			let laN = 0;
+			_writeLastApply(la);
+			let queue = items.slice();
+			let done = 0;
+			while (queue.length) {
+				if (_miCancel) { st.stopped = true; break; }
+				if (seqTok0 !== _importSeqToken()) { st.stopped = true; break; }
+				const part = queue.slice(0, MOTION_BATCH);
+				_miShowBusy("위치 쓰는 중… " + nm + " " + done + "/" + items.length);
+				const res = await _miCallWatch(() => host.mi.setMotion({ seqId, budgetMs: MI_BUDGET_MS, items: part.map((x) => ({ key: x.uid, g: x.cur.g, track: x.cur.track, nodeId: x.cur.nodeId, x: x.w.mo.x, y: x.w.mo.y })) }));
+				if (!res || res.ok !== true) throw _miHostFail("setMotion", res);
+				const n = Math.max(0, Math.min(part.length, parseInt(res.done, 10) || 0));
+				if (!n) throw _miHostFail("setMotion", { error: "done 0", detail: "호스트가 하나도 하지 않았다" });
+				for (let k = 0; k < n; k++) {
+					const x = part[k];
+					const r = (res.results || [])[k] || {};
+					const id = x.w.sub.id;
+					if (r.status === "applied") {
+						st.applied++;
+						_laTouch(la, x.uid, id);
+						const a = state.mi.applied[x.uid];
+						la.updated.push({ key: x.uid, g: x.cur.g, track: x.cur.track, sf: x.cur.sf, nodeId: String(x.cur.nodeId), rh: a && typeof a.rh === "string" ? a.rh : null,
+							n: laN++, id, op: "motion", k: (a && a.k) || "", m: (a && a.m) || "", ef: x.cur.ef, dur: 0, before: [],
+							from: { track: x.cur.track, sf: x.cur.sf, ef: x.cur.ef, name: x.cur.name || "" }, pos0: typeof r.x0 === "number" && typeof r.y0 === "number" ? [r.x0, r.y0] : null });
+						if (a) {
+							const hb = typeof a.hb === "string" && a.hb ? a.hb : !posOk(a.mo) ? a.h : "";
+							a.mo = x.w.mo;
+							if (x.w.mb) a.mb = x.w.mb;
+							else delete a.mb;
+							// 기본 해시를 알면 새 위치의 의도 해시로 (다음 ▶가 이 줄을 그대로로 본다). 모르면(지난 적용이 일부만 됐다) 그대로 두어 ▶가 다시 본다
+							if (hb) {
+								a.hb = hb;
+								a.h = motionHash(hb, x.w.mo);
+							}
+						}
+						_setRowRes(id, null);
+					} else if (r.status === "keyframed") {
+						st.keyed++;
+						_setRowRes(id, "키프레임이 있어 위치를 바꾸지 않음");
+					} else {
+						st.failed++;
+						_setRowRes(id, "위치를 쓰지 못함: " + (r.status || "응답 없음") + (r.reason ? " " + r.reason : "") + (r.detail ? " (" + r.detail + ")" : ""));
+					}
+					const sub = state.subtitles.find((s) => s.id === id);
+					if (sub) _refreshRowMarks(sub);
+				}
+				done += n;
+				queue = queue.slice(n);
+				la.chunksDone++;
+				_writeLastApply(la);
+			}
+		} catch (e) {
+			console.error("[MOGRT] 위치만 다시 적용 멈춤:", e);
+			setStatus(MI_STOPPED_MSG + ": " + ((e && e.message) || e), "err");
+			st.error = (e && e.message) || String(e);
+		} finally {
+			try {
+				if (la) {
+					la.complete = !st.stopped && !st.error;
+					_writeLastApply(la);
+					if (seqTok0 === _importSeqToken()) {
+						saveSessionToStorage();
+						if (st.applied) _saveHistoryOnAction("위치만 다시 적용: " + K + " (" + st.applied + "개)");
+						updateMultiSelect();
+					}
+				}
+			} finally {
+				_miBusy = false;
+				_miCancel = false;
+				_miHideBusy();
+			}
+		}
+		if (!la) return Object.assign({ ok: false, error: st.error ? "exception" : "no-clips" }, st);
+		if (!st.error) {
+			const parts = ["위치 " + st.applied + "개"];
+			if (st.keyed) parts.push("키프레임이 있어 그대로 " + st.keyed);
+			if (st.failed) parts.push("실패 " + st.failed);
+			if (st.noClip) parts.push("타임라인에 없음 " + st.noClip);
+			if (st.dup) parts.push("중복 " + st.dup);
+			const text = nm + " 위치만 다시 적용: " + parts.join(" · ");
+			setStatus((st.stopped ? "중지함 — " : "") + text, st.stopped || st.keyed || st.failed || st.dup ? "err" : "ok");
+		}
+		return Object.assign({ ok: !st.error && !st.stopped }, st);
 	}
 	// ─────────────────────────────────────────────────────────────
 	// 타임라인 검수 (읽기만, S3-3) — 계획서 §8 #verifyModal, spec S3-3
@@ -13006,7 +13472,7 @@ var modalState = {
 		const count = {};
 		plan.ops.forEach((op) => { count[op.op] = (count[op.op] || 0) + 1; });
 		return {
-			ops: count, removals: plan.removals.length, none: plan.none.length, minCount: plan.minCount, tracks: plan.tracks, blocked: plan.blocked,
+			ops: count, removals: plan.removals.length, none: plan.none.length, motionOnly: (plan.motionOnly || []).length, minCount: plan.minCount, tracks: plan.tracks, blocked: plan.blocked,
 			conflicts: plan.conflicts, edited: plan.edited, missing: plan.missing, oldVersion: plan.oldVersion, decorated: plan.decorated, userMoved: plan.userMoved,
 			adopt: plan.adopt, foreignAdopt: plan.foreignAdopt, legacyMove: plan.legacyMove, legacyKept: plan.legacyKept, cleanup: plan.cleanup.length,
 			orphans: plan.orphans.map((x) => ({ uid: x.uid, id: x.id, pre: x.pre })), dup: plan.dup, noPreset: plan.noPreset, perSpeaker: plan.perSpeaker,
@@ -13060,13 +13526,14 @@ var modalState = {
 		});
 		for (let i = 0; i < want.length; i += READ_BATCH) {
 			const part = want.slice(i, i + READ_BATCH);
-			const r = await _miCallWatch(() => host.mi.readTexts({ seqId: ctx.seqId, items: part, want: { texts: false, lay: false, deco: false, params: true } }));
+			const r = await _miCallWatch(() => host.mi.readTexts({ seqId: ctx.seqId, items: part, want: { texts: false, lay: false, deco: false, params: true, pos: true } }));
 			if (!r || r.ok !== true) throw _miHostFail("readClipTexts", r);
 			(r.results || []).forEach((x) => {
 				if (!x || !x.found) return;
 				const id = String(x.nodeId);
 				const m = ctx.repairM[id];
-				ctx.snaps[id] = { nodeId: id, track: x.track, sf: x.sf, ef: x.ef, name: x.name || "", kind: x.kind || "", params: x.params || [], m, durSec: _miDurOf(ctx, m) };
+				ctx.snaps[id] = { nodeId: id, track: x.track, sf: x.sf, ef: x.ef, name: x.name || "", kind: x.kind || "", params: x.params || [], m, durSec: _miDurOf(ctx, m),
+					pos: !x.posKeyed && Array.isArray(x.pos) ? roundPos({ x: x.pos[0], y: x.pos[1] }) : null };
 			});
 		}
 	}
@@ -13121,7 +13588,7 @@ var modalState = {
 						if (op.m) {
 							ctx.repairM[nid] = op.m;
 							ctx.snaps[nid] = { nodeId: nid, track: r.track, sf: r.sf, ef: r.ef, name: op.name !== null && op.name !== undefined ? op.name : r.name || "", kind: r.kind || "",
-								params: op.params || [], m: op.m, durSec: op.durSec || _miDurOf(ctx, op.m) };
+								params: op.params || [], m: op.m, durSec: op.durSec || _miDurOf(ctx, op.m), pos: Array.isArray(r.pos) ? roundPos({ x: r.pos[0], y: r.pos[1] }) : null };
 						}
 					} else delete ctx.snaps[nid];
 				}
