@@ -30,9 +30,14 @@ function diskPresetRefMax(root, projKey) {
 	const dir = path.join(root, projKey);
 	let max = 0;
 	if (!fs.existsSync(dir)) return 0;
+	const re0 = /"presetId"\s*:\s*"preset_(\d+)"/g;
+	// 프로젝트 단위 cast_defaults.json (패널 _presetRefs가 함께 본다)
+	const cd = path.join(dir, "cast_defaults.json");
+	if (fs.existsSync(cd)) { const t = fs.readFileSync(cd, "utf8"); let m0; while ((m0 = re0.exec(t))) max = Math.max(max, parseInt(m0[1], 10)); }
 	for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
 		if (!e.isDirectory()) continue;
-		for (const f of ["session.json", "history_auto.json", "history_manual.json"]) {
+		// 패널 PRESET_REF_FILES와 같은 목록 (S1-4 history_safety, S1-5 cast.json)
+		for (const f of ["session.json", "history_auto.json", "history_manual.json", "history_safety.json", "cast.json"]) {
 			const fp = path.join(dir, e.name, f);
 			if (!fs.existsSync(fp)) continue;
 			const text = fs.readFileSync(fp, "utf8");
