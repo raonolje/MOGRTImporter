@@ -162,6 +162,11 @@ function createToolbox(o) {
 		}
 		if (resp.ok === true) return opts.raw ? resp : resp.data;
 		if (opts.pass && opts.pass.indexOf(resp.error) !== -1) return resp;
+		// 서버가 보낸 명령을 패널이 모른다 = 설치된 패널이 서버보다 옛 버전 (core 해시는 core region만 보므로 여기서 잡는다, 예: M5.2 패널의 rows.raw)
+		if (resp.error === "bad-args" && String(resp.detail || "").indexOf("모르는 명령: ") === 0) {
+			throw new ToolFail("panel-version-mismatch", "패널이 이 서버의 명령(" + op + ")을 모릅니다 — 설치된 패널이 MCP 서버보다 옛 버전입니다.",
+				"패널을 새 버전으로 설치하고 패널을 새로 고치거나 Premiere를 다시 시작한 뒤 다시 시도하세요. 그 전까지 쓰기 도구는 쓰지 않습니다.", { detail: resp.detail, op });
+		}
 		const known = PANEL_ERRORS[resp.error] || ["패널이 거절했습니다 (" + resp.error + ").", "message를 확인하세요."];
 		const extra = { detail: resp.detail || "" };
 		if (resp.results) extra.results = resp.results;
@@ -216,14 +221,18 @@ function createToolbox(o) {
 			if (a.speaker !== undefined) args.spk = a.speaker;
 			if (a.from !== undefined) args.from = a.from;
 			if (a.filter !== undefined) args.filter = a.filter;
-			return ok(Object.assign({ seq_id: ctx.hb.seqId || "" }, await panel(ctx, "rows", args)));
+			// seq_id는 heartbeat의 시퀀스: 패널이 지금도 그 시퀀스일 때만 읽는다 (그 사이 바뀌었으면 seq-mismatch —
+			// 다른 시퀀스의 줄에 옛 seq_id가 붙으면 화자 없는 목록의 uid(줄 번호)가 돌아온 시퀀스의 줄에 맞아 버린다)
+			const seq_id = String(ctx.hb.seqId || "");
+			return ok(Object.assign({ seq_id }, await panel(ctx, "rows", args, { seqId: seq_id })));
 		});
 	def("find_row", "줄 찾기",
 		"사람이 말한 줄 주소('#12', '12', 'C2·12', '#12 T2')를 지금 목록의 줄로 바꾼다 → seq_id, uid, label, text(캡션 문장), fields, sig(field_sig), 필드를 적었으면 field {fid, displayName, value, caption}. 쓰기 전에 사용자에게 문장을 확인한다.",
 		obj({ label: str("줄 주소. 예: '#12', 'C2·12', '#12 T2' (다화자에서 번호가 겹치면 화자를 붙인다)") }, ["label"]), READ,
 		async (a, ctx) => {
 			await panelUp(ctx);
-			return ok(Object.assign({ seq_id: ctx.hb.seqId || "" }, await panel(ctx, "resolve", { label: a.label })));
+			const seq_id = String(ctx.hb.seqId || ""); // get_rows와 같다
+			return ok(Object.assign({ seq_id }, await panel(ctx, "resolve", { label: a.label }, { seqId: seq_id })));
 		});
 	def("get_suggestions", "제안 대기열",
 		"패널의 AI 제안 대기열: 줄·필드·값·by·ok(지금 검증 통과)·stale(캡션·구조가 바뀌어 다시 확인 필요)·check(확인 문구). 사용자가 패널에서 [적용]하기 전에는 아무것도 바뀌지 않는다.",

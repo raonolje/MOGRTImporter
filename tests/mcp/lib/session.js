@@ -5,6 +5,7 @@
  *
  *   const S = require("./lib/session");
  *   const fx = S.build();   // {sim, seq, preset, session, SEQ, PROJ, SALT}
+ *   const fx1 = S.buildSingle();   // 같은 프리셋, 화자 없는 14줄 (v27 단일 화자 목록)
  */
 const { createSim, FT, TPS, aeText, color } = require("../../lib/premiereSim");
 const { loadRegions } = require("../../lib/loadRegions");
@@ -62,4 +63,20 @@ function build() {
 	return { sim, seq, preset, session, SEQ, PROJ, SALT, MOGRT, RULE, HOST_FNS, captionOf };
 }
 
-module.exports = { build, SEQ, PROJ, SALT, RULE, captionOf, HOST_FNS };
+/** 화자 없는 목록 (v27 단일 화자: C 번호 없는 SRT 하나, 화자 표·salt 없음) n줄 → uid는 줄 id 숫자 ('12'), 캡션은 C1과 같다 */
+function buildSingle(n = 14) {
+	const fx = build();
+	const subtitles = [];
+	const rowStates = {};
+	for (let k = 1; k <= n; k++) {
+		const sf = 100 + (k - 1) * 150;
+		const text = captionOf("C1", k);
+		subtitles.push({ index: k, startTime: tc(sec(sf)), endTime: tc(sec(sf + 60)), startSec: sec(sf), endSec: sec(sf + 60), text, id: k });
+		const all = JSON.parse(JSON.stringify(fx.preset.params));
+		CORE.setTextValue(all[0], text);
+		rowStates[k] = { presetId: fx.preset.id, params: all.filter((p) => fx.preset.exposedIndices.indexOf(p.index) !== -1), _allParams: all, open: false, checked: false };
+	}
+	return Object.assign(fx, { session: { subtitles, rowStates, trashBin: [], nextId: n + 1 } });
+}
+
+module.exports = { build, buildSingle, SEQ, PROJ, SALT, RULE, captionOf, HOST_FNS };

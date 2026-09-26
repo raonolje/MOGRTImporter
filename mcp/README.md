@@ -126,7 +126,7 @@ claude mcp add mogrt_importer -- node <repo>/mcp/server.mjs
 | `panel-closed` | 패널이 닫혔다 | 패널을 열고 켠다 |
 | `no-heartbeat` | 5초 기다려도 패널 신호가 없다 | 패널을 열고 켠다 |
 | `panel-not-responding` | 신호가 끊겼다 (Premiere 모달·긴 작업) | Premiere 화면 확인 |
-| `panel-version-mismatch` | 패널 core와 설치본 core가 다르다 | 패널 새로 고침·Premiere 재시작 (쓰기 도구는 막힘) |
+| `panel-version-mismatch` | 패널 core와 설치본 core가 다르다, 또는 설치된 패널이 서버보다 옛 버전이라 명령을 모른다 | 패널 새로 고침·새 버전 설치·Premiere 재시작 (쓰기 도구는 막힘) |
 | `core-unavailable` | 설치본 app.js를 읽지 못했다 | 패널 설치 확인 |
 | `timeout` | 패널이 제시간에 답하지 않았다 | 잠시 뒤 다시 |
 | `rejected` | suggest_fields의 제안 중 확인을 통과하지 못한 것이 있다 (아무것도 넣지 않았다) | results[].error를 보고 고쳐 모두 다시 |

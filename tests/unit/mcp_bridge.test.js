@@ -73,7 +73,7 @@ test("call: 응답이 없으면 timeout, 패널이 가져가지 않은 명령은
 	}
 });
 
-test("진짜 폴더로 패널(하네스)과 왕복: heartbeat의 coreHash, status·rows, seq 다름, needs-approval(한국어 문구), 끄면 off", async () => {
+test("진짜 폴더로 패널(하네스)과 왕복: heartbeat의 coreHash, status·rows, seq 다름(빈 seqId 포함), needs-approval(한국어 문구), 끄면 off", async () => {
 	const appdata = tmpDir("panel");
 	const dir = path.join(appdata, "MogrtImporter", "bridge");
 	const PROJ = "C:/work/bridge.prproj";
@@ -112,6 +112,9 @@ test("진짜 폴더로 패널(하네스)과 왕복: heartbeat의 coreHash, statu
 		assert.deepEqual(rows.data.rows.map((r) => [r.uid, r.text]), [["1", "하나"]]);
 		const bad = await pump(B.call(dir, "rows", {}, { seqId: "다른 시퀀스" }));
 		assert.deepEqual([bad.ok, bad.error], [false, "seq-mismatch"]);
+		// 빈 seqId("" = 시퀀스 없음)도 싣는다: 빈 seq_id로 시퀀스 확인을 건너뛰지 못한다
+		const empty = await pump(B.call(dir, "rows", {}, { seqId: "" }));
+		assert.deepEqual([empty.ok, empty.error], [false, "seq-mismatch"]);
 		const q = await pump(B.call(dir, "undo", {}, { by: "claude" }));
 		assert.deepEqual([q.ok, q.error], [false, "needs-approval"]);
 		assert.match(q.detail, /패널에서 승인해야 합니다/, "한국어 그대로");

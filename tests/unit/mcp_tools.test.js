@@ -111,3 +111,59 @@ test("쓰기 도구(M5.3): suggest_fields·set_cast_proposal — readOnlyHint·d
 	["V1", "1", "V100", "V", "x3", "", "3.5"].forEach((v) => assert.equal(T.parseTrack(v), undefined, v));
 	assert.equal(T.SUGG_MAX, 200);
 });
+
+// ── M5.1~M5.3 리뷰: 다리(B)를 흉내 내고 도구가 패널에 무엇을 보내는지 본다 ──
+test("도구 → 패널 (다리 흉내): get_rows·find_row는 heartbeat의 seq_id로 읽는다(그 사이 바뀌면 seq-mismatch), 빈 seq_id도 쓰기 명령에 싣는다, 패널이 모르는 명령은 panel-version-mismatch", async () => {
+	const B = require("../../mcp/lib/bridge");
+	const orig = { checkPanel: B.checkPanel, call: B.call };
+	const hb = { v: 1, state: "on", at: Date.now(), seqId: "seq-A", extPath: path.join(ROOT, "extension"), coreHash: regionHash("src/mi/core.ts") };
+	const sent = [];
+	let panelSeq = "seq-A";
+	const known = { rows: { total: 0, from: 0, rows: [] }, resolve: { uid: "12", fid: "T2" }, "cast.get": { castOrder: ["C1"], cast: { C1: { name: "a" } } }, presets: [] };
+	// 패널 흉내: seqId가 오면 지금 시퀀스와 맞춘다 (runCommand와 같다), 모르는 명령은 bad-args '모르는 명령: …' (M5.2 패널의 rows.raw)
+	B.checkPanel = async () => ({ ok: true, hb, age: 0 });
+	B.call = async (dir, op, args, opts) => {
+		sent.push({ op, seqId: opts.seqId });
+		const head = { v: 1, id: "m-1", op, at: Date.now() };
+		if (opts.seqId !== undefined && String(opts.seqId) !== panelSeq) return Object.assign(head, { ok: false, error: "seq-mismatch", detail: "지금 시퀀스: " + panelSeq });
+		if (!Object.prototype.hasOwnProperty.call(known, op)) return Object.assign(head, { ok: false, error: "bad-args", detail: "모르는 명령: " + op });
+		return Object.assign(head, { ok: true, data: known[op] });
+	};
+	const J = (r) => JSON.parse(r.content[0].text);
+	try {
+		const box = T.createToolbox({ dir: "C:/없음", clientName: () => "codex-mcp-client" });
+		let r = await box.call("get_rows", {});
+		assert.deepEqual([!!r.isError, J(r).seq_id], [false, "seq-A"]);
+		r = await box.call("find_row", { label: "#12 T2" });
+		assert.deepEqual([!!r.isError, J(r).seq_id, J(r).uid], [false, "seq-A", "12"]);
+		assert.deepEqual(sent.map((m) => [m.op, m.seqId]), [["rows", "seq-A"], ["resolve", "seq-A"]], "읽기도 heartbeat의 seq_id를 싣는다");
+		// heartbeat(seq-A) 뒤 패널이 seq-B로 바뀌었다 → B의 줄에 seq_id A가 붙지 않고 seq-mismatch
+		panelSeq = "seq-B";
+		for (const [name, args] of [["get_rows", {}], ["find_row", { label: "#12" }]]) {
+			r = await box.call(name, args);
+			assert.deepEqual([r.isError, J(r).code], [true, "seq-mismatch"], name);
+		}
+		// 빈 seq_id: 그대로 싣는다 → 패널(seq-B)이 거절한다
+		sent.length = 0;
+		r = await box.call("set_cast_proposal", { seq_id: "", items: [{ key: "C1", name: "b" }] });
+		assert.deepEqual([r.isError, J(r).code], [true, "seq-mismatch"]);
+		assert.deepEqual(sent.map((m) => [m.op, m.seqId]), [["cast.get", ""]]);
+		r = await box.call("suggest_fields", { seq_id: "", items: [{ uid: "12", field_id: "T2", field_sig: "x", value: "v" }] });
+		assert.deepEqual([r.isError, J(r).code], [true, "seq-mismatch"]);
+		// 옛 패널(M5.2)은 rows.raw를 모른다: core 해시는 같아도 bad-args가 아니라 panel-version-mismatch (인자를 고치라고 하지 않는다)
+		panelSeq = "seq-A";
+		r = await box.call("suggest_fields", { seq_id: "seq-A", items: [{ uid: "12", field_id: "T2", field_sig: "x", value: "v" }] });
+		assert.deepEqual([r.isError, J(r).code, J(r).op], [true, "panel-version-mismatch", "rows.raw"]);
+		assert.match(J(r).message, /옛 버전/);
+		assert.match(J(r).hint, /새 버전으로 설치/);
+		delete known.presets;
+		r = await box.call("list_presets", {});
+		assert.equal(J(r).code, "panel-version-mismatch", "읽기 도구도 같다");
+		// 인자가 틀린 bad-args는 그대로
+		B.call = async (dir, op) => ({ v: 1, id: "m-2", op, at: Date.now(), ok: false, error: "bad-args", detail: "filter는 all|changed|warn|sugg" });
+		r = await box.call("get_rows", {});
+		assert.deepEqual([J(r).code, J(r).hint], ["bad-args", T.PANEL_ERRORS["bad-args"][1]]);
+	} finally {
+		Object.assign(B, orig);
+	}
+});

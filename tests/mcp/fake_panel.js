@@ -4,14 +4,14 @@
  * MCP 테스트의 가짜 패널 (별도 프로세스). 진짜 다리 폴더(임시)에 heartbeat를 쓰고 inbox에 답한다.
  *
  *   node tests/mcp/fake_panel.js <설정 JSON 경로>
- *   설정 {mode, dir, extPath, coreHash?, logFile?, snapFile?, appdata?, beatMs?, slowMs?}
+ *   설정 {mode, dir, extPath, coreHash?, logFile?, snapFile?, appdata?, beatMs?, slowMs?, single?}
  *
  * mode
  *   fixture  tests/mcp/fixtures/panel_replies.json의 답을 돌려준다 (op별, 일부는 인자별). seqId가 다르면 seq-mismatch,
  *            2분 지난 명령은 expired — 패널 inbox.ts와 같은 겉모양. 받은 명령은 logFile(jsonl)에 남긴다.
  *   harness  진짜 app.js 전체를 panelHarness(vm)로 띄우고 premiereSim을 호스트로 잇는다. 'AI 연결 허용'을 켜고
  *            가짜 시계를 실제 시간에 맞춰 돌린다 → 패널 inbox.ts가 진짜로 답한다. snapFile에 스냅숏·상태 줄·ui(제안 버튼 글자,
- *            승인 카드 글자)·예외를 0.3초마다 쓴다.
+ *            승인 카드 글자)·예외를 0.3초마다 쓴다. single이면 화자 없는 목록(v27 단일 화자, session.buildSingle)으로 띄운다.
  *   off | closed | stale   heartbeat에 그 상태 하나만 쓰고 답하지 않는다 (stale = 60초 전 state on)
  *   silent   살아 있는 heartbeat만 쓰고 명령은 가져가지 않는다 (시간 초과 시험)
  * 준비되면 stdout에 "ready"를 쓴다.
@@ -90,7 +90,7 @@ async function scripted() {
 async function harness() {
 	const { bootPanel, projKeyOf, seqKeyOf } = require("../lib/panelHarness");
 	const S = require("./lib/session");
-	const fx = S.build();
+	const fx = cfg.single ? S.buildSingle() : S.build();
 	const extDir = String(cfg.extPath).replace(/\\/g, "/");
 	const cache = extDir + "/cache/" + projKeyOf(S.PROJ);
 	const h = await bootPanel({

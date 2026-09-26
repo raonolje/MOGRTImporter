@@ -111,13 +111,16 @@ async function checkPanel(dir, opts = {}) {
 /**
  * 명령 하나를 보내고 응답을 기다린다 → 패널 응답 {v, id, op, at, ok, data | error, detail, …}.
  * opts {seqId, build, by, id, timeoutMs(기본 15초), pollMs}
+ * seqId는 문자열이면 빈 문자열("" = 시퀀스 없음)도 싣는다 — 패널이 지금 시퀀스와 맞춘다 (빈 seq_id로 확인을 건너뛰지 못하게).
+ * build·by는 비어 있으면 싣지 않는다.
  * 시간 안에 응답이 없으면 BridgeError("timeout"): 패널이 아직 가져가지 않은 명령은 거둬서(withdrawn) 나중에 돌지 않게 한다.
  */
 async function call(dir, op, args, opts = {}) {
 	const id = opts.id || newId();
 	if (!ID_RE.test(id)) throw new BridgeError("bad-args", "명령 id 형식이 아니다: " + id);
 	const msg = { v: 1, id, op, args: args || {}, at: Date.now() };
-	["seqId", "build", "by"].forEach((k) => { if (typeof opts[k] === "string" && opts[k]) msg[k] = opts[k]; });
+	if (typeof opts.seqId === "string") msg.seqId = opts.seqId;
+	["build", "by"].forEach((k) => { if (typeof opts[k] === "string" && opts[k]) msg[k] = opts[k]; });
 	const inbox = path.join(dir, "inbox");
 	const outFile = path.join(dir, "outbox", id + ".json");
 	fs.mkdirSync(inbox, { recursive: true });

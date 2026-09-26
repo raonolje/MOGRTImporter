@@ -3,6 +3,7 @@
 // set_cast_proposal(패널 승인 카드, 화자 표·타임라인 그대로). 진짜 서버(SDK Client, stdio) ↔ 다리 ↔ 진짜 패널(app.js 전체를 vm으로, 가짜 패널 harness 모드).
 //   20줄 포인트 텍스트 제안 → 대기열에만(속성 그대로, 'AI 제안 (20)'), 낡은 field_sig·캡션 필드·섞인 오류·최대 개수 초과는 아무것도 넣지 않음,
 //   seq_id가 다르면 seq-mismatch, '#12 T2'는 find_row로, 한국어 메모 왕복, core 해시가 다르면 패널에 아무것도 보내지 않고 거절.
+//   화자 없는 목록(v27 단일 화자): '#12 T2' → find_row → uid '12' → suggest_fields, seq_id가 다르거나 비었으면 seq-mismatch.
 // 실행: npm run test:mcp (mcp/에서 npm install 필요)
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -13,12 +14,12 @@ const M = require("./lib/mcpClient");
 const DOT = String.fromCharCode(0xb7);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function harness(tag, clientName) {
+async function harness(tag, clientName, extra) {
 	const tmp = M.tmpDir(tag);
 	const ext = M.makeExt(tmp);
 	const appdata = path.join(tmp, "appdata");
 	const snapFile = path.join(tmp, "snap.json");
-	const fake = await M.startFake(tmp, { mode: "harness", appdata, extPath: ext.extPath, snapFile });
+	const fake = await M.startFake(tmp, Object.assign({ mode: "harness", appdata, extPath: ext.extPath, snapFile }, extra || {}));
 	const c = await M.connect({ MI_BRIDGE_DIR: path.join(appdata, "MogrtImporter", "bridge") }, clientName);
 	// 스냅숏은 0.3초마다 쓰인다 → 새것을 기다린다
 	const snap = async () => {
@@ -109,6 +110,37 @@ test("끝에서 끝: suggest_fields 20줄 포인트 텍스트 → 제안 대기�
 		const rs = s.snapshot.rowStates;
 		assert.equal(Object.keys(rs).filter((id) => rs[id].sugg && rs[id].sugg.T2).length, 21);
 		assert.ok(Object.keys(rs).every((id) => rs[id]._allParams[1].value === ""), "승인 전에는 속성에 아무것도 쓰지 않았다");
+	} finally {
+		await x.done();
+	}
+});
+
+test("끝에서 끝 (화자 없는 목록, v27 단일 화자): '#12 T2' → find_row → uid '12' → suggest_fields, seq_id가 다르거나 비었으면 seq-mismatch", async () => {
+	const x = await harness("single", "codex-mcp-client", { single: true });
+	try {
+		const st = await x.call("get_status", {});
+		assert.equal(st.isError, false, st.text);
+		const seq_id = st.json.seq_id;
+		assert.deepEqual([seq_id, st.json.panel.castMode, st.json.panel.rows], ["seq-mcp-1", false, 14]);
+		const fr = await x.call("find_row", { label: "#12 T2" });
+		assert.equal(fr.isError, false, fr.text);
+		assert.deepEqual([fr.json.seq_id, fr.json.uid, fr.json.label, fr.json.text, fr.json.fid, fr.json.field.caption], [seq_id, "12", "#12", "오늘 날씨 12번 하늘 맑음", "T2", false]);
+		const item = { uid: fr.json.uid, field_id: fr.json.fid, field_sig: fr.json.sig, value: "날씨$$맑음" };
+		// uid '12'는 줄 번호라 다른 시퀀스에도 있다: 다른 seq_id나 빈 seq_id로는 들어가지 않는다
+		for (const bad of ["다른 시퀀스", ""]) {
+			const r = await x.call("suggest_fields", { seq_id: bad, items: [item] });
+			assert.deepEqual([r.isError, r.json.code], [true, "seq-mismatch"], JSON.stringify(bad) + " " + r.text);
+		}
+		assert.equal((await x.call("get_suggestions", {})).json.suggestions.length, 0);
+		const r = await x.call("suggest_fields", { seq_id, items: [item] });
+		assert.equal(r.isError, false, r.text);
+		assert.deepEqual([r.json.queued, r.json.results[0].uid, r.json.results[0].kind, r.json.results[0].check], [1, "12", "point", "✓ 본문에 있음"]);
+		const sg = await x.call("get_suggestions", {});
+		assert.deepEqual(sg.json.suggestions.map((q) => [q.uid, q.label, q.fid, q.v, q.by]), [["12", "#12", "T2", "날씨$$맑음", "codex"]]);
+		const s = await x.snap();
+		assert.equal(s.ui.sugg, "AI 제안 (1)");
+		assert.equal(s.snapshot.rowStates[12]._allParams[1].value, "", "승인 전에는 속성에 아무것도 쓰지 않았다");
+		assert.deepEqual(s.errors, []);
 	} finally {
 		await x.done();
 	}

@@ -71,7 +71,7 @@ const GUIDE = [
 	"",
 	"## 오류 {ok:false, code, message, hint}",
 	"- ai-link-off / panel-closed / no-heartbeat / panel-not-responding: 패널을 열고 'AI 연결 허용'을 켜 달라고 한다 (Premiere가 모달 창으로 멈췄을 수도 있다).",
-	"- panel-version-mismatch: 패널 코드와 서버가 읽은 설치본이 다르다. 쓰기를 멈추고 패널 새로 고침(또는 Premiere 재시작)을 부탁한다.",
+	"- panel-version-mismatch: 패널 코드와 서버가 읽은 설치본이 다르거나, 설치된 패널이 서버보다 옛 버전이라 명령을 모른다. 쓰기를 멈추고 패널 새로 고침(또는 새 버전 설치·Premiere 재시작)을 부탁한다.",
 	"- seq-mismatch: 그 사이 시퀀스가 바뀌었다. get_status부터 다시.",
 	"- busy: 패널이 타임라인에 적용하는 중이다. 끝난 뒤 다시.",
 	"- timeout: 패널이 제시간에 답하지 않았다. 잠시 뒤 다시 (검수·계획은 오래 걸릴 수 있다).",

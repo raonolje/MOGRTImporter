@@ -10870,6 +10870,8 @@ var modalState = {
 	}
 	// 설치된 app.js의 src/mi/core.ts 본문 해시 (5단계 MCP 서버가 같은 core를 쓰는지 확인하는 값).
 	// 패널이 실제로 로드한 파일을 읽는다. 읽지 못하면 null (한 번만 시도한다).
+	// 부팅 때(이 스크립트가 도는 그때) 한 번 잰다 — 'AI 연결 허용'을 켤 때 처음 재면, 그 사이 설치본이 바뀐 경우(새로 고치지 않은 재배포)
+	// 새 파일의 해시를 알려 서버가 돌지 않는 core로 확인하고 panel-version-mismatch를 놓친다 (M5.1 리뷰).
 	var _coreHashMemo;
 	function _coreHash() {
 		if (_coreHashMemo !== undefined) return _coreHashMemo;
@@ -10885,6 +10887,7 @@ var modalState = {
 		} catch (_) {}
 		return _coreHashMemo;
 	}
+	_coreHash();
 	function _rowSummaryOf(sub) {
 		const rs = state.rowStates[sub.id];
 		const preset = rs && rs.presetId ? state.presets[rs.presetId] : null;

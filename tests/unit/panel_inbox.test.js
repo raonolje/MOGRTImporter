@@ -1,13 +1,18 @@
 "use strict";
 // M5.1: 패널 인박스와 heartbeat (src/mi/inbox.ts) — panelHarness(app.js 전체, Node fs는 메모리) + premiereSim(hostscript 전체).
-// 'AI 연결 허용'은 기본 꺼짐(폴더를 읽지도 쓰지도 않는다), 켜면 heartbeat 2초마다(extPath·coreHash = 설치된 app.js core 해시),
+// 'AI 연결 허용'은 기본 꺼짐(폴더를 읽지도 쓰지도 않는다), 켜면 heartbeat 2초마다(extPath·coreHash = 부팅 때 로드한 app.js core 해시 —
+// 그 뒤 설치본이 바뀌어도 그대로),
 // 인박스 300 ms 폴링 → runCommand(agent): status 왕복, seq 다름, 2분 지난 명령, 같은 id 한 번만, 적용 중 busy,
 // suggest는 제안 대기열에만, 바꾸는 명령은 needs-approval, 끄면 {state: off} 한 번, 다시 열면 processed.json이 같은 id를 막는다.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { bootPanel, cachePaths: P, EXT_DIR, USER_DATA_DIR } = require("../lib/panelHarness");
 const { createSim, FT, TPS, aeText, color } = require("../lib/premiereSim");
-const { loadRegions, regionHash } = require("../lib/loadRegions");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { loadRegions, regionHash, sliceRegion, fnv1a32, APP_JS } = require("../lib/loadRegions");
+const MC = require("../../mcp/lib/core");
 
 const CORE = loadRegions(["src/mi/core.ts"]);
 const APPDATA = "C:/Users/test/AppData/Roaming";
@@ -153,6 +158,34 @@ test("켜면 heartbeat 2초마다: 버전·빌드·extPath·coreHash(설치된 a
 	assert.deepEqual(b.host && [b.host.v, b.host.build], [28, "@@BUILD@@"], "호스트 ping 결과");
 	assert.equal(h.host.calls.filter((c) => c.fn === "MI_ping").length, 1, "ping은 30초마다 한 번만");
 	assert.ok(!h.nodeFs.files.has(BR + "/heartbeat.json.tmp"), "tmp는 이름을 바꿔 남지 않는다");
+	noErrors(h);
+});
+
+test("coreHash는 부팅 때 로드한 core의 해시: 설치본 app.js가 바뀐 뒤(패널을 새로 고치지 않은 재배포) 켜도 heartbeat·status는 로드한 core → 서버가 panel-version-mismatch로 막는다", async () => {
+	const h = await boot();
+	const loaded = regionHash("src/mi/core.ts");
+	// 부팅 뒤 설치 폴더의 app.js를 core가 다른 새 빌드로 바꾼다 (패널은 옛 코드 그대로 돈다)
+	const newer = fs.readFileSync(APP_JS, "utf8").replace(/\r\n/g, "\n").replace("//#region src/mi/core.ts\n", "//#region src/mi/core.ts\n\t// 새 빌드 (재배포)\n");
+	const newerHash = fnv1a32(sliceRegion("src/mi/core.ts", newer).text);
+	assert.notEqual(newerHash, loaded);
+	h.fs.files.set(EXT_DIR + "/html/js/app.js", newer);
+	assert.equal(h.fs.readFile(EXT_DIR + "/html/js/app.js").data, newer, "설치본은 새 빌드");
+	linkOn(h);
+	assert.equal(hb(h).coreHash, loaded, "heartbeat = 로드한 core (설치본의 새 해시가 아니다)");
+	const r = await roundTrip(h, cmdMsg("status"));
+	assert.equal(r.data.coreHash, loaded);
+	await h.advance(2000);
+	assert.equal(hb(h).coreHash, loaded);
+	// 서버(mcp/lib/core.js)는 설치본(새 빌드)을 읽는다 → 패널이 알린 해시와 달라 쓰기 도구를 막는다
+	const ext = fs.mkdtempSync(path.join(os.tmpdir(), "mi_corehash_"));
+	try {
+		fs.mkdirSync(path.join(ext, "html", "js"), { recursive: true });
+		fs.writeFileSync(path.join(ext, "html", "js", "app.js"), newer);
+		const lc = MC.loadCore({ extPath: ext, coreHash: hb(h).coreHash });
+		assert.deepEqual([lc.ok, lc.code, lc.panel, lc.server], [false, "panel-version-mismatch", loaded, newerHash]);
+	} finally {
+		fs.rmSync(ext, { recursive: true, force: true });
+	}
 	noErrors(h);
 });
 
