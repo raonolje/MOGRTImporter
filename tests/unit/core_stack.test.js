@@ -51,9 +51,44 @@ test("stackLevels: 동시에 보이는 2·3화자는 castOrder 순서로 층 0/1
 	assert.deepEqual(plain(C.stackLevels([sub(1, "C1", 100, 200), sub(2, "C1", 150, 250)], cast3(), ["C1", "C2"], FT)), {});
 	// 화자 표에 없는 화자·길이 0인 줄은 뺀다
 	assert.deepEqual(plain(C.stackLevels([sub(1, "C1", 100, 200), sub(2, "C9", 150, 250)], cast3(), ["C1", "C2"], FT)), {});
-	// 이어지는 겹침은 한 묶음 (A-B, B-C가 겹치면 A·B·C 한 묶음)
+	// 이어지는 겹침은 한 묶음 (A-B, B-C가 겹치면 A·B·C 한 묶음). 층은 줄마다 실제로 겹치는 앞 화자 줄 위로:
+	// C2는 C1 위(1), C3는 겹치는 C2 위(2) — 동시에 보이는 둘은 늘 castOrder 순서로 아래에서 위로
 	const chain = plain(C.stackLevels([sub(1, "C1", 100, 200), sub(2, "C2", 180, 300), sub(3, "C3", 280, 400)], cast3(), ["C1", "C2", "C3"], FT));
 	assert.deepEqual([chain[1].level, chain[2].level, chain[3].level, chain[1].group === chain[3].group], [0, 1, 2, true]);
+});
+
+test("stackLevels: 사슬 묶음이어도 겹치지 않는 화자 때문에 더 올라가지 않는다 (세 사람 대화, 한 번에 둘까지)", () => {
+	const order = ["C1", "C2", "C3"];
+	// C3–C1, C1–C3, C3–C2가 2프레임씩 겹친다: 한 번에 보이는 자막은 둘까지 → 층 1까지 (C3만 위, C1·C2는 겹치지 않아 둘 다 0)
+	const dlg = plain(C.stackLevels([sub(1, "C3", 0, 100), sub(2, "C1", 98, 200), sub(3, "C3", 198, 300), sub(4, "C2", 298, 400)], cast3(), order, FT));
+	assert.deepEqual([1, 2, 3, 4].map((i) => dlg[i].level), [1, 0, 1, 0]);
+	assert.equal(new Set([1, 2, 3, 4].map((i) => dlg[i].group)).size, 1, "한 묶음");
+	// C1–C3, C3–C2만 겹친다 (C1·C2는 겹치지 않는다) → C3만 층 1
+	const skip = plain(C.stackLevels([sub(1, "C1", 100, 200), sub(2, "C3", 180, 300), sub(3, "C2", 280, 400)], cast3(), order, FT));
+	assert.deepEqual([skip[1].level, skip[2].level, skip[3].level], [0, 1, 0]);
+	// 셋이 한꺼번에 겹치는 곳이 있으면 0/1/2 (그 뒤 C3와만 겹치는 C1도 0)
+	const three = plain(C.stackLevels([sub(1, "C1", 100, 200), sub(2, "C2", 120, 220), sub(3, "C3", 150, 320), sub(4, "C1", 300, 400)], cast3(), order, FT));
+	assert.deepEqual([1, 2, 3, 4].map((i) => three[i].level), [0, 1, 2, 0]);
+	// 겹치는 줄끼리는 늘 층이 다르다 (무작위 대화 200줄)
+	let seed = 7;
+	const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+	const rows = [];
+	let t = 0;
+	for (let i = 1; i <= 200; i++) {
+		const K = "C" + (1 + Math.floor(rnd() * 3));
+		const sf = t + Math.floor(rnd() * 40) - 20;
+		rows.push(sub(i, K, Math.max(0, sf), Math.max(0, sf) + 30 + Math.floor(rnd() * 60)));
+		t += 25 + Math.floor(rnd() * 30);
+	}
+	const lv = plain(C.stackLevels(rows, cast3(), order, FT));
+	const fr = plain(C.speakerFrames(rows, FT));
+	const rk = (K) => order.indexOf(K);
+	for (const a of rows) for (const b of rows) {
+		if (a.id >= b.id || a.spk === b.spk || fr[a.id].zero || fr[b.id].zero) continue;
+		if (!(fr[a.id].sf < fr[b.id].ef && fr[b.id].sf < fr[a.id].ef)) continue;
+		const [lo, hi] = rk(a.spk) < rk(b.spk) ? [a, b] : [b, a];
+		assert.ok(lv[lo.id].level < lv[hi.id].level, "겹치는 " + lo.spk + "·" + hi.spk + " 줄 " + lo.id + "·" + hi.id + ": " + lv[lo.id].level + " < " + lv[hi.id].level);
+	}
 });
 
 test("stackLevels·rowMotions: 여러 줄 자막은 묶음의 가장 긴 줄 수만큼 간격을 곱한다 · 위치 없는 화자는 (0.5, 0.5)에서 쌓는다", () => {
@@ -72,6 +107,29 @@ test("stackLevels·rowMotions: 여러 줄 자막은 묶음의 가장 긴 줄 수
 	// 간격을 바꾸면 쌓은 줄만 바뀐다
 	const wide = plain(C.rowMotions(rows, Object.assign({}, mi, { stackDy: 0.2 }), FT));
 	assert.deepEqual([wide[2].mo, wide[4].mo, wide[1].mo], [{ x: 0.5, y: 0.1 }, { x: 0.5, y: 0.3 }, { x: 0.35, y: 0.5 }]);
+});
+
+test("rowMotions: 위치가 '변경 안 함'인 화자의 쌓은 줄은 그 줄 클립의 지난 자리(applied: 쌓았던 줄은 mb, 아니면 mo)에서 쌓는다", () => {
+	const rows = [sub(1, "C1", 100, 200), sub(2, "C2", 150, 250), sub(3, "C1", 400, 500), sub(4, "C2", 420, 480), sub(5, "C1", 700, 800), sub(6, "C2", 720, 780)];
+	const mi = {
+		salt: SALT, cast: cast3(), castOrder: ["C1", "C2"], stack: true, stackDy: 0.12,
+		applied: {
+			"ab12-2": { mo: { x: 0.65, y: 0.5 } }, // 지난번에 쌓지 않았다 → mo가 쌓기 전 자리
+			"ab12-4": { mo: { x: 0.65, y: 0.38 }, mb: { x: 0.65, y: 0.5 } } // 지난번에 쌓았다 → mb
+		}
+	};
+	const m = plain(C.rowMotions(rows, mi, FT));
+	assert.deepEqual(m[2], { mo: { x: 0.65, y: 0.38 }, mb: { x: 0.65, y: 0.5 }, level: 1 }, "(0.5, 0.5)로 튀지 않는다");
+	assert.deepEqual(m[4], { mo: { x: 0.65, y: 0.38 }, mb: { x: 0.65, y: 0.5 }, level: 1 });
+	assert.deepEqual(m[6], { mo: { x: 0.5, y: 0.38 }, mb: { x: 0.5, y: 0.5 }, level: 1 }, "지난 자리가 없으면 (0.5, 0.5)");
+	assert.deepEqual([m[1].mo, m[3].mo], [null, null], "층 0은 건드리지 않는다");
+	// 화자 위치가 있으면 그것이 먼저
+	mi.cast.C2.pos = { x: 0.35, y: 0.5 };
+	assert.deepEqual(plain(C.rowMotions(rows, mi, FT))[4], { mo: { x: 0.35, y: 0.38 }, mb: { x: 0.35, y: 0.5 }, level: 1 });
+	// salt가 다르면 지난 자리로 보지 않는다
+	mi.cast.C2.pos = null;
+	mi.salt = "zz99";
+	assert.deepEqual(plain(C.rowMotions(rows, mi, FT))[2].mb, { x: 0.5, y: 0.5 });
 });
 
 test("castPosKind·roundPos·lineCount·samePos", () => {
@@ -223,6 +281,30 @@ test("planPlacement: 쌓기 — 켜면 층 1 이상인 줄만 위치를 보내�
 	runPlan(p, mi, scan, details);
 	assert.deepEqual([plain(mi.applied["ab12-2"].mo), mi.applied["ab12-2"].mb], [{ x: 0.5, y: 0.5 }, undefined]);
 	assert.equal(planOf(rows, mi, scan, details).ops.length, 0);
+});
+
+test("planPlacement: 쌓은 화자를 '변경 안 함'으로 되돌려도 쌓은 줄은 그대로, 쌓기를 끄면 그 화자의 지난 자리로 (원래 자리로 튀지 않는다)", () => {
+	const rows = [row(1, "C1", 100, 200), row(2, "C2", 150, 250), row(3, "C2", 400, 460)];
+	const mi = { salt: SALT, cast: cast3({ C2: { x: 0.65, y: 0.5 } }), castOrder: ["C1", "C2"], applied: {}, legacyTrack: null, stack: true, stackDy: 0.12 };
+	const scan = scanEmpty();
+	const details = {};
+	const byId = (p) => p.ops.slice().sort((a, b) => a.id - b.id).map((o) => [o.op, o.id, plain(o.motion)]);
+	let p = planOf(rows, mi, scan, details);
+	assert.deepEqual(byId(p), [["place", 1, null], ["place", 2, { x: 0.65, y: 0.38 }], ["place", 3, { x: 0.65, y: 0.5 }]]);
+	runPlan(p, mi, scan, details);
+	mi.cast.C2.pos = null;
+	p = planOf(rows, mi, scan, details);
+	assert.deepEqual(byId(p), [], "'변경 안 함': 쌓은 줄도 그대로 (x 0.5로 옮기지 않는다)");
+	mi.stack = false;
+	p = planOf(rows, mi, scan, details);
+	assert.deepEqual(byId(p), [["update", 2, { x: 0.65, y: 0.5 }]], "쌓기 전 자리 = 오른쪽 (한 화자의 줄이 두 x로 갈리지 않는다)");
+	runPlan(p, mi, scan, details);
+	assert.equal(planOf(rows, mi, scan, details).ops.length, 0);
+	// 다시 쌓으면 (위치 '변경 안 함') 지난 자리 오른쪽에서 쌓는다
+	mi.stack = true;
+	p = planOf(rows, mi, scan, details);
+	assert.deepEqual(byId(p), [["update", 2, { x: 0.65, y: 0.38 }]]);
+	assert.deepEqual(plain(p.ops[0].mb), { x: 0.65, y: 0.5 });
 });
 
 test("appliedEntryOf·planPlacement: 위치를 쓰지 못하면(키프레임) h를 비우고 지난 위치 → 다음 계획이 위치만 다시 보낸다", () => {

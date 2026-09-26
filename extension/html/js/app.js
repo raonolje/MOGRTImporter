@@ -3592,10 +3592,12 @@
 		const n = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "").length;
 		return Math.max(1, n);
 	}
-	// 동시 발화 쌓기 (#castStackChk, 기본 끔): 화자 줄의 프레임 구간(speakerFrames)을 시작 순으로 훑어 겹치는 구간이 이어진 묶음
-	// (동시에 보이는 줄들)을 만들고, 두 화자 이상인 묶음 안에서 그 묶음의 화자를 castOrder 순서로 층 0, 1, 2…에 둔다.
-	// 끝과 시작이 맞닿은 줄은 겹치지 않는다 (쌓지 않는다). 같은 화자는 한 층이다.
-	// lines = 묶음에서 줄이 가장 많은 자막의 줄 수 (y = y0 − 층 × stackDy × lines, rowMotions)
+	// 동시 발화 쌓기 (#castStackChk, 기본 끔): 화자 줄의 프레임 구간(speakerFrames)을 시작 순으로 훑어 겹치는 구간이 이어진 묶음을 만들고,
+	// 두 화자 이상인 묶음 안에서 줄마다 층을 매긴다: 층 = 그 줄과 실제로 겹치는(동시에 보이는) castOrder가 앞선 화자 줄들의 가장 높은 층 + 1,
+	// 그런 줄이 없으면 0. → 동시에 보이는 줄끼리는 늘 castOrder 순서로 아래에서 위로 서로 다른 층이고, 묶음이 사슬처럼 이어져도
+	// (A-B, B-C만 겹친다) 겹치지 않는 화자 때문에 더 올라가지 않는다 (예: C3가 C1·C2와 따로 겹치면 C3만 층 1).
+	// 끝과 시작이 맞닿은 줄은 겹치지 않는다 (쌓지 않는다). 같은 화자의 줄은 서로 겹치지 않는다 (speakerFrames가 끝을 맞춘다).
+	// lines = 묶음에서 줄이 가장 많은 자막의 줄 수 (y = y0 − 층 × stackDy × lines, rowMotions — 묶음 전체에 같은 값이라 층이 다르면 겹치지 않는다)
 	//   rows: 화자 줄 [sub] (spk·startSec·endSec·text, lines가 숫자면 그것을 줄 수로), cast·castOrder (castOrder에 없는 화자는 C번호 순으로 뒤에)
 	// → {줄 id: {level, lines, group}} (두 화자 이상인 묶음의 줄만)
 	function stackLevels(rows, cast, castOrder, frameTicks) {
@@ -3619,7 +3621,18 @@
 			if (keys.length >= 2) {
 				keys.sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
 				const lines = Math.max(...group.map((g) => (typeof g.s.lines === "number" && g.s.lines > 0 ? g.s.lines : lineCount(g.s.text))));
-				group.forEach((g) => { out[g.s.id] = { level: keys.indexOf(g.s.spk), lines, group: gi }; });
+				// castOrder 순(같은 화자는 시작 순)으로 매긴다: 앞선 화자의 줄은 이미 층이 있다
+				const byRank = group.slice().sort((a, b) => keys.indexOf(a.s.spk) - keys.indexOf(b.s.spk) || a.sf - b.sf);
+				const lvOf = new Map();
+				byRank.forEach((g) => {
+					const ki = keys.indexOf(g.s.spk);
+					let level = 0;
+					byRank.forEach((o) => {
+						if (keys.indexOf(o.s.spk) < ki && lvOf.has(o) && o.sf < g.ef && g.sf < o.ef) level = Math.max(level, lvOf.get(o) + 1);
+					});
+					lvOf.set(g, level);
+					out[g.s.id] = { level, lines, group: gi };
+				});
 				gi++;
 			}
 			group = [];
@@ -3634,11 +3647,15 @@
 		return out;
 	}
 	// 줄마다 원하는 위치 → {줄 id: {mo: {x, y} | null, mb: 쌓기 전 자리 | null, level}} (rows = 화자 줄 전부)
-	//   mo: 화자 위치 cast[K].pos (null = 건드리지 않는다). 쌓기가 켜져 있고 층이 1 이상이면 y = (pos.y ?? 0.5) − 층 × stackDy × lines,
-	//   x = pos.x ?? 0.5 (그때 mb = 쌓기 전 자리 {pos.x ?? 0.5, pos.y ?? 0.5} — 쌓기가 풀리면 계획이 그 자리로 되돌린다)
+	//   mo: 화자 위치 cast[K].pos (null = 건드리지 않는다). 쌓기가 켜져 있고 층이 1 이상이면 y = 쌓기 전 자리 y − 층 × stackDy × lines,
+	//   x = 쌓기 전 자리 x (그때 mb = 쌓기 전 자리 — 쌓기가 풀리면 계획이 그 자리로 되돌린다).
+	//   쌓기 전 자리 = 화자 위치, 없으면('변경 안 함') 그 줄 클립의 지난 자리 (mi.applied: 쌓았던 줄은 mb, 아니면 mo), 그것도 없으면 (0.5, 0.5)
+	//   — '변경 안 함'으로 되돌린 화자의 쌓은 줄이 원래 자리로 튀지 않게 (spec position: null은 클립을 되돌리지 않는다)
 	function rowMotions(rows, mi, frameTicks) {
 		const m = mi || miDefault();
 		const cast = m.cast || {};
+		const applied = m.applied || {};
+		const salt = String(m.salt || "");
 		const dy = typeof m.stackDy === "number" && isFinite(m.stackDy) ? m.stackDy : STACK_DY_DEFAULT;
 		const lv = m.stack === true ? stackLevels(rows, cast, m.castOrder, frameTicks) : {};
 		const out = {};
@@ -3648,7 +3665,8 @@
 			const l = lv[s.id];
 			if (l && l.level > 0) {
 				// 화면 밖으로 한참 나가도 쓸모가 없다 → STACK_Y_MIN에서 멈춘다 (호스트는 ±10 밖의 값을 받지 않는다)
-				const b = pos || { x: 0.5, y: 0.5 };
+				const a = !pos && salt ? applied[salt + "-" + s.id] : null;
+				const b = pos || (a && (roundPos(a.mb) || roundPos(a.mo))) || { x: 0.5, y: 0.5 };
 				out[s.id] = { mo: roundPos({ x: b.x, y: Math.max(STACK_Y_MIN, b.y - l.level * dy * l.lines) }), mb: b, level: l.level };
 			} else out[s.id] = { mo: pos, mb: null, level: l ? l.level : 0 };
 		});
@@ -8452,10 +8470,13 @@ var modalState = {
 	// '직접'을 고르면 x·y 칸이 나오고, 칸을 고쳐야 저장한다 (원래 자리와 같은 값이어도 '직접' 칸이 닫히지 않게 화자별로 기억한다).
 	// 바꾸면 _castSetItems (session.json·cast.json·cast_defaults.json·히스토리). 다음 ▶는 위치만 바뀐 줄에 위치만 보낸다.
 	// '변경 안 함'으로 되돌려도 클립은 그대로다 — 원래 자리로 옮기려면 '원래 자리'를 고른다
-	var _castPosCustom = {}; // {K: true} '직접'을 고른 화자 (창마다, 저장하지 않는다)
+	// '직접'을 고른 화자 {K: {pos: 그때(또는 직접 칸으로 저장한) 위치}} (창마다, 저장하지 않는다).
+	// 저장된 위치가 그 값과 다르면(AI cast.set·히스토리 복원·다른 세션 등 칸 밖에서 바뀌었다) 잊는다 — 칸이 지금 값을 그대로 보이게
+	var _castPosCustom = {};
 	function _castPosEls(K) {
 		const c = state.mi.cast[K];
 		const cur = posOk(c.pos) ? roundPos(c.pos) : null;
+		if (_castPosCustom[K] && !samePos(_castPosCustom[K].pos, cur)) delete _castPosCustom[K];
 		const kind = _castPosCustom[K] ? "custom" : castPosKind(cur);
 		const sel = document.createElement("select");
 		sel.className = "cast-pos";
@@ -8485,7 +8506,7 @@ var modalState = {
 		sel.addEventListener("change", () => {
 			const v = sel.value;
 			if (v === "custom") {
-				_castPosCustom[K] = true;
+				_castPosCustom[K] = { pos: cur };
 				xi.style.display = "";
 				yi.style.display = "";
 				return;
@@ -8505,6 +8526,7 @@ var modalState = {
 				return;
 			}
 			const p = roundPos({ x, y });
+			_castPosCustom[K] = { pos: p };
 			_castSetItems([{ key: K, pos: p }], { label: "화자 위치: " + K + " " + p.x + ", " + p.y });
 		};
 		xi.addEventListener("change", commit);
@@ -8700,10 +8722,11 @@ var modalState = {
 				else if (act === "delete") _castDelete(K);
 			});
 			menu.appendChild(b);
+			return b;
 		};
 		item("이 화자 줄에 기본 프리셋 적용", "preset");
 		item("이 화자 줄 선택", "select");
-		item("위치만 다시 적용", "pos");
+		item("위치만 다시 적용", "pos").title = "이 화자 클립의 위치(Motion Position)만 씁니다. 하나라도 쓰면 '↶ 마지막 적용 되돌리기'는 그 전 ▶ 대신 이 위치 쓰기를 되돌립니다";
 		item("화자 삭제 (줄은 휴지통으로)", "delete", "danger");
 		row.appendChild(menu);
 		_castMenuEl = menu;
@@ -13082,6 +13105,7 @@ var modalState = {
 	//   위치가 '변경 안 함'이고 쌓은 줄도 없으면 보내지 않는다. 스캔은 ▶와 같은 트랙·창 (_miScanTracks, 줄 자리 ±30초).
 	//   결과: applied의 위치(mo·mb)와 의도 해시(기본 해시 hb를 알면 h = hb + 새 위치) → 다음 ▶는 그 줄을 그대로로 본다.
 	//   last_apply에 새 기록(updated, 속성 없음, 쓰기 전 위치 pos0) → '↶ 마지막 적용 되돌리기'가 위치를 되돌린다.
+	//   기록은 위치를 하나라도 쓴 때만 바꾼다 (하나도 못 쓰면 그 전 ▶ 기록이 그대로 남아 되돌릴 수 있다).
 	// → {ok, applied, keyed, failed, noClip, dup, stopped} | {ok: false, error}
 	// ─────────────────────────────────────────────────────────────
 	const MOTION_BATCH = 40;
@@ -13166,10 +13190,11 @@ var modalState = {
 				setStatus(nm + ": 위치를 쓸 클립이 타임라인에 없습니다" + (st.dup ? " (중복 " + st.dup + ")" : ""), "err");
 				return Object.assign({ ok: false, error: "no-clips" }, st);
 			}
+			// 기록은 위치를 하나라도 쓴 뒤에야 파일에 남긴다: 하나도 쓰지 못하면(모두 키프레임·실패, 첫 호출 예외, 쓰기 전에 중지)
+			// 그 전 ▶의 기록을 그대로 둔다 — 타임라인이 그대로인데 '↶ 마지막 적용 되돌리기'만 잃지 않게
 			la = _laNew(seqId, state.mi.salt, items.length, false);
 			la.posOnly = K;
 			let laN = 0;
-			_writeLastApply(la);
 			let queue = items.slice();
 			let done = 0;
 			while (queue.length) {
@@ -13217,7 +13242,7 @@ var modalState = {
 				done += n;
 				queue = queue.slice(n);
 				la.chunksDone++;
-				_writeLastApply(la);
+				if (st.applied) _writeLastApply(la);
 			}
 		} catch (e) {
 			console.error("[MOGRT] 위치만 다시 적용 멈춤:", e);
@@ -13226,8 +13251,10 @@ var modalState = {
 		} finally {
 			try {
 				if (la) {
-					la.complete = !st.stopped && !st.error;
-					_writeLastApply(la);
+					if (st.applied) {
+						la.complete = !st.stopped && !st.error;
+						_writeLastApply(la);
+					}
 					if (seqTok0 === _importSeqToken()) {
 						saveSessionToStorage();
 						if (st.applied) _saveHistoryOnAction("위치만 다시 적용: " + K + " (" + st.applied + "개)");

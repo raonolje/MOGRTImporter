@@ -144,6 +144,36 @@ test("moveRegen·legacyMove·replace로 다시 놓은 클립에도 위치를 다
 	assert.deepEqual(plain(r.results[1].before.pos), [0.35, 0.5]);
 });
 
+test("replace가 실패해 옛 템플릿을 되놓으면(restored-old) 옛 위치도 되쓴다 · 옛 Position에 키가 있었으면 되살리지 않고 알린다", () => {
+	const { sim, seq, chunk } = setup();
+	let r = chunk([place(1, 2, 100, 150, { motion: { x: 0.35, y: 0.5 } }), place(2, 2, 400, 450)]);
+	const [p1, p2] = r.results;
+	assert.deepEqual([p1.motion, p2.motion], ["applied", "none"]);
+	// 새 템플릿 경로가 없어 놓지 못한다 → 옛 클립(0.35, 0.5)을 되놓는다
+	r = chunk([{ key: "ab12-1", op: "replace", g: 2, track: 2, sf: 100, ef: 150, own: { track: 2, sf: 100, nodeId: p1.nodeId, m: AE }, mogrtPath: "C:/m/없는.mogrt", durSec: 5.005, params: [], name: tag(1, 2), guard: [], motion: { x: 0.35, y: 0.5 } }]);
+	let x = r.results[0];
+	assert.deepEqual([x.status, x.reason, x.motion, plain(x.before.pos)], ["failed", "restored-old", "none", [0.35, 0.5]], JSON.stringify([x.reason, x.detail]));
+	let back = sim.clips(seq, 2).find((m) => m.name === tag(1, 1));
+	assert.ok(back, "옛 이름으로 되놓았다");
+	assert.deepEqual(sim.posOf(back), [0.35, 0.5], "되놓은 클립의 위치 = 옛 위치 (템플릿 기본 0.5, 0.5가 아니다)");
+	assert.doesNotMatch(x.detail || "", /위치/);
+	// 원래 자리였던 옛 클립: 위치를 쓰지 않는다 (이미 같다)
+	const sv0 = sim.S.counts.setValue;
+	r = chunk([{ key: "ab12-2", op: "replace", g: 2, track: 2, sf: 400, ef: 450, own: { track: 2, sf: 400, nodeId: p2.nodeId, m: AE }, mogrtPath: "C:/m/없는.mogrt", durSec: 5.005, params: [], name: tag(2, 2), guard: [] }]);
+	assert.deepEqual([r.results[0].status, r.results[0].reason], ["failed", "restored-old"]);
+	assert.deepEqual(sim.posOf(sim.clips(seq, 2).find((m) => m.name === tag(2, 1))), [0.5, 0.5]);
+	assert.equal(sim.S.counts.setValue - sv0, 2, "옛 속성 2개만 되쓴다 (위치는 이미 같아 쓰지 않는다)");
+	// 옛 Position에 키 → 되놓은 클립에 위치를 쓰지 않고 detail로 알린다
+	sim.keyMotion(back);
+	r = chunk([{ key: "ab12-1", op: "replace", g: 2, track: 2, sf: 100, ef: 150, own: { track: 2, sf: 100, nodeId: sim.nodeId(back), m: AE }, mogrtPath: "C:/m/없는.mogrt", durSec: 5.005, params: [], name: tag(1, 2), guard: [] }]);
+	x = r.results[0];
+	assert.deepEqual([x.status, x.reason, x.before.posKeyed], ["failed", "restored-old", true]);
+	assert.match(x.detail, /키프레임은 되살리지 못했다/);
+	back = sim.clips(seq, 2).find((m) => m.name === tag(1, 1));
+	assert.deepEqual(sim.posOf(back), [0.5, 0.5]);
+	assert.equal(sim.S.counts.setTimeVarying, 0);
+});
+
 test("실패한 작업(충돌)에는 위치를 쓰지 않는다 · 잘못된 motion은 bad-item", () => {
 	const { sim, seq, chunk } = setup();
 	sim.placeOther(seq, 2, 90, 400, "영상.mp4");

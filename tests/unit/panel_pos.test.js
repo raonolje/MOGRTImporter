@@ -7,6 +7,7 @@
 //   (d) ⋯ '위치만 다시 적용' → MI_setMotion만 (placeChunk 없음), applied 해시 → 다음 ▶ 보낼 것 없음 → 되돌리기가 위치를 되돌린다
 //   (e) 동시 발화 쌓기 켬/끔 → 겹치는 C2 줄만 위로, 끄면 쌓기 전 자리
 //   (f) ▶ 되돌리기 → 위치 되돌림
+//   (g) '위치만 다시 적용'이 하나도 못 쓰면 그 전 ▶ 기록 그대로 (h) '직접' 칸은 칸 밖에서 바뀐 위치를 따른다
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { bootPanel, cachePaths: P } = require("../lib/panelHarness");
@@ -301,5 +302,62 @@ test("(f) ▶로 바꾼 위치도 되돌리기가 되돌린다 · 다시 놓은 
 	assert.equal(h.status().text, "화자별 배치: 옮김 8", "C1은 V6으로, 자동인 C2는 첫 자동 화자라 기본 트랙(V3)으로");
 	assert.deepEqual(posRows(sim, seq, 2).map((x) => [x[0], x[1]]), [[2, 0.5], [4, 0.5], [6, 0.5], [8, 0.5]], "C2는 위치를 쓴 적이 없다 (원래 자리 그대로)");
 	assert.deepEqual(posRows(sim, seq, 5).map((x) => [x[0], x[1], x[3]]), [[1, 0.35, "철수 하나"], [3, 0.35, "철수 둘"], [5, 0.35, "철수 셋"], [7, 0.35, "철수 넷"]]);
+	noErrors(h);
+});
+
+test("(g) '위치만 다시 적용'이 하나도 쓰지 못하면(모두 키프레임·호스트 실패) 그 전 ▶ 기록을 그대로 둔다 → 되돌리기가 ▶를 되돌린다", async () => {
+	const { sim, seq, preset } = makeSim();
+	const h = await boot(sim, preset, castSession(preset, ROWS));
+	setSel(h, castRow(h, "C1").querySelector(".cast-pos"), "left");
+	await applyAll(h);
+	const la0 = h.fs.readJson(LA());
+	assert.equal(la0.created.length, 8);
+	// C1 클립 4개 모두 Position 키 → '위'로 바꾸고 위치만 다시 적용: 하나도 쓰지 못한다
+	sim.clips(seq, 2).forEach((m) => sim.keyMotion(m));
+	setSel(h, castRow(h, "C1").querySelector(".cast-pos"), "top");
+	menuClick(h, "C1", "pos");
+	await done(h);
+	assert.equal(calls(h, "MI_setMotion").length, 1);
+	assert.equal(h.status().text, "C1 철수 위치만 다시 적용: 위치 0개 · 키프레임이 있어 그대로 4");
+	assert.deepEqual(h.fs.readJson(LA()), la0, "last_apply 그대로 (빈 기록으로 바꾸지 않는다)");
+	assert.equal(h.fs.readJson(P.historyAuto(PROJ, A.seqId))[0].label, "화자 위치: C1 위", "히스토리도 남기지 않는다");
+	// 호스트가 첫 호출에서 실패해도 그대로
+	h.host.handlers.MI_setMotion = () => JSON.stringify({ ok: false, error: "exception", detail: "테스트" });
+	menuClick(h, "C1", "pos");
+	await done(h);
+	assert.match(h.status().text, /^중단됨/);
+	assert.deepEqual(h.fs.readJson(LA()), la0);
+	// 되돌리기 → ▶가 놓은 8개를 지운다
+	const r = await cmd(h, "undo", {});
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.equal(sim.clips(seq, 2).length + sim.clips(seq, 3).length, 0, "▶가 놓은 클립을 지웠다");
+	noErrors(h);
+});
+
+test("(h) '직접' 칸은 위치가 칸 밖에서 바뀌면(AI cast.set 등) 지금 값을 보인다 · 칸으로 저장한 값은 원래 선택지와 같아도 '직접'", async () => {
+	const { sim, preset } = makeSim();
+	const h = await boot(sim, preset, castSession(preset, ROWS));
+	setSel(h, castRow(h, "C2").querySelector(".cast-pos"), "custom");
+	const xi = castRow(h, "C2").querySelector(".cast-x");
+	xi.value = "0.35";
+	h.change(xi);
+	assert.deepEqual(h.snapshot().mi.cast.C2.pos, { x: 0.35, y: 0.5 });
+	assert.equal(castRow(h, "C2").querySelector(".cast-pos").value, "custom", "왼쪽과 같은 값이어도 직접 칸은 닫히지 않는다");
+	let r = await cmd(h, "cast.set", { items: [{ key: "C2", pos: null }] });
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.equal(h.snapshot().mi.cast.C2.pos, null);
+	assert.equal(castRow(h, "C2").querySelector(".cast-pos").value, "", "변경 안 함");
+	assert.equal(castRow(h, "C2").querySelector(".cast-x").style.display, "none");
+	r = await cmd(h, "cast.set", { items: [{ key: "C2", pos: { x: 0.65, y: 0.5 } }] });
+	assert.equal(r.ok, true, JSON.stringify(r));
+	assert.equal(castRow(h, "C2").querySelector(".cast-pos").value, "right");
+	// 직접 칸으로 0.7 → 칸 밖에서 0.65(오른쪽)로 → 오른쪽
+	setSel(h, castRow(h, "C2").querySelector(".cast-pos"), "custom");
+	const xi2 = castRow(h, "C2").querySelector(".cast-x");
+	xi2.value = "0.7";
+	h.change(xi2);
+	assert.equal(castRow(h, "C2").querySelector(".cast-pos").value, "custom");
+	r = await cmd(h, "cast.set", { items: [{ key: "C2", pos: { x: 0.65, y: 0.5 } }] });
+	assert.equal(castRow(h, "C2").querySelector(".cast-pos").value, "right");
 	noErrors(h);
 });

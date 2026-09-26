@@ -4292,6 +4292,8 @@ function MI__opReplace(ctx, it, pr, r) {
     if (back) {
         r.reason = "restored-old";
         if (!back.sameLay) r.detail += " (되놓은 클립의 속성 구조가 옛 클립과 다르다)";
+        if (back.pos === "failed" || back.pos === "keyframed") r.detail += " (되놓은 클립에 옛 위치를 쓰지 못했다)";
+        else if (back.pos === "keyed") r.detail += " (옛 위치의 키프레임은 되살리지 못했다)";
         MI__readback(r, back.clip, pr.ti, ctx.ft, false);
     } else {
         r.reason = "lost-old";
@@ -4329,7 +4331,17 @@ function MI__restoreOld(ctx, pr, it) {
     }
     MI__applyParamsSafe(c, MI__kind(c), b.params);
     MI__setName(c, b.name);
-    return { clip: c, sameLay: same };
+    /* 위치 (S4-1 스냅숏 pos): 되놓은 클립은 템플릿 기본 위치에서 시작한다 → 옛 위치가 지금과 다르면 되쓴다.
+       pos: none(스냅숏에 위치 없음·이미 같다) | applied | keyframed | failed | keyed (옛 Position에 키가 있었다 — 키는 스냅숏에 없어 되살리지 않는다) */
+    var pos = "none";
+    if (MI__isArr(b.pos) && b.pos.length === 2 && typeof b.pos[0] === "number" && typeof b.pos[1] === "number") {
+        if (b.posKeyed === true) pos = "keyed";
+        else {
+            var now = MI__posRead(c).pos;
+            if (!now || Math.abs(now[0] - b.pos[0]) > MI__POS_EPS || Math.abs(now[1] - b.pos[1]) > MI__POS_EPS) pos = MI__motionPos(c, b.pos[0], b.pos[1]).status;
+        }
+    }
+    return { clip: c, sameLay: same, pos: pos };
 }
 
 /* ══ 진입점: 쓰기 (S2-2) ══ */

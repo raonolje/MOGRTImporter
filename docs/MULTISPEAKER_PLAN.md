@@ -711,11 +711,15 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   - (S4-1 구현) `MI_placeChunk`는 작업이 끝나 클립이 남은 결과(placed·updated·replaced·moved·adopted·partial)에만 motion을 쓰고, 결과에 `motion`(none|applied|keyframed|failed)·
     `pos`(쓴 뒤 값)·`pos0`(기존 클립 update·adopt·move의 쓰기 전 값 — 되돌리기용)를 둔다. 위치를 쓰지 못해도 작업 상태는 바꾸지 않는다.
     'before' 스냅숏(`MI__snapOf`: move·replace·moveRegen·legacyMove·removeClips)에 `pos`·`posKeyed`를 더했다 (옛 클립을 되놓을 때 위치도 되돌린다).
+    replace가 실패해 호스트가 옛 템플릿을 되놓을 때(`MI__restoreOld`, restored-old)도 스냅숏 위치를 되쓴다 (키가 있던 Position은 되살리지 못해 detail로 알린다).
     `MI_readClipTexts`는 `want.pos`면 `pos`·`posKeyed`를 준다.
   - (S4-1 구현) `MI_setMotion`은 spec 상태에 `locked`(잠긴 트랙, 풀지 않는다)를 더하고, key가 uid면 이름의 태그(uid·g)를 확인한다(다르면 notFound reason tag).
     같은 태그 클립이 둘이면(자르기) ambiguous. 결과에 쓰기 전 값 `x0`·`y0`, 예산 7초와 `done`(placeChunk와 같다), 200개 상한.
 - **재배치 클립**(moveRegen, legacyMove, replace)에는 pos를 다시 적용한다. 효과가 있는 클립은 기본적으로 다시 놓지 않는다.
 - **동시 발화 쌓기**(기본 끔): `stackLevels`로 동시에 보이는 묶음 안에서 castOrder 순서로 층을 매긴다. y = y0 − 층 × stackDy × 줄 수.
+  - (S4-2 리뷰) 층은 줄마다 매긴다: 그 줄과 실제로 겹치는 castOrder가 앞선 화자 줄들의 가장 높은 층 + 1 (없으면 0). 동시에 보이는 줄끼리는 늘 castOrder 순서로
+    서로 다른 층이고, 겹침이 사슬처럼 이어진 묶음(A-B, B-C)에서도 겹치지 않는 화자 때문에 더 올라가지 않는다. 줄 수(lineFactor)는 묶음 전체의 최댓값 그대로다.
+  - (S4-2 리뷰) 위치가 '변경 안 함'인 화자의 쌓은 줄은 (0.5, 0.5)가 아니라 그 줄 클립의 지난 자리(applied: 쌓았던 줄은 mb, 아니면 mo)에서 쌓는다 — null은 클립을 되돌리지 않는다.
 - (S4-2 구현) **의도 해시**: 위치는 기본 해시 위에 얹는다 (`intentBase` + `motionHash`). 위치가 없으면 v1.2의 해시와 바이트까지 같아 올리기만 해서는 아무 줄도 다시 보내지 않는다.
   applied 항목에 `mo`(클립에 있다고 보는 위치)·`hb`(위치를 뺀 기본 해시, mo가 있을 때만)·`mb`(쌓기 전 자리, 쌓았을 때만)를 더했다 — 위치가 없던 줄의 항목 모양은 그대로다.
   기본 해시가 지금과 같고 위치만 다르면 계획은 되읽기 없이 **위치만 보내는 update**(속성 0·이름 null·keepTime)를 만든다 (`plan.motionOnly`, 점검 창·검수 '위치가 바뀜').
@@ -726,6 +730,7 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   ('키프레임이 있어 위치를 바꾸지 않음', 상태 줄 '위치 키프레임 N'). 사용자의 애니메이션은 늘 그대로다.
 - (S4-2 구현) **위치만 다시 적용**(⋯)은 `MI_setMotion`만 부른다 (40개씩). 쓴 줄은 applied의 mo·mb와 h(= hb + 새 위치)를 고쳐 다음 ▶가 그대로로 본다.
   last_apply에 새 기록(updated, 속성 없음, 쓰기 전 위치 `pos0`)을 남기므로 '↶ 마지막 적용 되돌리기'는 이 위치 변경을 되돌린다 (그 전 ▶ 기록 대신).
+  기록은 위치를 하나라도 쓴 때만 바꾼다 — 모두 키프레임·실패이거나, 첫 호출이 실패하거나, 쓰기 전에 중지하면 그 전 ▶ 기록이 그대로 남는다.
 - (S4-2 구현) **되돌리기**: 같은 클립의 위치를 바꾼 기록은 `pos0`(호스트 결과)로 update에 위치를 싣고, 다시 놓는 옛 클립은 'before' 스냅숏의 위치(키가 없고 원래 자리가
   아닐 때)로 놓는다. 덮인 이웃을 스냅숏으로 다시 놓을 때(`repairOps`)도 스냅숏 위치를 쓴다 (`_miSnapRead`가 want.pos로 읽는다).
 - (S4-2 구현) 새 화자는 프로젝트 `cast_defaults.json`의 위치를 기본값으로 받는다 (이름·프리셋·색과 같다. 없으면 null = 건드리지 않음). 화자 표 머리의
