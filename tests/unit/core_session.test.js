@@ -6,7 +6,7 @@ const { loadRegions, plain } = require("../lib/loadRegions");
 
 const core = loadRegions(["src/mi/core.ts"]);
 
-const DEFAULT = { v: 1, salt: "", hwm: 0, legacyTrack: null, remapped: false, castOrder: [], cast: {}, stack: false, stackDy: 0.12, applied: {} };
+const DEFAULT = { v: 1, salt: "", hwm: 0, legacyTrack: null, remapped: false, castOrder: [], cast: {}, stack: true, stackDy: 0.12, applied: {} }; // 쌓기 기본 켬 (2026-09-26)
 
 test("miDefault·miHasData", () => {
 	assert.deepEqual(plain(core.miDefault()), DEFAULT);

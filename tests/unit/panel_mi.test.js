@@ -11,7 +11,7 @@ const PROJ2 = "C:/work/mi_saveas.prproj";
 const A = { seqId: "aaaa-0001", seqName: "T_A", projPath: PROJ };
 const B = { seqId: "bbbb-0002", seqName: "T_B", projPath: PROJ };
 const C = { seqId: "cccc-0003", seqName: "T_C", projPath: PROJ };
-const DEFAULT_MI = { v: 1, salt: "", hwm: 0, legacyTrack: null, remapped: false, castOrder: [], cast: {}, stack: false, stackDy: 0.12, applied: {} };
+const DEFAULT_MI = { v: 1, salt: "", hwm: 0, legacyTrack: null, remapped: false, castOrder: [], cast: {}, stack: true, stackDy: 0.12, applied: {} }; // 쌓기 기본 켬 (2026-09-26)
 const DOT = String.fromCharCode(0xb7);
 const clone = (v) => JSON.parse(JSON.stringify(v));
 

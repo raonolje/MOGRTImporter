@@ -1445,7 +1445,7 @@
 	// ── mi 블록 (session.json의 선택 키) ──
 
 	function miDefault() {
-		return { v: 1, salt: "", hwm: 0, legacyTrack: null, remapped: false, castOrder: [], cast: {}, stack: false, stackDy: 0.12, applied: {} };
+		return { v: 1, salt: "", hwm: 0, legacyTrack: null, remapped: false, castOrder: [], cast: {}, stack: true, stackDy: 0.12, applied: {} };
 	}
 	// 저장할 내용이 있는가 (salt가 있거나 화자가 있다). 없으면 session.json에 mi를 쓰지 않는다
 	function miHasData(mi) {
@@ -1465,7 +1465,7 @@
 		mi.remapped = mi.remapped === true;
 		if (!Array.isArray(mi.castOrder)) mi.castOrder = [];
 		if (!isObj(mi.cast)) mi.cast = {};
-		if (typeof mi.stack !== "boolean") mi.stack = false;
+		if (typeof mi.stack !== "boolean") mi.stack = true; // 동시 발화 쌓기는 기본으로 켠다 (2026-09-26 사용자 결정). 명시적으로 끈 값은 그대로
 		if (typeof mi.stackDy !== "number" || !isFinite(mi.stackDy)) mi.stackDy = 0.12;
 		if (!isObj(mi.applied)) mi.applied = {};
 		return mi;
