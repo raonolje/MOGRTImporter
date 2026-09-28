@@ -1,0 +1,11 @@
+{
+  "version": "1.4.0",
+  "build": "prod-b3444dd",
+  "sourceCommit": "b3444dd3b0895e537a6c3cf73095a363aa3371a4",
+  "macOS": "experimental, not tested on Mac",
+  "artifacts": [
+    "MOGRTImporter_v1.4.0_Windows.exe",
+    "MOGRTImporter_v1.4.0_Windows.zip",
+    "MOGRTImporter_v1.4.0_macOS_experimental.zip"
+  ]
+}
