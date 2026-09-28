@@ -64,6 +64,10 @@ safe_directory_path() {
 same_extension() {
   grep -Eq '(ExtensionBundleId|Id)[[:space:]]*=[[:space:]]*"com[.]raonolje[.]mogrtimporter([.]panel)?"' "$1"
 }
+installed_extension() {
+  # Released 1.0.0/1.1.6 used the original com.manus bundle ID.
+  grep -Eq '(ExtensionBundleId|Id)[[:space:]]*=[[:space:]]*"com[.](raonolje|manus)[.]mogrtimporter([.]panel)?"' "$1"
+}
 check_duplicates() {
   local manifest folder
   if [ -e "$SYSTEM_EXTENSIONS/CEP_MogrtImporter" ] || [ -L "$SYSTEM_EXTENSIONS/CEP_MogrtImporter" ]; then
@@ -72,11 +76,11 @@ check_duplicates() {
   for manifest in "$SYSTEM_EXTENSIONS"/*/CSXS/manifest.xml "$EXTENSIONS"/*/CSXS/manifest.xml; do
     [ -f "$manifest" ] || continue
     folder=${manifest%/CSXS/manifest.xml}
-    if [ "$folder" != "$TARGET" ] && same_extension "$manifest"; then
+    if [ "$folder" != "$TARGET" ] && installed_extension "$manifest"; then
       fail "다른 위치에 같은 확장 ID가 있습니다: $folder. 그 설치본과 cache를 먼저 확인해 중복을 정리하세요."
     fi
   done
-  if [ -f "$TARGET/CSXS/manifest.xml" ] && ! same_extension "$TARGET/CSXS/manifest.xml"; then
+  if [ -f "$TARGET/CSXS/manifest.xml" ] && ! installed_extension "$TARGET/CSXS/manifest.xml"; then
     fail "대상 폴더의 확장 ID가 다릅니다: $TARGET. 다른 확장을 덮어쓰지 않습니다."
   fi
 }
