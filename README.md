@@ -6,6 +6,8 @@ Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 �
 - **대상** Premiere Pro 14.0 ~ (실측 26.5.1) / CEP 11.0
 - **번들 ID** `com.raonolje.mogrtimporter`
 
+현재 Windows 작업 저장소는 `D:\01_ClaudeAI\02_MOGRT_Importer`이며, 설치 파일은 그 아래 `releases\1.4.0`에 있다. 구버전 1.1.6 설치 파일은 현재 트리에서 제거했고 필요한 과거 자료는 Git 이력으로 확인한다.
+
 ## 구성
 
 | 경로 | 내용 |
@@ -17,7 +19,6 @@ Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 �
 | `packaging/` | 캐시를 보존하는 Windows/macOS 설치기 소스 |
 | `releases/1.4.0/` | 최신 설치 EXE, ZIP, SHA-256 및 소스 커밋 기록 |
 | `src/` | `app.js` 번들을 region 단위로 잘라낸 옛 분리본 (**동기화하지 않음, 참고용**) |
-| `installer_v1.1.6.exe` | 소스 복구의 출처가 된 원본 NSIS 인스톨러 (**업그레이드·롤백에 쓰지 않는다**) |
 | `RECOVERY_NOTES.md` | 복구 경위, 복구된 범위, 구조 메모 |
 
 ## 변경 내역

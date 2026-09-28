@@ -2,9 +2,14 @@
 
 The user requested on 2026-09-28 that this project stay updated in all three places:
 
-- Windows working repository: `D:/01/_ClaudeAI/02_MOGRT_Importer`
+- Windows working repository: `D:/01_ClaudeAI/02_MOGRT_Importer`
 - GitHub (`origin`): `https://github.com/raonolje/MOGRTImporter.git`
 - GitLab (`gitlab`): `https://code.raonolje.synology.me/raonolje/mogrt_importer.git`
+
+The user corrected the Windows path on 2026-09-28. Use the exact path above;
+do not recreate the old `D:/01/_ClaudeAI/02_MOGRT_Importer` checkout. Keep current
+installers in `releases/1.4.0/`; the obsolete 1.1.6 installer and duplicate local
+build staging were removed at the user's request. Preserve Git history and user data.
 
 For completed changes, run the relevant checks, commit the finished work locally,
 then update both remote repositories. This is standing authorization from the user;

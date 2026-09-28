@@ -1,6 +1,6 @@
 # Windows 설치
 
-최신 배포의 `MOGRTImporter_v1.4.0_Windows.exe`를 실행하세요. 저장소의 `installer_v1.1.6.exe`는 예전 코드 복구에 사용한 보관 파일이며, 최신 기능 설치·업데이트·롤백용이 아닙니다.
+최신 배포의 `MOGRTImporter_v1.4.0_Windows.exe`를 실행하세요. 예전 코드 복구에 사용한 `installer_v1.1.6.exe`는 현재 저장소에서 제거했으며 Git 이력에만 남아 있습니다. 최신 기능 설치·업데이트·롤백에 사용하지 마세요.
 
 ## 설치 파일 사용
 

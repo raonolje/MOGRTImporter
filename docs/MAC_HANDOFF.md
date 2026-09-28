@@ -4,7 +4,7 @@
 
 ## 작업 저장소와 동기화
 
-Mac에서는 사용자가 선택한 로컬 checkout을 Codex 작업 폴더로 연다. Windows 작업 경로 `D:/01/_ClaudeAI/02_MOGRT_Importer`를 Mac에 만들거나 그 경로에 의존하지 않는다. 처음 내려받을 때의 예시는 다음과 같다. 기존 checkout이 있으면 새로 복제하지 말고 그 저장소의 상태·remote부터 확인한다.
+Mac에서는 사용자가 선택한 로컬 checkout을 Codex 작업 폴더로 연다. Windows 작업 경로 `D:/01_ClaudeAI/02_MOGRT_Importer`를 Mac에 만들거나 그 경로에 의존하지 않는다. 처음 내려받을 때의 예시는 다음과 같다. 기존 checkout이 있으면 새로 복제하지 말고 그 저장소의 상태·remote부터 확인한다.
 
 ```sh
 git clone https://github.com/raonolje/MOGRTImporter.git "$HOME/Projects/MOGRTImporter"
