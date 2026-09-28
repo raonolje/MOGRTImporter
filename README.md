@@ -2,7 +2,7 @@
 
 Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 타임라인에 자동 배치하는 CEP 확장 패널.
 
-- **개발 버전** 1.4.0 (`hostscript.jsx` 내부 v27 + v28 `MI_` 구역). 운영 배포는 1.3.0이며, 1.4.0의 실앱 검증 현황은 [MCP_VALIDATION.md](docs/MCP_VALIDATION.md)를 참고한다.
+- **패키지 버전** 1.4.0 (`hostscript.jsx` 내부 v27 + v28 `MI_` 구역). Windows 설치본과 macOS 실험용 ZIP을 제공한다. 실제 검증 범위는 [MCP_VALIDATION.md](docs/MCP_VALIDATION.md)를 참고한다. macOS 실기 검증은 아직 완료하지 않았다.
 - **대상** Premiere Pro 14.0 ~ (실측 26.5.1) / CEP 11.0
 - **번들 ID** `com.raonolje.mogrtimporter`
 
@@ -14,13 +14,15 @@ Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 �
 | `docs/` | 작업 지시서(`MULTISPEAKER_PLAN.md`), Premiere 실측(`spike_s0*.md`), 테스트 절차(`TESTING.md`) |
 | `tests/` | node 단위 테스트(`npm test`)와 Premiere 하드 테스트(`npm run hard`, DEV 패널) |
 | `tools/` | DEV 설치(`install_dev.sh`), 캐시를 지키는 운영 배포(`deploy_prod.sh`) |
+| `packaging/` | 캐시를 보존하는 Windows/macOS 설치기 소스 |
+| `releases/1.4.0/` | 최신 설치 EXE, ZIP, SHA-256 및 소스 커밋 기록 |
 | `src/` | `app.js` 번들을 region 단위로 잘라낸 옛 분리본 (**동기화하지 않음, 참고용**) |
 | `installer_v1.1.6.exe` | 소스 복구의 출처가 된 원본 NSIS 인스톨러 (**업그레이드·롤백에 쓰지 않는다**) |
 | `RECOVERY_NOTES.md` | 복구 경위, 복구된 범위, 구조 메모 |
 
 ## 변경 내역
 
-### 1.4.0 개발판 (2026-09) — AI 적용 요청 · SRT 가져오기 · 작업 상태
+### 1.4.0 (2026-09) — AI 적용 요청 · SRT 가져오기 · 작업 상태
 
 - **AI 타임라인 적용 요청**: `request_apply`로 화자가 지정된 목록의 변경분 또는 지정한 줄을 요청하면 패널에 승인 카드가 뜬다. 승인 후 필요한 적용 전 점검을 거치며, 기존 충돌·수동 수정 보호와 [중지]를 그대로 사용한다. 화자 없는 기존 목록은 패널의 일반 ▶를 사용하거나 가져오기 창에서 C1 등 화자를 지정한다.
 - **AI SRT 가져오기**: `import_srt`에 로컬 SRT 경로를 보내면 승인 카드와 가져오기 창으로 이어진다. 파일을 받았다는 이유만으로 기존 목록을 교체하지 않는다.
@@ -64,15 +66,16 @@ Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 �
 
 ## 설치
 
-1. `extension/` 폴더를 `CEP_MogrtImporter` 이름으로 복사해 아래 경로에 배치
-   - Windows: `%APPDATA%\Adobe\CEP\extensions\` (현재 운영 위치) 또는 `C:\Program Files (x86)\Common Files\Adobe\CEP\extensions\`
-   - macOS: `/Library/Application Support/Adobe/CEP/extensions/`
-2. 서명되지 않은 확장 허용 (디버그 모드)
-   - Windows: `HKEY_CURRENT_USER\Software\Adobe\CSXS.11` 에 문자열 값 `PlayerDebugMode` = `1`
-   - macOS: `defaults write com.adobe.CSXS.11 PlayerDebugMode 1`
-3. Premiere Pro 재시작 → `Window > Extensions > MOGRT Subtitle Importer`
+다른 사용자에게는 [최신 설치 파일](releases/1.4.0/)을 전달한다. **`installer_v1.1.6.exe`로 최신 기능을 설치할 수 없다.**
 
-**주의**: 사용자 프리셋·세션 캐시는 설치 폴더 안(`CEP_MogrtImporter/cache`)에 있다. 폴더를 지우고 새로 깔면 캐시가 사라진다. 업데이트는 `tools/deploy_prod.sh`(Premiere 종료 상태, 캐시를 extensions 밖에 백업, 지우지 않고 덮어쓰기, `--rollback <ref>`)로 한다.
+1. Premiere 프로젝트를 저장하고 Premiere를 완전히 종료한다.
+2. Windows: `MOGRTImporter_v1.4.0_Windows.exe`를 본인 계정에서 실행한다. ZIP 수동 설치 방법은 ZIP 안의 `README_WINDOWS.md`에 있다.
+3. macOS: `MOGRTImporter_v1.4.0_macOS_experimental.zip` 전체를 압축 해제하고 `README_MACOS.md`를 읽은 뒤 `Installer.command`를 실행한다. **실제 Mac/Premiere 실행은 아직 미검증이며, 서명·공증된 `.pkg`가 아니다.**
+4. Premiere를 다시 실행하고 `Window > Extensions (Legacy) > MOGRT Subtitle Importer`를 연다. 메뉴 명칭은 버전에 따라 다를 수 있다.
+
+설치본은 현재 사용자 CEP 폴더에 설치되며, 기존 코드와 `cache`를 확장 폴더 밖에 백업한다. 설치 후 파일 해시와 캐시 보존 여부를 확인한다. 미서명 CEP 허용 설정이 필요한 경우 설치 화면에서 설명하고 선택을 받는다. 설치 폴더 전체를 삭제하지 않는다.
+
+MOGRT 파일·폰트·개인 프리셋은 포함하지 않는다. CEP 패널 설치에는 Node.js가 필요 없지만, AI 연결은 [MCP 설정](mcp/README.md)을 별도로 해야 한다. Mac에서 개발·검증을 이어가는 방법은 [MAC_HANDOFF.md](docs/MAC_HANDOFF.md)를 참고한다.
 
 사용 절차는 `extension/README.md` 참고.
 
@@ -82,6 +85,7 @@ Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 �
 - `npm test` — node 단위 테스트(순수 로직 region을 잘라 vm에서 실행). `npm run lint:jsx` — MI 구역 ES3 검사.
 - `tools/install_dev.sh` — 운영본과 함께 뜨는 DEV 사본(메뉴 '(DEV)', 포트 7778, `MID_` 접두사). JSX를 바꾸면 Premiere 재시작.
 - `npm run hard` — DEV 패널에 CDP로 붙어 Premiere 하드 테스트(`MI_test.prproj`의 `T_` 시퀀스에서만). 자세한 절차는 `docs/TESTING.md`.
+- 배포물 생성: 소스 변경을 커밋한 뒤 `node tools/build_release.js --out dist/release-1.4.0`. Windows EXE 빌드에는 NSIS가 필요하다. Mac 등에서는 `--zip-only`로 ZIP을 생성한다. 빌드에는 커밋된 파일만 들어가고 `release.json`에 소스 커밋이 기록된다. 생성된 설치 파일을 커밋한 저장소 HEAD와 이 소스 커밋은 다를 수 있다.
 
 ## 아키텍처 요약
 

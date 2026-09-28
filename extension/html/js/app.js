@@ -15551,7 +15551,8 @@ var modalState = {
 				const exportData = { version: 1, exportedAt: new Date().toISOString(), presets: selectedPresets };
 				const json = JSON.stringify(exportData, null, 2);
 				const defaultFileName = "mogrt_presets_" + new Date().toLocaleDateString("ko-KR").replace(/\./g, "").replace(/ /g, "_") + ".json";
-				const savePath = folderPath.replace(/[\\/]+$/, "") + "\\" + defaultFileName;
+				// CEP와 ExtendScript 모두 /를 지원한다. macOS에서도 선택한 폴더 안에 저장한다.
+				const savePath = folderPath.replace(/\\/g, "/").replace(/\/+$/, "") + "/" + defaultFileName;
 				// CEP 네이티브 파일 쓰기 (호스트 호출 문자열 길이 제한 우회)
 				const writeResult = window.cep && window.cep.fs ? window.cep.fs.writeFile(savePath, json, cep.encoding.UTF8) : null;
 				if (writeResult && writeResult.err === 0) {
