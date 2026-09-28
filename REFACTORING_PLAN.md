@@ -1,5 +1,7 @@
 # REFACTORING_PLAN
 
+> 이 문서는 2026-08-27 초기 복구본의 과거 계획입니다. 현재 구조·검증 상태와 다음 우선순위는 [최신 검토](docs/REFACTORING_REVIEW.md)를 따릅니다.
+
 MOGRT Subtitle Importer 리팩토링 작업 지시서. Claude Code가 이 문서를 읽고 순서대로 진행한다.
 
 - 작성 기준: 2026-08-27

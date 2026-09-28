@@ -12,33 +12,33 @@
  */
 const fs = require("node:fs");
 const path = require("node:path");
-const { loadRegions, regionHash } = require("./loadRegions");
+const { loadRegionsFromSource, sliceRegion, fnv1a32 } = require("./loadRegions");
 
 const CORE_REGION = "src/mi/core.ts";
-let _memo = null; // {file, mtimeMs, size, hash, core}
+let _memo = null; // {file, source, hash, core} — 해시와 실행은 같은 스냅샷을 쓴다
 
 function installedAppJs(extPath) {
 	return path.join(String(extPath), "html", "js", "app.js");
 }
 
-/** 설치본 파일의 core 해시 (수정 시각·크기가 같으면 다시 읽지 않는다) → {ok, file, hash} | {ok: false, code, message, hint} */
+/** 설치본 파일의 core 해시 (내용이 같으면 해시·VM 결과를 재사용) → {ok, file, hash} | {ok: false, code, message, hint} */
 function installedCoreHash(extPath) {
 	if (!extPath) return { ok: false, code: "core-unavailable", message: "패널이 설치 폴더(extPath)를 알리지 않았습니다.", hint: "패널을 새로 고치거나 Premiere를 다시 시작한 뒤 다시 시도하세요." };
 	const file = installedAppJs(extPath);
-	let st;
+	let source;
 	try {
-		st = fs.statSync(file);
+		source = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
 	} catch (e) {
 		return { ok: false, code: "core-unavailable", message: "설치된 패널 파일을 읽지 못했습니다: " + file, hint: "패널 설치 폴더가 옮겨졌거나 지워졌을 수 있습니다. 패널을 다시 연 뒤 get_status로 확인하세요." };
 	}
-	if (_memo && _memo.file === file && _memo.mtimeMs === st.mtimeMs && _memo.size === st.size) return { ok: true, file, hash: _memo.hash };
+	if (_memo && _memo.file === file && _memo.source === source) return { ok: true, file, hash: _memo.hash };
 	let hash;
 	try {
-		hash = regionHash(CORE_REGION, file);
+		hash = fnv1a32(sliceRegion(CORE_REGION, source).text);
 	} catch (e) {
 		return { ok: false, code: "core-unavailable", message: "설치된 패널 파일에서 core를 찾지 못했습니다: " + String(e.message || e), hint: "v28 이전 패널일 수 있습니다. 패널을 새 버전으로 설치하세요." };
 	}
-	_memo = { file, mtimeMs: st.mtimeMs, size: st.size, hash, core: null };
+	_memo = { file, source, hash, core: null };
 	return { ok: true, file, hash };
 }
 
@@ -61,7 +61,7 @@ function loadCore(hb, opts = {}) {
 	}
 	if (opts.withCore && !_memo.core) {
 		try {
-			_memo.core = loadRegions([CORE_REGION], h.file);
+			_memo.core = loadRegionsFromSource([CORE_REGION], _memo.source, h.file);
 		} catch (e) {
 			return { ok: false, code: "core-unavailable", message: "설치본 core를 실행하지 못했습니다: " + String(e.message || e), hint: "패널 버전을 확인하세요.", server: h.hash, panel };
 		}

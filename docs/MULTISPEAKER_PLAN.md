@@ -1147,7 +1147,7 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   - 적용은 화자 키가 있는 줄만 지원한다. 화자 없는 기존 목록은 `unsupported-rows`로 거절하며 패널에서 적용하거나 화자를 지정하도록 안내한다. `changed`는 전체 목록을 검사해 실제 변경분을 계획한다.
   - 요청 시 시퀀스와 자막·프리셋·화자 설정을 확인한다. 승인 전 데이터 변경은 `rows-changed`, 시퀀스 전환은 취소. 점검 만료 후 남은 확인 버튼으로 실행할 수 없고 다른 대기 작업의 만료가 현재 작업을 취소하지 않는다.
   - 작업 스냅숏은 `cache/ai_jobs.json`에 최대 100개/24시간 보관한다. 승인·입력 대기는 10분 후 만료한다. 서버 재연결로 조회할 수 있고, 패널 재시작 시 미완료 작업은 `cancelled`로 남기며 자동 재실행하지 않는다.
-  - 단위 `tests/unit/panel_jobs.test.js` 10개, SDK/VM 통합 `tests/mcp/server_jobs.test.js`를 추가했다. 고유 자동 검사 665개 통과. 실제 Premiere Pro 2026 DEV에서 `s5_inbox`·`s5_mcp`·`s5_jobs` 각각 2/2 통과(공통 스모크 제외 시 본 케이스 3개). `s5_jobs`는 가져오기/적용의 거절·취소·승인, V3/V8 네 클립 ±1프레임, 스크래치 정리를 확인했다.
+  - 단위 `tests/unit/panel_jobs.test.js` 11개, SDK/VM 통합 `tests/mcp/server_jobs.test.js`를 추가했다. 최종 보완 후 고유 자동 검사 668개 통과. 실제 Premiere Pro 2026 DEV에서 `s5_inbox`·`s5_mcp`·`s5_jobs` 각각 2/2 통과(공통 스모크 제외 시 본 케이스 3개). `s5_jobs`는 가져오기/적용의 거절·취소·승인, V3/V8 네 클립 ±1프레임, 스크래치 정리를 확인했다. 이후 삭제 실패 보고와 MCP 코어 스냅샷 보완은 별도 자동 회귀 검사로 확인했다.
 - M5.5 Claude — **부분 검증, 완료 보류 (2026-09-28)**
   - 실제 Claude Code 2.1.276에서 격리 설정의 `mcp get/list` 연결 성공. 이후 실제 모델 요청 두 번도 MCP 연결은 됐지만 도구 호출 없이 중단됐고, 진단에서 조직 정책 오류 `oauth_org_not_allowed`를 확인했다. 기능 설정은 보존됐으며 `.claude.json` 자동 캐시만 갱신됐다.
   - 실제 Claude Desktop 2.9939.2.0 실행과 MCP 초기 연결·도구 목록·모델의 `get_guide` 호출을 확인했다. 패널 조회는 `ai-link-off`/`no-heartbeat`로 실패했고, 일반 다리와 Store 가상화 경로의 오래된 다리 불일치를 발견했다. Desktop의 제안·승인 작업은 미실행이다.

@@ -161,6 +161,58 @@ test("changed jobs include fresh rows without mm; approval is async, preflight b
 	healthy(h);
 });
 
+test("a clip locked after preflight reports removal failure, fails the job, and remains retryable", async () => {
+	const { h, sim, seq } = await fixture();
+	const first = (await request(h, "jobs.requestApply", { scope: "changed" })).data;
+	await approve(h, first);
+	h.$("pfOk").click(); await h.flush();
+	assert.equal((await get(h, first)).state, "succeeded");
+	assert.equal(sim.all(seq), 4);
+	const orphan = sim.place(seq, 2, MOGRT, 900, 950);
+	orphan.name = "old [MI:" + SALT + "-99.1]";
+	const failedJob = (await request(h, "jobs.requestApply", { scope: "changed" })).data;
+	await approve(h, failedJob);
+	assert.equal((await get(h, failedJob)).state, "waiting_input");
+	h.$("pfOrphansAll").checked = true;
+	let removalResult;
+	const removeClips = h.host.handlers.MI_removeClips;
+	h.host.handlers.MI_removeClips = (json) => {
+		// 계획은 잠기지 않은 트랙을 읽었다. 실행 직전에 잠겨 실제 호스트의 항목별 locked 응답을 받는다.
+		seq.tracks[2].locked = true;
+		try {
+			const raw = removeClips(json);
+			removalResult = JSON.parse(raw);
+			return raw;
+		} finally { seq.tracks[2].locked = false; }
+	};
+	h.$("pfOk").click(); await h.flush();
+	const done = await get(h, failedJob);
+	assert.equal(removalResult.ok, true, "호스트 호출 자체는 성공해도 항목 삭제는 실패할 수 있다");
+	assert.equal(removalResult.results[0].status, "locked");
+	assert.equal(done.state, "failed", JSON.stringify(done));
+	assert.equal(done.error.code, "apply-incomplete");
+	assert.equal(done.result.removeFailed, 1);
+	assert.equal(done.result.removed, 0);
+	assert.equal(done.result.failed, 0, "배치 실패와 삭제 실패 수를 구분한다");
+	assert.equal(sim.all(seq), 5, "잠긴 클립은 남겨 둔다");
+	assert.match(h.$("statusBar").textContent, /삭제 실패 1/);
+	assert.equal(h.$("statusBar").classList.contains("err"), true);
+	assert.equal(h.fs.readJson(JOB_FILE).jobs.find((j) => j.jobId === failedJob.jobId).state, "failed");
+
+	h.host.handlers.MI_removeClips = removeClips;
+	const retry = (await request(h, "jobs.requestApply", { scope: "changed" })).data;
+	await approve(h, retry);
+	h.$("pfOrphansAll").checked = true;
+	h.$("pfOk").click(); await h.flush();
+	const retried = await get(h, retry);
+	assert.equal(retried.state, "succeeded", JSON.stringify(retried));
+	assert.equal(retried.result.removed, 1);
+	assert.equal(retried.result.removeFailed, 0);
+	assert.equal(sim.all(seq), 4);
+	assert.doesNotMatch(h.$("statusBar").textContent, /삭제 실패/);
+	healthy(h);
+});
+
 test("preflight cancel and sequence switch make terminal jobs and never write", async () => {
 	for (const changeSeq of [false, true]) {
 		const { h, sim, seq } = await fixture();

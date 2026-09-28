@@ -19,7 +19,7 @@ npm install
 ```
 
 - Node 20 이상. 의존성은 `@modelcontextprotocol/sdk` 하나(버전 고정, `package-lock.json`)입니다. `node_modules`는 커밋하지 않습니다.
-- `<repo>`는 이 저장소 폴더입니다. 이 PC에서는 `C:/Users/RAONOLJE/Documents/00_Claude_Project/02_MOGRT_Importer`.
+- `<repo>`는 이 저장소 폴더입니다. 이 PC에서는 `D:/01/_ClaudeAI/02_MOGRT_Importer`.
 
 ## 패널 쪽 준비
 
@@ -42,7 +42,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 60
 ```
 
-이 PC의 예: `args = ["C:/Users/RAONOLJE/Documents/00_Claude_Project/02_MOGRT_Importer/mcp/server.mjs"]`
+이 PC의 예: `args = ["D:/01/_ClaudeAI/02_MOGRT_Importer/mcp/server.mjs"]`
 
 DEV 패널(`CEP_MogrtImporter_dev`, 하드 테스트용)에 붙일 때만 다리 폴더를 바꿉니다:
 

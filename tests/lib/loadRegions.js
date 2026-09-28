@@ -264,8 +264,13 @@ function _run(code, names, filename) {
  * @param {string} [file]           기본은 저장소의 app.js (MCP 서버는 설치본 경로를 넘긴다)
  */
 function loadRegions(names, file = APP_JS) {
+	return loadRegionsFromSource(names, _read(file), file);
+}
+
+/** 이미 읽은 스냅샷을 실행한다. 파일을 다시 읽지 않아 해시 검사와 실행 사이의 파일 교체에 영향받지 않는다. */
+function loadRegionsFromSource(names, source, file = APP_JS) {
 	const list = Array.isArray(names) ? names : [names];
-	const src = _read(file);
+	const src = source.replace(/\r\n/g, "\n");
 	const parts = list.map((nm) => sliceRegion(nm, src));
 	parts.forEach((p) => _checkPure(p.name + " (" + path.basename(file) + ")", p.text, IMPURE_PANEL, p.startLine));
 	const code = parts.map((p) => "/* region " + p.name + " @" + p.startLine + " */\n" + p.text).join("\n");
@@ -311,4 +316,4 @@ function plain(v) {
 	return v === undefined ? v : structuredClone(v);
 }
 
-module.exports = { loadRegions, loadHostPure, regionHash, sliceRegion, listRegions, fnv1a32, plain, APP_JS, HOST_JSX, ROOT };
+module.exports = { loadRegions, loadRegionsFromSource, loadHostPure, regionHash, sliceRegion, listRegions, fnv1a32, plain, APP_JS, HOST_JSX, ROOT };

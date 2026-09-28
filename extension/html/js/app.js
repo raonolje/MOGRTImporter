@@ -10992,7 +10992,7 @@ var modalState = {
 				_saveSafety("AI: 타임라인 적용 전");
 				const r = await _miApply(subs, { auto: false, single: j.args.scope === "rows" });
 				const cancelled = j.seq !== _importSeqToken() || (r && (r.stopped || r.error === "cancelled" || r.error === "seq-mismatch"));
-				const failed = !r || r.ok !== true || r.failed > 0 || r.partial > 0 || r.lost > 0 || r.motionFailed > 0 || r.conflict > 0;
+				const failed = !r || r.ok !== true || r.failed > 0 || r.removeFailed > 0 || r.partial > 0 || r.lost > 0 || r.motionFailed > 0 || r.conflict > 0;
 				_jobFinish(j, cancelled ? "cancelled" : failed ? "failed" : "succeeded", r || null, cancelled ? { code: j.cancelReason || r && r.error || "cancelled", detail: "중단되었습니다. 결과의 부분 적용 수를 확인하세요" } : failed ? { code: r && r.error || "apply-incomplete", detail: "적용 결과를 확인하세요" } : null);
 			} catch (e) { _jobFinish(j, "failed", null, { code: "exception", detail: _errText(e) }); }
 			finally { if (j.op === "jobs.requestApply") _aiLabel = false; }
@@ -13572,7 +13572,7 @@ var modalState = {
 	function _miReport(ctx, plan) {
 		const s = ctx.stats;
 		return { ok: !ctx.error && !ctx.aborted, stopped: !!ctx.stopped, error: ctx.error || null, created: s.created, updated: s.updated, moved: s.moved, adopted: s.adopted,
-			replaced: s.replaced, removed: s.removed, partial: s.partial, conflict: s.conflict, failed: s.failed, none: plan ? plan.none.length : 0,
+			replaced: s.replaced, removed: s.removed, removeFailed: s.removeFailed || 0, partial: s.partial, conflict: s.conflict, failed: s.failed, none: plan ? plan.none.length : 0,
 			motionOnly: plan && plan.motionOnly ? plan.motionOnly.length : 0, motionKeyed: s.motionKeyed || 0, motionFailed: s.motionFailed || 0,
 			skipped: plan ? Object.keys(plan.rowOps).filter((k) => plan.rowOps[k] && plan.rowOps[k].skip).length : 0,
 			ops: plan ? plan.ops.length + plan.removals.length : 0, tracksAdded: ctx.tracksAdded || 0, runId: ctx.la ? ctx.la.runId : null, saltRecovered: !!ctx.saltRecovered };
@@ -13587,6 +13587,7 @@ var modalState = {
 		if (rep.motionFailed) parts.push("위치 실패 " + rep.motionFailed);
 		if (rep.conflict) parts.push("충돌 " + rep.conflict);
 		if (rep.failed) parts.push("실패 " + rep.failed);
+		if (rep.removeFailed) parts.push("삭제 실패 " + rep.removeFailed);
 		if (rep.skipped) parts.push("건너뜀 " + rep.skipped);
 		if (rep.tracksAdded) parts.push("새 트랙 " + rep.tracksAdded);
 		return "화자별 배치: " + (parts.join(" · ") || "보낸 줄 없음");
@@ -13751,7 +13752,7 @@ var modalState = {
 		if (ctx.error) setStatus(MI_STOPPED_MSG + ": " + ctx.error + " — " + text, "err");
 		else if (ctx.aborted) setStatus("시퀀스가 바뀌어 멈췄습니다 — " + text, "err");
 		else if (ctx.stopped) setStatus("중지함 — 다시 적용하면 이어서 진행 · " + text, "err");
-		else setStatus(text, rep.conflict || rep.failed || rep.skipped || rep.partial || rep.motionKeyed || rep.motionFailed ? "err" : "ok");
+		else setStatus(text, rep.conflict || rep.failed || rep.removeFailed || rep.skipped || rep.partial || rep.motionKeyed || rep.motionFailed ? "err" : "ok");
 	}
 	// ─────────────────────────────────────────────────────────────
 	// 위치만 다시 적용 (화자 ⋯ 메뉴, 4단계) — 계획서 §8·§10, spec position
