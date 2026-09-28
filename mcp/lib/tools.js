@@ -16,6 +16,7 @@
  */
 const B = require("./bridge");
 const C = require("./core");
+const path = require("node:path");
 const { GUIDE } = require("./guide");
 
 const CALL_MAX_MS = 15000;
@@ -23,9 +24,24 @@ const ROWS_DEFAULT = 50;
 const ROWS_MAX = 200;
 const SUGG_MAX = 200;
 const CAST_ITEMS_MAX = 99;
+const JOB_TERMINAL = new Set(["succeeded", "failed", "rejected", "cancelled", "expired"]);
 const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 // 쓰기 도구: 패널 대기열·승인 카드에만 넣는다 (속성·타임라인은 사용자가 패널에서 바꾼다) → destructive 아님
 const QUEUE_ONLY = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
+const APPROVED_WRITE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
+
+// UNC·장치 경로·URL은 받지 않는다. 서버는 내용을 읽지 않고 패널이 승인 뒤 파일을 읽는다.
+function localSrtPath(value) {
+	return typeof value === "string" && value.length <= 4096 && !/[\x00-\x1f]/.test(value) && !/^[\\/]{2}/.test(value) &&
+		(/^[A-Za-z]:[\\/]/.test(value) || path.posix.isAbsolute(value)) && /\.srt$/i.test(value);
+}
+function jobResult(data) {
+	const result = Object.assign({}, data);
+	result.job_id = result.jobId;
+	delete result.jobId;
+	if (result.seqId !== undefined) { result.seq_id = result.seqId; delete result.seqId; }
+	return result;
+}
 
 // 패널 오류 코드 → 사용자에게 보일 말과 다음 할 일
 const PANEL_ERRORS = {
@@ -39,6 +55,7 @@ const PANEL_ERRORS = {
 	"fields-changed": ["줄의 필드 구조가 바뀌었습니다 (field_sig가 다릅니다).", "get_rows나 find_row로 그 줄의 sig를 다시 받아 보내세요."],
 	"no-sequence": ["패널에 시퀀스가 열려 있지 않습니다.", "Premiere에서 시퀀스를 연 뒤 다시 하세요."],
 	"no-rows": ["검수할 화자 줄이 없습니다.", "화자(C1, C2 …) SRT를 가져온 목록에서만 검수합니다."],
+	"unsupported-rows": ["AI 타임라인 적용은 화자(C1, C2 …)가 지정된 줄만 지원합니다.", "화자 없는 기존 목록은 패널의 ▶로 적용하거나 SRT 가져오기 창에서 화자를 지정한 뒤 다시 요청하세요."],
 	"needs-approval": ["패널에서 사용자가 승인해야 합니다.", "사용자에게 패널에서 승인해 달라고 알리세요."],
 	expired: ["명령이 너무 오래되어 패널이 돌리지 않았습니다.", "다시 부르세요."],
 	duplicate: ["이미 처리한 명령입니다.", "새로 부르세요."],
@@ -152,7 +169,7 @@ function createToolbox(o) {
 	async function panel(ctx, op, args, opts = {}) {
 		const left = ctx.deadline - Date.now() - 300;
 		if (left < 500) throw new ToolFail("timeout", "도구 시간 한도(" + Math.round(budgetMs / 1000) + "초)를 넘었습니다.", "잠시 뒤 다시 부르세요.");
-		const timeoutMs = opts.long ? left : Math.min(CALL_MAX_MS, left);
+		const timeoutMs = Math.min(opts.long ? left : Math.min(CALL_MAX_MS, left), opts.timeoutMs === undefined ? Infinity : opts.timeoutMs);
 		let resp;
 		try {
 			resp = await B.call(dir, op, args, { by: ctx.by, seqId: opts.seqId, timeoutMs });
@@ -377,6 +394,56 @@ function createToolbox(o) {
 			if (r.ok) return ok({ pending: false, changed: (r.data && r.data.changed) || [], message: "화자 표를 바꿨습니다." });
 			return ok({ pending: true, rid: r.rid, items, message: "화자 표 변경을 패널 승인 카드에 올렸습니다. 사용자가 패널에서 [승인]해야 바뀝니다 (타임라인은 그대로)." });
 		});
+	def("request_apply", "타임라인 적용 요청",
+		"화자(C1, C2 …)가 지정된 줄의 타임라인 적용을 패널 승인 카드에 요청한다. scope changed는 바뀐 줄, rows는 uids의 줄(1~200개). 화자 없는 기존 목록은 unsupported-rows로 거절한다. 승인 전에는 적용하지 않는다. " +
+		"승인 후에도 충돌 점검 창은 사용자가 확인한다. 결과 job_id를 wait_job으로 확인한다. 같은 요청을 반복하면 별도 작업이 생긴다.",
+		obj({ seq_id: SEQ_ID, scope: str("changed 또는 rows", { enum: ["changed", "rows"] }),
+			uids: { type: "array", items: { type: "string" }, description: "scope rows일 때만, get_rows의 고유 uid 1~200개" }
+		}, ["seq_id", "scope"]), APPROVED_WRITE,
+		async (a, ctx) => {
+			if (a.scope === "changed" && a.uids !== undefined) throw new ToolFail("bad-args", "scope changed에는 uids를 주지 않습니다.", "");
+			if (a.scope === "rows" && (!a.uids || !a.uids.length || a.uids.length > 200 || a.uids.some((v) => !v.trim()) || new Set(a.uids).size !== a.uids.length)) {
+				throw new ToolFail("bad-args", "scope rows에는 중복 없는 uid 1~200개가 필요합니다.", "get_rows에서 uid를 받으세요.");
+			}
+			await writeReady(ctx, false);
+			const args = { scope: a.scope };
+			if (a.uids !== undefined) args.uids = a.uids;
+			return ok(jobResult(await panel(ctx, "jobs.requestApply", args, { seqId: a.seq_id })));
+		});
+	def("import_srt", "SRT 가져오기 요청",
+		"로컬 SRT 파일의 절대 경로 1~20개를 패널 승인 카드에 요청한다. 사용자 승인 뒤 기존 가져오기·병합 창에서 다시 확인한다. " +
+		"목록 교체·병합을 서버가 자동 선택하지 않는다. job_id를 wait_job으로 확인한다. UNC·장치 경로·URL은 지원하지 않는다.",
+		obj({ seq_id: SEQ_ID, paths: { type: "array", items: { type: "string" }, description: "로컬 .srt 파일의 절대 경로 1~20개 (중복 불가)" } }, ["seq_id", "paths"]), APPROVED_WRITE,
+		async (a, ctx) => {
+			if (!a.paths.length || a.paths.length > 20 || !a.paths.every(localSrtPath) || new Set(a.paths.map((p) => p.replace(/\\/g, "/").toLowerCase())).size !== a.paths.length) {
+				throw new ToolFail("bad-args", "paths에는 중복 없는 로컬 .srt 절대 경로 1~20개가 필요합니다 (UNC·장치 경로·URL 불가).", "");
+			}
+			await writeReady(ctx, false);
+			return ok(jobResult(await panel(ctx, "jobs.importSrt", { paths: a.paths }, { seqId: a.seq_id })));
+		});
+	def("wait_job", "요청 작업 상태 확인",
+		"request_apply·import_srt의 job_id로 패널 작업 상태를 읽는다. wait_sec는 0~25초(기본 0), 실제 대기는 도구 호출 시간 한도 안에서 끝난다. " +
+		"pending_approval은 패널 승인, waiting_input은 점검·가져오기 창 입력이 필요하다. 시간이 지나도 미완료 상태를 그대로 반환하며 실패로 바꾸지 않는다.",
+		obj({ job_id: str("요청 결과의 job_id"), wait_sec: { type: "number", description: "최대 기다릴 초 (0~25, 기본 0)" } }, ["job_id"]), READ,
+		async (a, ctx) => {
+			const seconds = a.wait_sec === undefined ? 0 : a.wait_sec;
+			if (!a.job_id.trim() || seconds < 0 || seconds > 25) throw new ToolFail("bad-args", "job_id는 비울 수 없고 wait_sec는 0~25입니다.", "");
+			await panelUp(ctx);
+			const deadline = Math.min(ctx.deadline - 1100, Date.now() + seconds * 1000);
+			let last;
+			for (;;) {
+				try {
+					last = jobResult(await panel(ctx, "jobs.get", { jobId: a.job_id }, last ? { timeoutMs: Math.max(1, deadline - Date.now()) } : {}));
+				} catch (e) {
+					// 이미 받은 작업 상태가 있으면 후속 폴링 시간 초과는 작업 실패가 아니다.
+					if (last && e instanceof ToolFail && JSON.parse(e.result.content[0].text).code === "timeout") return ok(last);
+					throw e;
+				}
+				if (JOB_TERMINAL.has(last.state) || Date.now() >= deadline) return ok(last);
+				await new Promise((resolve) => setTimeout(resolve, Math.min(300, deadline - Date.now())));
+				if (Date.now() >= deadline) return ok(last);
+			}
+		});
 	def("get_guide", "운영 규칙",
 		"이 도구들의 자세한 운영 규칙 (주소·포인트 텍스트·승인·오류 코드). 패널에 닿지 않는다.",
 		obj({}), READ,
@@ -402,4 +469,4 @@ function createToolbox(o) {
 	};
 }
 
-module.exports = { createToolbox, checkArgs, byOf, parseTrack, ok, fail, ToolFail, PANEL_ERRORS, ROWS_DEFAULT, ROWS_MAX, SUGG_MAX, CALL_MAX_MS };
+module.exports = { createToolbox, checkArgs, byOf, parseTrack, localSrtPath, ok, fail, ToolFail, PANEL_ERRORS, ROWS_DEFAULT, ROWS_MAX, SUGG_MAX, CALL_MAX_MS };

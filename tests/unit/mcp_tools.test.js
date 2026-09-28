@@ -20,7 +20,7 @@ test("복사한 region 로더는 tests/lib와 바이트까지 같다 (서버와 
 
 test("도구 정의: 이름 [A-Za-z0-9_], 루트 object + 이름을 적은 properties, anyOf·default·min/max 없음, 읽기 도구 readOnlyHint, 한국어 설명", () => {
 	const box = T.createToolbox({ dir: "C:/없음" });
-	assert.ok(box.tools.length >= 9);
+	assert.equal(box.tools.length, 14);
 	const walk = (o, fn, at) => {
 		if (!o || typeof o !== "object") return;
 		fn(o, at);
@@ -42,13 +42,88 @@ test("도구 정의: 이름 [A-Za-z0-9_], 루트 object + 이름을 적은 prope
 	}
 });
 
+test("M5.4 도구: 승인 뒤 바꾸는 요청은 destructive, wait_job은 읽기; 잘못된 경로·범위는 패널 호출 없이 거절", async () => {
+	const box = T.createToolbox({ dir: "C:/없음" });
+	for (const name of ["request_apply", "import_srt"]) {
+		const t = box.tools.find((x) => x.name === name);
+		assert.deepEqual([t.annotations.readOnlyHint, t.annotations.destructiveHint, t.annotations.idempotentHint], [false, true, false]);
+	}
+	assert.equal(box.tools.find((t) => t.name === "wait_job").annotations.readOnlyHint, true);
+	for (const p of ["C:/자막/C1.srt", "D:\\자막\\대사.SRT", "/tmp/c1.srt"]) assert.equal(T.localSrtPath(p), true, p);
+	for (const p of ["C:relative.srt", "C:/x.txt", "x.srt", "https://x/a.srt", "\\\\server\\x.srt", "//host/x.srt", "\\\\?\\C:\\x.srt", "C:/x\u0000.srt"]) assert.equal(T.localSrtPath(p), false, p);
+	for (const [name, args] of [
+		["request_apply", { seq_id: "s", scope: "all" }],
+		["request_apply", { seq_id: "s", scope: "changed", uids: [] }],
+		["request_apply", { seq_id: "s", scope: "rows" }],
+		["request_apply", { seq_id: "s", scope: "rows", uids: ["a", "a"] }],
+		["request_apply", { seq_id: "s", scope: "rows", uids: [""] }],
+		["import_srt", { seq_id: "s", paths: ["relative.srt"] }],
+		["import_srt", { seq_id: "s", paths: ["C:/a.srt", "c:\\a.srt"] }],
+		["import_srt", { seq_id: "s", paths: [] }],
+		["wait_job", { job_id: "", wait_sec: 1 }],
+		["wait_job", { job_id: "j", wait_sec: 26 }],
+		["wait_job", { job_id: "j", wait_sec: -1 }]
+	]) {
+		const r = await box.call(name, args);
+		assert.deepEqual([r.isError, JSON.parse(r.content[0].text).code], [true, "bad-args"], JSON.stringify(args));
+	}
+});
+
+test("M5.4 다리: seq_id·by 전달, job_id 이름, 서버 재접속 조회, 제한된 폴링은 실행 중 상태를 실패로 바꾸지 않는다", async () => {
+	const B = require("../../mcp/lib/bridge");
+	const orig = { checkPanel: B.checkPanel, call: B.call };
+	const hb = { extPath: path.join(ROOT, "extension"), coreHash: regionHash("src/mi/core.ts") };
+	const sent = [];
+	let reads = 0;
+	let terminal = false;
+	B.checkPanel = async () => ({ ok: true, hb, age: 0 });
+	B.call = async (dir, op, args, opts) => {
+		sent.push({ op, args, opts });
+		return { ok: true, data: { jobId: "j1", rid: "a1", seqId: "s1", state: op === "jobs.get" ? (terminal && ++reads > 1 ? "succeeded" : "running") : "pending_approval", progress: { done: 3, total: 20 } } };
+	};
+	const json = (r) => JSON.parse(r.content[0].text);
+	try {
+		let box = T.createToolbox({ dir: "test", clientName: () => "Claude Desktop", budgetMs: 1600 });
+		let r = json(await box.call("request_apply", { seq_id: "s1", scope: "rows", uids: ["u1"] }));
+		assert.deepEqual([r.job_id, r.jobId, r.seq_id, r.state], ["j1", undefined, "s1", "pending_approval"]);
+		assert.deepEqual([sent[0].op, sent[0].args, sent[0].opts.seqId, sent[0].opts.by], ["jobs.requestApply", { scope: "rows", uids: ["u1"] }, "s1", "claude"]);
+		r = json(await box.call("import_srt", { seq_id: "s1", paths: ["C:/a.srt"] }));
+		assert.equal(sent[1].op, "jobs.importSrt");
+		assert.equal(sent[1].opts.seqId, "s1");
+		box = T.createToolbox({ dir: "test", clientName: () => "codex", budgetMs: 1600 });
+		const started = Date.now();
+		r = json(await box.call("wait_job", { job_id: "j1", wait_sec: 25 }));
+		assert.ok(Date.now() - started < 1500, "tool budget caps 25-second request");
+		assert.deepEqual([r.state, r.progress.done], ["running", 3]);
+		assert.ok(sent.filter((x) => x.op === "jobs.get").every((x) => x.opts.seqId === undefined && x.opts.by === "codex"));
+		terminal = true;
+		r = json(await box.call("wait_job", { job_id: "j1", wait_sec: 1 }));
+		assert.equal(r.state, "succeeded");
+		hb.coreHash = "mismatch";
+		const count = sent.length;
+		for (const [name, args] of [["request_apply", { seq_id: "s1", scope: "changed" }], ["import_srt", { seq_id: "s1", paths: ["C:/a.srt"] }]]) {
+			r = json(await box.call(name, args));
+			assert.equal(r.code, "panel-version-mismatch");
+		}
+		assert.equal(sent.length, count, "no write sent on hash mismatch");
+		assert.equal(json(await box.call("wait_job", { job_id: "j1" })).state, "succeeded", "status reads still work");
+		let poll = 0;
+		B.call = async () => {
+			if (++poll > 1) throw Object.assign(new Error("poll timed out"), { code: "timeout", withdrawn: true });
+			return { ok: true, data: { jobId: "j1", state: "running", progress: { done: 3 } } };
+		};
+		const waiting = await box.call("wait_job", { job_id: "j1", wait_sec: 1 });
+		assert.deepEqual([!!waiting.isError, json(waiting).state, json(waiting).progress.done], [false, "running", 3], "후속 상태 조회 시간 초과는 마지막 작업 상태를 보존한다");
+	} finally { Object.assign(B, orig); }
+});
+
 test("안내문: 2048자 이하, 앞 512자만으로 규칙이 선다, 도구 이름은 실제 도구", () => {
 	assert.ok(INSTRUCTIONS.length <= 2048, INSTRUCTIONS.length);
 	assert.ok(INSTRUCTIONS_HEAD.length <= 512, "머리 " + INSTRUCTIONS_HEAD.length);
 	assert.equal(INSTRUCTIONS.slice(0, INSTRUCTIONS_HEAD.length), INSTRUCTIONS_HEAD);
 	["get_status", "AI 연결 허용", "find_row", "field_sig", "캡션", "시간", "승인"].forEach((w) => assert.ok(INSTRUCTIONS_HEAD.indexOf(w) !== -1, w));
 	const names = T.createToolbox({ dir: "C:/없음" }).tools.map((t) => t.name);
-	const mentioned = (INSTRUCTIONS + "\n" + GUIDE).match(/\b[a-z]+(?:_[a-z]+)+\b/g).filter((w) => /^(get|find|list|plan|verify|suggest|set|request|wait|import)_/.test(w));
+	const mentioned = (INSTRUCTIONS + "\n" + GUIDE).match(/\b[a-z]+(?:_[a-z]+)+\b/g).filter((w) => w !== "wait_sec" && /^(get|find|list|plan|verify|suggest|set|request|wait|import)_/.test(w));
 	[...new Set(mentioned)].forEach((w) => assert.ok(names.indexOf(w) !== -1, "안내문의 " + w + "는 있는 도구"));
 });
 

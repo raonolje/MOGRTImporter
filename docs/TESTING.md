@@ -173,7 +173,7 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 
 ### 테스트 프로젝트
 
-- `C:/Users/RAONOLJE/Documents/MI_test/MI_test.prproj` (MOGRT_probe.prproj 사본)
+- 이 PC의 테스트 프로젝트 경로: `%USERPROFILE%/Documents/00_Claude_Project/02_MOGRT_Importer_test/MI_test.prproj` (다른 환경에서는 해당 테스트 프로젝트의 경로를 사용한다)
 - 시퀀스: `T_23976`(1920x1080), `T_2997`, `T_25`, `T_5994`, `T_TC1h`(시작 TC 01:00:00:00), `T_BIG`(V1 600클립 + V3 MOGRT 150클립)
 - 각 시퀀스: V1 영상, 빈 V2+, V4에 외부 PNG 하나. 케이스는 템플릿 시퀀스를 복제하거나 V2+를 스스로 비운다.
 
@@ -188,3 +188,36 @@ MOGRT Subtitle Importer의 테스트·DEV 설치·배포 절차. 작업 지시�
 - `--rollback <ref>`: 같은 절차로 `<ref>`의 extension/을 배포한다. 롤백 기준 태그는 `v27`(0aa8b82, 로컬 태그).
 - `installer_v1.1.6.exe`로 업그레이드·롤백하지 않는다(캐시가 설치 폴더 안에 있다).
 - 배포 뒤 Premiere를 열고 읽기 전용 스모크: `node tests/premiere/run.js --prod --port 7777 tests/premiere/smoke.expr.txt` (`--prod`는 이 파일과 `--check-build`만 받는다).
+
+## 7. M5.4 승인 작업과 M5.5 클라이언트 검증
+
+승인 작업은 패널 VM, 실제 MCP 서버와 SDK, 실제 Premiere, 실제 Claude 클라이언트를 나누어 확인한다. 실행 결과와 보류 사유는 [MCP_VALIDATION.md](MCP_VALIDATION.md)에 기록한다. SDK 클라이언트에 `Claude Desktop`이라는 이름을 붙여 실행한 결과는 실제 Desktop 앱의 검증으로 세지 않는다.
+
+### 자동 검사
+
+```powershell
+node --test tests/unit/panel_jobs.test.js
+npm run test:mcp
+```
+
+- `panel_jobs.test.js`의 9개 검사는 승인·거절, 적용 점검과 SRT 가져오기 입력 대기, 시퀀스/데이터 변경, 만료, 패널 재시작, 저장 실패, 화자 없는 기존 목록의 거절을 확인한다. 만료 뒤 확인 버튼을 누르거나 다른 작업이 진행 중인 경우도 포함한다.
+- `server_jobs.test.js`의 4개 검사는 실제 서버를 SDK stdio 클라이언트로 실행하고 파일 다리와 패널 VM까지 연결한다. 적용/가져오기 요청, 승인·거절, 다른 연결 및 서버 재연결에서 같은 작업 조회, 지원 범위를 확인한다. `npm run test:mcp` 전체는 기존 검사와 합쳐 14개다.
+- 실제 캐시 호환 검사는 `MI_REAL_CACHE`를 운영 캐시 경로로 지정한 뒤 수행한다. 운영 캐시는 읽기만 하고 테스트 하네스의 메모리 파일 시스템에 복사해 사용한다. 이 검사도 실제 Premiere의 타임라인 실행을 대신하지 않는다.
+
+### Premiere 하드 `s5_jobs`
+
+MCP SDK 의존성(`mcp/`에서 `npm install`), 정상 응답하는 Premiere, 최신 DEV 패널이 필요하다. §5의 DEV 설치·재시작 절차를 따른 뒤 `MI_test.prproj`에서 이름이 `T_`로 시작하는 시퀀스를 활성화한다. 먼저 `node tests/premiere/run.js --port 7778 --check-build`가 통과해야 한다.
+
+```powershell
+npm run hard -- s5_jobs
+```
+
+`tests/premiere/cases/s5_jobs.case.js`는 실제 SDK → DEV 파일 다리 → DEV 패널 → Premiere를 연결한다. 템플릿 시퀀스를 복제해 V2 이상을 비우고, 임시 SRT 두 파일에서 C1/C2 각 두 줄을 가져온다. 가져오기 거절·창 취소·확정, 적용 거절·점검 취소·확정, 작업 상태 전이를 검사한다. 마지막에는 V3/V4의 네 MOGRT 클립, 중복/누락 여부, 시작·종료 시간 ±1프레임과 완료 작업 조회가 타임라인을 다시 쓰지 않는지를 확인한다.
+
+정상 종료 시 스크래치 시퀀스와 임시 SRT를 지우고 프로젝트 화자 기본값과 AI 연결 상태를 복원한다. 종료한 작업 기록은 DEV의 `cache/ai_jobs.json`에 남긴다. 중단되면 §5의 스크래치 시퀀스 정리 안내를 따른다. 운영 패널·캐시에 실행하지 않는다.
+
+### 실제 Claude Code와 Desktop
+
+실제 CLI의 `claude mcp list` 연결 성공은 서버 시작과 MCP 초기 연결만 확인한다. 모델 호출 없이 검사하려면 `CLAUDE_CONFIG_DIR`로 설정을 격리하고 그 폴더에만 서버를 등록한다. 원래 설정이 보존됐는지도 확인한다.
+
+M5.5의 전체 흐름은 실제 Claude Code/Desktop에서 도구 목록, 읽기, 제안, 승인 작업 요청, 사용자 패널 승인, `wait_job` 결과 조회를 수행해 별도로 확인한다. 모델 사용량 때문에 호출하지 못하거나 앱이 초기화 전에 종료하면 보류로 기록한다. 자동 테스트나 초기 연결 성공으로 전체 흐름을 완료 처리하지 않는다.

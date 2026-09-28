@@ -196,6 +196,10 @@ test("core 해시가 다르면 쓰기 도구는 panel-version-mismatch로 거절
 		assert.match(r.json.hint, /새로 고치거나/);
 		r = await M.callJson(c.client, "set_cast_proposal", { seq_id: "seq-fx-1", items: [{ key: "C2", name: "민수" }] });
 		assert.deepEqual([r.isError, r.json.code], [true, "panel-version-mismatch"]);
+		for (const [name, args] of [["request_apply", { seq_id: "seq-fx-1", scope: "changed" }], ["import_srt", { seq_id: "seq-fx-1", paths: [path.join(tmp, "C1.srt")] }]]) {
+			r = await M.callJson(c.client, name, args);
+			assert.deepEqual([r.isError, r.json.code], [true, "panel-version-mismatch"], name);
+		}
 		assert.deepEqual(M.readLog(logFile), [], "패널에 아무 명령도 보내지 않았다");
 		r = await M.callJson(c.client, "get_rows", {});
 		assert.equal(r.isError, false, "읽기 도구는 된다");

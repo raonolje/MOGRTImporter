@@ -4,7 +4,7 @@
  * MCP 테스트의 가짜 패널 (별도 프로세스). 진짜 다리 폴더(임시)에 heartbeat를 쓰고 inbox에 답한다.
  *
  *   node tests/mcp/fake_panel.js <설정 JSON 경로>
- *   설정 {mode, dir, extPath, coreHash?, logFile?, snapFile?, appdata?, beatMs?, slowMs?, single?}
+ *   설정 {mode, dir, extPath, coreHash?, logFile?, snapFile?, appdata?, beatMs?, slowMs?, single?, applyFixture?, controlFile?}
  *
  * mode
  *   fixture  tests/mcp/fixtures/panel_replies.json의 답을 돌려준다 (op별, 일부는 인자별). seqId가 다르면 seq-mismatch,
@@ -91,6 +91,12 @@ async function harness() {
 	const { bootPanel, projKeyOf, seqKeyOf } = require("../lib/panelHarness");
 	const S = require("./lib/session");
 	const fx = cfg.single ? S.buildSingle() : S.build();
+	if (cfg.applyFixture) {
+		// 읽기/제안 fixture의 comment는 실제 템플릿에는 없는 합성 규칙. 배치 시험에서는 템플릿과 맞추고 트랙 추가 점검을 유발한다.
+		fx.preset.params = fx.preset.params.filter((p) => p.type !== "comment");
+		Object.values(fx.session.rowStates).forEach((rs) => { rs._allParams = rs._allParams.filter((p) => p.type !== "comment"); });
+		fx.seq.tracks.splice(2);
+	}
 	const extDir = String(cfg.extPath).replace(/\\/g, "/");
 	const cache = extDir + "/cache/" + projKeyOf(S.PROJ);
 	const h = await bootPanel({
@@ -112,6 +118,26 @@ async function harness() {
 	let n = 0;
 	for (;;) {
 		await h.advance(50);
+		// 테스트 전용 사용자 입력 통로. 브리지/agent로 승인하지 않고 패널의 UI/test 경로를 직접 구동한다.
+		if (cfg.controlFile && fs.existsSync(cfg.controlFile)) {
+			const input = JSON.parse(fs.readFileSync(cfg.controlFile, "utf8"));
+			fs.unlinkSync(cfg.controlFile);
+			let action;
+			try {
+				if (input.click) {
+					const el = h.$(input.click);
+					if (!el) throw new Error("없는 UI: " + input.click);
+					el.click();
+					action = { ok: true };
+				} else if (input.change) {
+					const el = h.$(input.change);
+					el.value = input.value;
+					h.change(el);
+					action = { ok: true };
+				} else action = h.win._mogrtDebug.cmd(input.op, input.args || {});
+				Promise.resolve(action).then((result) => writeJsonAtomic(cfg.controlFile + ".response", { id: input.id, result }), (error) => writeJsonAtomic(cfg.controlFile + ".response", { id: input.id, error: String(error) }));
+			} catch (error) { writeJsonAtomic(cfg.controlFile + ".response", { id: input.id, error: String(error) }); }
+		}
 		if (cfg.snapFile && ++n % 6 === 0) {
 			try {
 				const bar = h.$("aiReqBar");
@@ -119,9 +145,10 @@ async function harness() {
 				const ui = {
 					sugg: sb ? sb.textContent : "",
 					suggShown: !!h.$("suggWrap") && h.$("suggWrap").style.display !== "none",
-					aiReq: bar && bar.style.display !== "none" ? bar.querySelectorAll(".ai-req-text").map((e) => e.textContent) : []
+					aiReq: bar && bar.style.display !== "none" ? bar.querySelectorAll(".ai-req-text").map((e) => e.textContent) : [],
+					preflight: !!h.$("preflightModal") && h.$("preflightModal").classList.contains("open")
 				};
-				writeJsonAtomic(cfg.snapFile, { snapshot: h.snapshot(), status: h.status(), ui, errors: h.errors().map((e) => String((e && e.message) || e)).slice(0, 5) });
+				writeJsonAtomic(cfg.snapFile, { snapshot: h.snapshot(), status: h.status(), ui, hostCalls: h.host.calls.map((c) => c.fn), errors: h.errors().map((e) => String((e && e.message) || e)).slice(0, 5) });
 			} catch (_) {}
 		}
 		await sleep(50);

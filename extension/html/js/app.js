@@ -9802,6 +9802,7 @@ var modalState = {
 		renderCastBar();
 	}
 	async function updateSingleClip(sub) {
+		if (_jobActive) { _setStatus("AI 작업의 검토/적용이 진행 중입니다", "err"); return; }
 		const rs = state.rowStates[sub.id];
 		// 화자 줄: 한 줄 계획으로 화자 트랙에 (src/mi/apply.ts _miApply, 점검 창은 충돌·고침·옛 버전·새 트랙일 때만)
 		if (sub.spk) {
@@ -10103,7 +10104,7 @@ var modalState = {
 			setStatus("시퀀스를 열면 SRT를 열 수 있습니다", "err");
 			return null;
 		}
-		if (_miBusy) {
+		if (_miBusy || _jobActive) {
 			setStatus("타임라인 적용 중에는 SRT를 열 수 없습니다", "err");
 			return null;
 		}
@@ -10152,7 +10153,7 @@ var modalState = {
 	function _closeImportUi() {
 		let closed = false;
 		if (_imp) {
-			_closeImportModal();
+			_closeImportModal(false, "seq-mismatch");
 			closed = true;
 		}
 		if (closeChoice()) closed = true;
@@ -10301,10 +10302,12 @@ var modalState = {
 		_renderImportModal();
 		modal.classList.add("open");
 	}
-	function _closeImportModal() {
+	function _closeImportModal(keepJob, reason) {
+		const jobId = _imp && _imp.agentJobId;
 		const modal = document.getElementById("importModal");
 		if (modal) modal.classList.remove("open");
 		_imp = null;
+		if (jobId && !keepJob) _jobFinish(_jobs[jobId], "cancelled", null, { code: reason || "cancelled", detail: reason === "seq-mismatch" ? "시퀀스가 바뀌어 가져오기를 취소했습니다" : "SRT 가져오기 창을 닫았습니다" });
 	}
 	// 키를 고를 때마다: 이미 있는 화자면 그 이름·기본 프리셋이 기본값이고 처리는 병합(후반 작업 유지).
 	// 새 화자는 프로젝트 cast_defaults.json의 그 C번호 이름·기본 프리셋 (S2-3)
@@ -10645,9 +10648,10 @@ var modalState = {
 	}
 	function _onImportOk() {
 		if (!_imp) return;
+		if (_imp.agentJobId) { _jobPrune(); if (!_imp) return; }
 		// 창을 연 뒤 시퀀스가 바뀌었다: 미리 계산·분배 선택은 이전 시퀀스의 줄 것이다
 		if (_imp.seq !== _importSeqToken()) {
-			_closeImportModal();
+			_closeImportModal(false, "seq-mismatch");
 			setStatus(IMPORT_SEQ_CHANGED_MSG, "err");
 			return;
 		}
@@ -10667,8 +10671,19 @@ var modalState = {
 			return;
 		}
 		const job = _impJob();
-		_closeImportModal();
-		_importIntoCast(job);
+		const agentJob = _imp.agentJobId ? _jobs[_imp.agentJobId] : null;
+		_closeImportModal(true);
+		if (agentJob) {
+			if (agentJob.state !== "waiting_input" || agentJob.seq !== _importSeqToken()) return;
+			_aiLabel = true;
+			try {
+				const before = _sessionDataSig(_sessionClone());
+				const rep = _importIntoCast(job);
+				_jobFinish(agentJob, "succeeded", _cmdImportSummary(job, rep, before !== _sessionDataSig(_sessionClone())), null);
+			} catch (e) {
+				_jobFinish(agentJob, "failed", null, { code: "exception", detail: _errText(e) });
+			} finally { _aiLabel = false; }
+		} else _importIntoCast(job);
 	}
 	document.getElementById("impOk")?.addEventListener("click", _onImportOk);
 	document.getElementById("impCancel")?.addEventListener("click", () => {
@@ -10818,8 +10833,9 @@ var modalState = {
 	// 읽기: status, rows, resolve, presets, cast.get, session.snapshot, rows.raw(M5.3), mergePreview, plan(→ planToken), verify, sugg.list, approvals.list
 	// 바꾸기: importSrt, mergeCommit, apply {planToken | ids | uids | spk}, undo, cast.set,
 	//         suggest (제안 대기열에만 넣는다 — 속성·타임라인은 그대로), sugg.approve·sugg.reject (ui·test만), approvals.approve·approvals.reject (ui·test만)
-	// agent가 바꾸는 명령(CMD_MUTATING)을 보내면 실행하지 않고 승인 대기열에 넣고 needs-approval(rid)을 돌려준다 (M5.4 승인 카드 전까지는
-	// approvals.approve로 승인한다). 승인하면 실행하고, 그 명령이 인자를 확인한 뒤 바꾸기 바로 앞에서 안전 지점 'AI: <명령> 전'을 남긴다
+	// agent가 바꾸는 옛 명령(CMD_MUTATING)을 보내면 실행하지 않고 승인 대기열에 넣고 needs-approval(rid)을 돌려준다.
+	// MCP 적용/가져오기는 jobs.*를 써서 즉시 jobId를 받고 패널 카드에서 승인한다. jobs.get은 실행 중에도 바로 현재 상태를 돌려준다.
+	// 승인하면 실행하고, 그 명령이 인자를 확인한 뒤 바꾸기 바로 앞에서 안전 지점 'AI: <명령> 전'을 남긴다
 	// (_aiSafetyFlush — 틀린 요청은 남기지 않는다). 그동안 남는 히스토리 이름은 'AI: …'다.
 	// suggest는 agent도 바로 된다: 제안 대기열 자체가 승인 단계다 (사용자가 [적용]하기 전에는 아무것도 쓰지 않는다, 결정 4).
 	// 모든 명령: ctx.seqId·ctx.build가 있으면 지금 시퀀스·패널 빌드와 같아야 하고(seq-mismatch·build-mismatch), 바꾸는 명령은
@@ -10844,6 +10860,145 @@ var modalState = {
 	const SUGG_BATCH_MAX = 200;
 	var _agentQueue = [];
 	var _agentSeq = 0;
+	// M5.4: 작업은 MCP 프로세스가 아니라 패널이 소유한다. 스냅숏만 최대 100개/24시간 보관한다.
+	// 패널 재시작은 자동 재실행하지 않는다: 미완료 작업은 cancelled(panel-reloaded), 부분 적용은 검수 후 다시 요청한다.
+	const JOB_MAX = 100, JOB_TTL = 24 * 60 * 60000;
+	const JOB_TERMINAL = { succeeded: true, failed: true, rejected: true, cancelled: true, expired: true };
+	const JOB_LABELS = { "jobs.requestApply": "타임라인 적용", "jobs.importSrt": "SRT 가져오기" };
+	var _jobs = {}, _jobsLoaded = false, _jobActive = null, _jobSeq = 0;
+	function _jobSave() {
+		const root = _getCacheRoot();
+		return !!root && _fsWrite(root + "/ai_jobs.json", { v: 1, jobs: Object.values(_jobs) });
+	}
+	function _jobLoad() {
+		if (_jobsLoaded) return;
+		_jobsLoaded = true;
+		const root = _getCacheRoot();
+		const saved = root ? _fsRead(root + "/ai_jobs.json") : null;
+		let interrupted = false;
+		if (saved && saved.v === 1 && Array.isArray(saved.jobs)) saved.jobs.slice(-JOB_MAX).forEach((j) => {
+			if (!j || typeof j.jobId !== "string" || !/^j[a-z0-9-]+$/.test(j.jobId) || typeof j.createdAt !== "number" || Date.now() - j.createdAt > JOB_TTL) return;
+			if (!JOB_TERMINAL[j.state]) {
+				j.state = "cancelled";
+				j.error = { code: "panel-reloaded", detail: "패널이 다시 열려 작업을 중단했습니다. 부분 적용 여부를 검수한 뒤 다시 요청하세요" };
+				j.updatedAt = j.finishedAt = Date.now();
+				interrupted = true;
+			}
+			_jobs[j.jobId] = j;
+		});
+		if (interrupted) _jobSave();
+	}
+	function _jobView(j) {
+		const v = _cmdClone(j);
+		delete v.seq;
+		delete v.args;
+		delete v.inputHash;
+		delete v.cancelReason;
+		return v;
+	}
+	function _jobInputHash(uids) {
+		return fnv1a32(stableJson({ rows: uids.map((uid) => {
+			const sub = _subByUid(uid), rs = sub && state.rowStates[sub.id];
+			return { sub, values: rs ? { presetId: rs.presetId, params: rs.params, all: rs._allParams, mm: rs.mm, ap: rs.ap } : null };
+		}), presets: state.presets, cast: state.mi.cast, order: state.mi.castOrder, stack: state.mi.stack, dy: state.mi.stackDy, base: _trackValueNum() }));
+	}
+	function _jobFinish(j, st, result, error) {
+		if (!j || JOB_TERMINAL[j.state]) return;
+		j.state = st;
+		j.updatedAt = j.finishedAt = Date.now();
+		j.result = result === undefined ? null : _cmdClone(result);
+		j.error = error || null;
+		if (_jobActive === j.jobId) _jobActive = null;
+		_jobSave();
+	}
+	function _jobPrune() {
+		_jobLoad();
+		let changed = false;
+		Object.values(_jobs).forEach((j) => {
+			if (j.state === "pending_approval" || j.state === "waiting_input") {
+				const wasActive = _jobActive === j.jobId;
+				if (j.seq !== _importSeqToken()) _jobFinish(j, "cancelled", null, { code: "seq-mismatch", detail: "작업을 요청한 뒤 시퀀스가 바뀌었습니다" });
+				else if (Date.now() - (j.waitingAt || j.createdAt) >= AGENT_QUEUE_TTL) _jobFinish(j, "expired", null, { code: "expired", detail: "승인/입력 대기 시간이 10분을 넘었습니다" });
+				if (JOB_TERMINAL[j.state] && _imp && _imp.agentJobId === j.jobId) _closeImportModal(true);
+				if (wasActive && JOB_TERMINAL[j.state] && j.op === "jobs.requestApply" && _miPfClose) _miPfClose();
+			}
+			if (JOB_TERMINAL[j.state] && Date.now() - j.createdAt > JOB_TTL) { delete _jobs[j.jobId]; changed = true; }
+		});
+		const old = Object.values(_jobs).filter((j) => JOB_TERMINAL[j.state]).sort((a, b) => a.createdAt - b.createdAt);
+		while (Object.keys(_jobs).length >= JOB_MAX && old.length) { delete _jobs[old.shift().jobId]; changed = true; }
+		if (changed) _jobSave();
+	}
+	function _jobRequest(op, args, ctx) {
+		if (!_keysResolved || !state.currentSequenceId) return _cmdErr("no-sequence", "작업할 시퀀스를 여세요");
+		if (!ctx || typeof ctx.seqId !== "string" || !ctx.seqId) return _cmdErr("bad-args", "ctx.seqId는 필수입니다");
+		if (ctx.seqId !== String(state.currentSequenceId)) return _cmdErr("seq-mismatch", "요청 시퀀스가 다릅니다");
+		_jobPrune();
+		if (_jobActive || _miBusy || _legacyRun || _imp) return _cmdErr("busy", "다른 적용/가져오기 작업이 진행 중입니다");
+		let captured;
+		if (op === "jobs.requestApply") {
+			if (Object.keys(args).some((k) => k !== "scope" && k !== "uids") || ["changed", "rows"].indexOf(args.scope) === -1) return _cmdErr("bad-args", "scope는 changed|rows입니다");
+			if (args.scope === "changed" && args.uids !== undefined) return _cmdErr("bad-args", "changed에는 uids를 함께 주지 않습니다");
+			let subs;
+			if (args.scope === "rows") {
+				if (!Array.isArray(args.uids) || !args.uids.length || args.uids.length > 200 || args.uids.some((u) => typeof u !== "string" || !u) || new Set(args.uids).size !== args.uids.length) return _cmdErr("bad-args", "uids는 서로 다른 줄 uid 1~200개입니다");
+				subs = args.uids.map(_subByUid);
+				if (subs.some((s) => !s)) return _cmdErr("not-found", "요청한 줄을 찾지 못했습니다");
+			// changed는 mm 표시에 국한되지 않는다: 새 줄·프리셋·위치·타임라인 삭제도 실행 시 배치 계획이 차이를 판정한다.
+			} else subs = state.subtitles.slice();
+			if (!subs.length) return _cmdErr("no-rows", "적용할 줄이 없습니다");
+			if (subs.some((s) => !s.spk)) return _cmdErr("unsupported-rows", "화자가 없는 옛 단일 화자 줄은 AI 적용을 지원하지 않습니다. 패널의 일반 ▶ 적용을 사용하거나 SRT 가져오기 창에서 C1 등 화자를 지정한 뒤 요청하세요");
+			captured = { scope: args.scope, uids: subs.map(_uidOf) };
+		} else {
+			if (Object.keys(args).some((k) => k !== "paths") || !Array.isArray(args.paths) || !args.paths.length || args.paths.length > 20 || args.paths.some((p) => typeof p !== "string" || p.length > 4096 || /[\x00-\x1f]/.test(p) || !/\.srt$/i.test(p) || !/^(?:[A-Za-z]:[\\/]|\/(?!\/))/.test(p)) || new Set(args.paths).size !== args.paths.length) return _cmdErr("bad-args", "paths는 절대 로컬 .srt 경로 1~20개입니다 (네트워크 경로 제외)");
+			captured = { paths: args.paths.slice() };
+		}
+		if (_agentPrune().length >= AGENT_QUEUE_MAX || Object.keys(_jobs).length >= JOB_MAX) return _cmdErr("busy", "승인 대기열이 가득 찼습니다");
+		const now = Date.now(), jobId = "j" + now.toString(36) + "-" + ++_jobSeq + "-" + Math.random().toString(36).slice(2, 8);
+		const rid = "a" + now.toString(36) + "-" + ++_agentSeq;
+		const j = { jobId, rid, op, seqId: ctx.seqId, seq: _importSeqToken(), state: "pending_approval", createdAt: now, updatedAt: now, result: null, error: null, args: captured };
+		if (captured.uids) j.inputHash = _jobInputHash(captured.uids);
+		_jobs[jobId] = j;
+		if (!_jobSave()) { delete _jobs[jobId]; return _cmdErr("storage-failed", "작업 기록을 저장하지 못했습니다"); }
+		_agentQueue.push({ rid, jobId, op, args: captured, by: typeof ctx.by === "string" ? ctx.by.slice(0, 40) : "ai", at: now, seq: j.seq });
+		_aiReqRender();
+		return _cmdOk(_jobView(j));
+	}
+	function _jobStart(q) {
+		const j = _jobs[q.jobId];
+		if (!j || j.state !== "pending_approval") return _cmdErr("not-found", "대기 중인 작업이 없습니다");
+		_jobActive = j.jobId;
+		j.state = "running"; j.startedAt = j.updatedAt = Date.now();
+		if (!_jobSave()) { _jobFinish(j, "failed", null, { code: "storage-failed", detail: "시작 기록을 저장하지 못했습니다" }); return _cmdOk(_jobView(j)); }
+		// 승인 응답/인박스 폴링은 완료를 기다리지 않는다. 모든 쓰기 명령은 _jobActive로 직렬화한다.
+		Promise.resolve().then(async () => {
+			try {
+				if (j.seq !== _importSeqToken()) { _jobFinish(j, "cancelled", null, { code: "seq-mismatch", detail: "시퀀스가 바뀌었습니다" }); return; }
+				if (j.op === "jobs.importSrt") {
+					const read = _cmdReadFiles(j.args.paths.map((path) => ({ path })));
+					if (read.error) { _jobFinish(j, "failed", null, { code: "read-failed", detail: read.error }); return; }
+					const ans = read.files.map(_analyzeSrt);
+					if (!ans.some((a) => a.cues.length)) { _jobFinish(j, "failed", null, { code: "bad-srt", detail: "가져올 자막이 없습니다" }); return; }
+					// C번호 없는 한 파일도 교체 경로로 곧장 보내지 않는다. 사용자가 화자/병합 방식을 검토한다.
+					_openImportModal(ans, state.subtitles.some((s) => !s.spk), j.seq);
+					if (!_imp) throw new Error("가져오기 창을 열지 못했습니다");
+					_imp.agentJobId = j.jobId;
+					j.state = "waiting_input"; j.waitingAt = j.updatedAt = Date.now(); _jobSave();
+					return;
+				}
+				const subs = j.args.uids.map(_subByUid);
+				if (subs.some((s) => !s)) { _jobFinish(j, "failed", null, { code: "rows-changed", detail: "승인 전 대상 줄이 사라졌습니다" }); return; }
+				if (j.inputHash !== _jobInputHash(j.args.uids)) { _jobFinish(j, "failed", null, { code: "rows-changed", detail: "요청 후 자막/프리셋/화자 설정이 바뀌었습니다. 현재 값으로 다시 요청하세요" }); return; }
+				_aiLabel = true;
+				_saveSafety("AI: 타임라인 적용 전");
+				const r = await _miApply(subs, { auto: false, single: j.args.scope === "rows" });
+				const cancelled = j.seq !== _importSeqToken() || (r && (r.stopped || r.error === "cancelled" || r.error === "seq-mismatch"));
+				const failed = !r || r.ok !== true || r.failed > 0 || r.partial > 0 || r.lost > 0 || r.motionFailed > 0 || r.conflict > 0;
+				_jobFinish(j, cancelled ? "cancelled" : failed ? "failed" : "succeeded", r || null, cancelled ? { code: j.cancelReason || r && r.error || "cancelled", detail: "중단되었습니다. 결과의 부분 적용 수를 확인하세요" } : failed ? { code: r && r.error || "apply-incomplete", detail: "적용 결과를 확인하세요" } : null);
+			} catch (e) { _jobFinish(j, "failed", null, { code: "exception", detail: _errText(e) }); }
+			finally { if (j.op === "jobs.requestApply") _aiLabel = false; }
+		});
+		return _cmdOk(_jobView(j));
+	}
 	// 승인한 agent 요청의 안전 지점 이름 ('AI: <명령> 전'). 바꾸는 명령이 인자를 모두 확인한 뒤 바꾸기 바로 앞에서 _aiSafetyFlush로 남긴다:
 	// 틀린 요청(bad-args·not-found)이 안전 지점 자리(SAFETY_MAX)를 쓰지 않고, '… 전' 이름이 돌지 않은 명령을 가리키지 않게
 	var _aiSafetyPending = "";
@@ -10894,6 +11049,14 @@ var modalState = {
 		return rowSummary(sub, rs, preset, (state.mi && state.mi.salt) || "", _castMode());
 	}
 	const _COMMANDS = {
+		"jobs.requestApply": (args, ctx) => _jobRequest("jobs.requestApply", args, ctx),
+		"jobs.importSrt": (args, ctx) => _jobRequest("jobs.importSrt", args, ctx),
+		"jobs.get": (args) => {
+			if (Object.keys(args).some((k) => k !== "jobId") || typeof args.jobId !== "string" || !args.jobId) return _cmdErr("bad-args", "jobId는 필수 문자열입니다");
+			_jobPrune();
+			const j = Object.prototype.hasOwnProperty.call(_jobs, args.jobId) ? _jobs[args.jobId] : null;
+			return j ? _cmdOk(_jobView(j)) : _cmdErr("not-found", "작업 기록이 없습니다 (보관 24시간/100개)");
+		},
 		// 패널·시퀀스·목록 요약. panel.build는 이 패널의 빌드 스탬프, host는 v28 호스트 ping 결과
 		// (MI_ 호스트가 없거나 응답이 없으면 null — v27 호스트가 캐시된 채인 Premiere)
 		status: async () => {
@@ -10904,7 +11067,7 @@ var modalState = {
 			});
 			let hostPing = null;
 			try {
-				hostPing = await host.mi.ping();
+				if (!_jobActive && !_miBusy && !_legacyRun) hostPing = await host.mi.ping();
 			} catch (_) {
 				hostPing = null;
 			}
@@ -10919,7 +11082,7 @@ var modalState = {
 				rows: state.subtitles.length,
 				castMode: _castMode(),
 				speakers,
-				busy: _miBusy,
+				busy: !!(_miBusy || _legacyRun || _jobActive),
 				suggestions: _suggAll().length,
 				approvals: _agentPrune().length,
 				coreHash: _coreHash()
@@ -11117,11 +11280,12 @@ var modalState = {
 			return _cmdOk(_cmdClone(_suggReject(t.list)));
 		},
 		// agent 요청 대기열 → [{rid, op, what, by, at, args}]
-		"approvals.list": () => _cmdOk(_cmdClone(_agentPrune().map((q) => ({ rid: q.rid, op: q.op, what: CMD_MUTATING[q.op], by: q.by, at: q.at, args: q.args })))),
+		"approvals.list": () => _cmdOk(_cmdClone(_agentPrune().map((q) => ({ rid: q.rid, jobId: q.jobId || null, op: q.op, what: CMD_MUTATING[q.op] || JOB_LABELS[q.op], by: q.by, at: q.at, args: q.args })))),
 		// agent 요청 승인 (ui·test만): 그 명령을 실행 (인자를 확인한 뒤 바꾸기 전에 안전 지점 'AI: <명령> 전', 그동안 남는 히스토리 이름은 'AI: …') → 그 명령의 결과
 		"approvals.approve": async (args) => {
 			const q = _agentTake(args.rid);
 			if (q.error) return _cmdErr(q.code, q.error);
+			if (q.item.jobId) return _jobStart(q.item);
 			_aiSafetyPending = "AI: " + CMD_MUTATING[q.item.op] + " 전";
 			_aiLabel = true;
 			try {
@@ -11135,7 +11299,8 @@ var modalState = {
 		"approvals.reject": (args) => {
 			const q = _agentTake(args.rid);
 			if (q.error) return _cmdErr(q.code, q.error);
-			setStatus("AI 요청을 버렸습니다: " + CMD_MUTATING[q.item.op], "");
+			if (q.item.jobId) _jobFinish(_jobs[q.item.jobId], "rejected", null, { code: "rejected", detail: "패널에서 요청을 거절했습니다" });
+			setStatus("AI 요청을 버렸습니다: " + (CMD_MUTATING[q.item.op] || JOB_LABELS[q.item.op]), "");
 			return _cmdOk({ rid: q.item.rid });
 		}
 	};
@@ -11144,7 +11309,9 @@ var modalState = {
 	function _agentPrune() {
 		const now = Date.now();
 		const seq = _importSeqToken();
-		_agentQueue = _agentQueue.filter((q) => now - q.at < AGENT_QUEUE_TTL && q.seq === seq);
+		// 요청이 실제 있을 때만 디스크 작업 기록을 읽는다 ('AI 연결 끔' 부팅은 쓰지 않는다).
+		if (_jobsLoaded) _jobPrune();
+		_agentQueue = _agentQueue.filter((q) => now - q.at < AGENT_QUEUE_TTL && q.seq === seq && (!q.jobId || (_jobs[q.jobId] && _jobs[q.jobId].state === "pending_approval")));
 		return _agentQueue;
 	}
 	// agent가 보낸 바꾸는 명령을 대기열에 넣는다 → needs-approval + rid
@@ -11153,7 +11320,10 @@ var modalState = {
 		const rid = "a" + Date.now().toString(36) + "-" + ++_agentSeq;
 		const by = ctx && typeof ctx.by === "string" && ctx.by ? ctx.by.slice(0, 40) : "ai";
 		_agentQueue.push({ rid, op, args: _cmdClone(args || {}), by, at: Date.now(), seq: _importSeqToken() });
-		if (_agentQueue.length > AGENT_QUEUE_MAX) _agentQueue.shift();
+		if (_agentQueue.length > AGENT_QUEUE_MAX) {
+			const old = _agentQueue.shift();
+			if (old.jobId) _jobFinish(_jobs[old.jobId], "expired", null, { code: "queue-full", detail: "새 요청으로 승인 대기열이 가득 찼습니다" });
+		}
 		setStatus("AI 요청 대기: " + CMD_MUTATING[op] + " — 패널에서 승인해야 실행됩니다", "");
 		_aiReqRender(); // 화자 표 제안 카드 (inbox.ts, M5.3)
 		return Object.assign(_cmdErr("needs-approval", CMD_MUTATING[op] + "은(는) 패널에서 승인해야 합니다"), { rid });
@@ -11493,10 +11663,10 @@ var modalState = {
 			if (CMD_UI_ONLY[op]) return _cmdErr("needs-approval", "승인은 패널에서만 합니다");
 			if (mutating) return _agentEnqueue(op, args || {}, ctx);
 		}
-		if ((mutating || CMD_BUSY_BLOCKED[op]) && (_miBusy || _legacyRun)) return _cmdErr("busy", "타임라인 적용이 실행 중");
+		if ((mutating || CMD_BUSY_BLOCKED[op] || JOB_LABELS[op] || op === "plan" || op === "verify") && (_miBusy || _legacyRun || _jobActive)) return _cmdErr("busy", "적용/가져오기 작업이 실행 중");
 		if (mutating || CMD_BUSY_BLOCKED[op]) _bumpActivity();
 		try {
-			return await _COMMANDS[op](args || {}, { source, by: ctx && typeof ctx.by === "string" ? ctx.by : undefined });
+			return await _COMMANDS[op](args || {}, { source, seqId: ctx && ctx.seqId, by: ctx && typeof ctx.by === "string" ? ctx.by : undefined });
 		} catch (e) {
 			console.error("[MOGRT] runCommand 예외:", op, e);
 			return _cmdErr("exception", (e && e.message) || String(e));
@@ -11677,7 +11847,7 @@ var modalState = {
 			projKey: state.currentProjectKey,
 			seqKey: state.currentSequenceKey,
 			keysResolved: _keysResolved,
-			busy: !!(_miBusy || _legacyRun),
+			busy: !!(_miBusy || _legacyRun || _jobActive),
 			processing: _aiProcessing,
 			pendingApproval: _agentPrune().length,
 			suggestions: _suggAll().length,
@@ -11709,7 +11879,7 @@ var modalState = {
 	}
 	// 호스트 버전 (heartbeat.host): 적용 중이 아닐 때 AI_HOST_PING_MS마다 한 번 ping (MI_ 호스트가 없으면 null)
 	function _aiPingHost() {
-		if (_miBusy || _legacyRun || _aiPinging || Date.now() - _aiHostAt < AI_HOST_PING_MS) return;
+		if (_miBusy || _legacyRun || _jobActive || _aiPinging || Date.now() - _aiHostAt < AI_HOST_PING_MS) return;
 		_aiPinging = true;
 		_aiHostAt = Date.now();
 		host.mi.ping().then(
@@ -11862,15 +12032,15 @@ var modalState = {
 			console.warn("[MOGRT] AI 연결: 응답을 쓰지 못함", id, _errText(e));
 		}
 	}
-	// ── AI 요청 카드 (M5.3) ──
+	// ── AI 요청 카드 (M5.3 화자 표 / M5.4 적용·가져오기 작업) ──
 	// agent가 보낸 화자 표 제안(cast.set — MCP set_cast_proposal)을 패널 위쪽 #aiReqBar에 한 줄씩 보인다: [승인]이면 그 요청을 실행하고
 	// (approvals.approve: 안전 지점 'AI: 화자 표 바꾸기 전' → 화자 표 → 히스토리 'AI: 화자 표: …'), [거절]이면 버린다. 타임라인은 바꾸지 않는다.
-	// 적용·가져오기 같은 다른 바꾸는 요청의 카드는 M5.4에서 (그 전에는 대기열에만 있다가 10분 뒤 버려진다).
+	// jobs.requestApply/jobs.importSrt는 승인 후 비동기로 실행하며, 기존 적용 전 점검/가져오기 창의 추가 입력을 기다린다.
 	// 대기열이 바뀔 때(넣기·꺼내기)와 heartbeat마다(낡음·시퀀스 전환) 다시 그린다.
 	function _aiReqRender() {
 		const bar = document.getElementById("aiReqBar");
 		if (!bar) return;
-		const list = _agentPrune().filter((q) => q.op === "cast.set");
+		const list = _agentPrune().filter((q) => q.op === "cast.set" || !!JOB_LABELS[q.op]);
 		const sig = list.map((q) => q.rid).join(",");
 		if (bar.dataset.rids === sig && (list.length > 0) === (bar.style.display !== "none")) return;
 		bar.dataset.rids = sig;
@@ -11882,7 +12052,8 @@ var modalState = {
 			const txt = document.createElement("span");
 			txt.className = "ai-req-text";
 			txt.textContent = "AI 요청 (" + _suggByLabel(q.by) + ") · " + _aiReqSummary(q);
-			txt.title = "패널에서 승인해야 실행됩니다. 승인하면 바꾸기 전 상태를 안전 지점 'AI: 화자 표 바꾸기 전'에 남깁니다";
+			txt.title = "패널에서 승인해야 실행됩니다. 적용 전 점검/가져오기 창에서 내용을 다시 확인할 수 있습니다";
+			if (q.op === "jobs.importSrt") txt.title += "\n" + (q.args.paths || []).join("\n");
 			const ok = document.createElement("button");
 			ok.className = "btn ai-req-ok";
 			ok.textContent = "승인";
@@ -11901,6 +12072,13 @@ var modalState = {
 	// "화자 표: C2(영희) 이름 ‘민수’, 트랙 V5 · C1(철수) 기본 프리셋 ‘합성 자막’ — 메모"
 	function _aiReqSummary(q) {
 		const a = q.args || {};
+		if (q.op === "jobs.requestApply") {
+			const labels = (a.uids || []).slice(0, 8).map((uid) => { const sub = _subByUid(uid); return sub ? rowLabel(sub, _castMode()) : uid; });
+			return "타임라인 " + (a.scope === "changed" ? "변경 확인 후 적용" : "선택 줄 적용") + " · 검사 대상 " + (a.uids || []).length + "줄" + (a.scope === "rows" ? " (" + labels.join(", ") + (a.uids.length > 8 ? " …" : "") + ")" : "");
+		}
+		if (q.op === "jobs.importSrt") return "SRT 가져오기 · " + (a.paths || []).map((p) => p.split(/[\\/]/).pop()).join(" · ") + " (승인 뒤 가져오기 창에서 확인)";
+		if (q.op === "apply") return "타임라인 적용 (기본 보호 설정)";
+		if (q.op === "importSrt") return "SRT 가져오기 · " + (a.files || []).map((f) => f.name || f.path || "?").join(" · ");
 		const items = Array.isArray(a.items) ? a.items : [];
 		const parts = items.map((it) => {
 			if (!it || typeof it !== "object") return "?";
@@ -11918,8 +12096,9 @@ var modalState = {
 		return "화자 표: " + (parts.join(" · ") || "(항목 없음)") + (typeof a.note === "string" && a.note.trim() ? " — " + a.note.trim().slice(0, 120) : "");
 	}
 	async function _aiReqDecide(rid, yes) {
+		const q = _agentQueue.find((x) => x.rid === rid);
 		const r = await runCommand(yes ? "approvals.approve" : "approvals.reject", { rid }, { source: "ui" });
-		if (yes && r.ok) setStatus("AI 요청을 승인했습니다: 화자 표 바꾸기" + (r.data && r.data.changed && r.data.changed.length ? " (" + r.data.changed.join(", ") + ")" : " — 바뀐 것 없음"), "ok");
+		if (yes && r.ok) setStatus("AI 요청을 승인했습니다: " + (q ? CMD_MUTATING[q.op] || JOB_LABELS[q.op] : "요청") + (r.data && r.data.jobId ? " — 진행 상태는 작업 기록에서 확인할 수 있습니다" : r.data && r.data.changed && r.data.changed.length ? " (" + r.data.changed.join(", ") + ")" : ""), "ok");
 		else if (!r.ok) setStatus("AI 요청을 " + (yes ? "실행하지" : "버리지") + " 못했습니다: " + (r.detail || r.error), "err");
 		_aiReqRender();
 		return r;
@@ -12842,6 +13021,10 @@ var modalState = {
 	};
 	var _miPfClose = null; // 열린 적용 전 점검을 닫는 함수 (시퀀스 전환 등)
 	function _miShowBusy(text) {
+		if (_jobActive && _jobs[_jobActive]) {
+			_jobs[_jobActive].progress = { text: String(text), at: Date.now() };
+			_jobs[_jobActive].updatedAt = Date.now();
+		}
 		const el = document.getElementById("miBusy");
 		if (el) el.style.display = "";
 		const t = document.getElementById("miBusyText");
@@ -13102,6 +13285,7 @@ var modalState = {
 	// #preflightModal → 고른 선택지(MI_PF_DEFAULTS 모양) | null (취소)
 	function _miPreflight(plan, ctx) {
 		return new Promise((resolve) => {
+			const agentJob = _jobActive && _jobs[_jobActive] && _jobs[_jobActive].op === "jobs.requestApply" ? _jobs[_jobActive] : null;
 			const modal = document.getElementById("preflightModal");
 			const okBtn = document.getElementById("pfOk");
 			const noBtn = document.getElementById("pfCancel");
@@ -13149,15 +13333,23 @@ var modalState = {
 				okBtn.onclick = null;
 				noBtn.onclick = null;
 				_miPfClose = null;
+				if (agentJob && !JOB_TERMINAL[agentJob.state]) { agentJob.state = "running"; agentJob.updatedAt = Date.now(); delete agentJob.waitingAt; _jobSave(); }
 				resolve(v);
 			};
-			okBtn.onclick = () => done({
+			okBtn.onclick = () => {
+				if (agentJob) {
+					_jobPrune();
+					if (JOB_TERMINAL[agentJob.state]) { done(null); return; }
+				}
+				done({
 				adopt: chk("pfAdopt"), adoptUncertain: chk("pfAdoptUncertain"), adoptForeign: chk("pfAdoptForeign"), moveLegacy: chk("pfMoveLegacy"),
 				orphans: chk("pfOrphansAll") ? "all" : chk("pfOrphans") ? "pre" : "none", cleanupStale: chk("pfCleanupStale"), replaceMissing: chk("pfReplaceMissing"),
 				overwriteEdited: chk("pfOverwriteEdited"), restoreMoved: chk("pfRestoreMoved"), moveDecorated: chk("pfMoveDecorated"), upgradeOld: chk("pfUpgradeOld")
-			});
+				});
+			};
 			noBtn.onclick = () => done(null);
 			_miPfClose = () => done(null);
+			if (agentJob) { agentJob.state = "waiting_input"; agentJob.waitingAt = agentJob.updatedAt = Date.now(); agentJob.progress = { text: "적용 전 점검 창에서 확인을 기다립니다", at: Date.now() }; _jobSave(); }
 			modal.classList.add("open");
 		});
 	}
@@ -14874,7 +15066,7 @@ var modalState = {
 		_seqPollingActive = true;
 		setInterval(async () => {
 			// 화자별 배치 중에는 시퀀스 전환을 따라가지 않는다 (목록·키가 바뀌면 결과를 다른 시퀀스에 적는다, S2-4)
-			if (_miBusy) return;
+			if (_miBusy && !(_jobActive && _miPfClose)) return;
 			let info;
 			try {
 				info = await host.getActiveSequenceInfo();
@@ -14882,7 +15074,14 @@ var modalState = {
 				return;
 			}
 			// 기다리는 동안 적용이 시작됐을 수 있다 (▶가 이 호출 뒤에 줄을 섰다) → 이 결과로 시퀀스를 옮기지 않는다
-			if (_miBusy) return;
+			if (_miBusy) {
+				// 검토 창에서는 호스트 쓰기가 없다. 시퀀스 변경만 읽어 창을 취소하고, 목록 전환은 작업 정리 후 다음 폴링에 맡긴다.
+				if (_jobActive && _miPfClose && info.seqId && String(info.seqId) !== String(state.currentSequenceId)) {
+					if (_jobs[_jobActive]) _jobs[_jobActive].cancelReason = "seq-mismatch";
+					_miPfClose();
+				}
+				return;
+			}
 			try {
 				const newSeqId = info.seqId || "";
 				const newSeqName = info.seqName || "";
@@ -15245,7 +15444,7 @@ var modalState = {
 			setStatus("먼저 SRT 파일을 열어주세요.", "err");
 			return;
 		}
-		if (_miBusy) {
+		if (_miBusy || _jobActive) {
 			setStatus("타임라인 적용이 이미 실행 중입니다", "err");
 			return;
 		}

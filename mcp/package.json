@@ -1,6 +1,6 @@
 {
   "name": "mogrt-importer-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "MOGRT Subtitle Importer 전용 MCP 서버 (stdio, 상태 없음). 패널과는 %APPDATA%/MogrtImporter/bridge 파일 다리로만 이야기한다.",
   "main": "server.mjs",

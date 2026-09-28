@@ -716,7 +716,7 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   - (S4-1 구현) `MI_setMotion`은 spec 상태에 `locked`(잠긴 트랙, 풀지 않는다)를 더하고, key가 uid면 이름의 태그(uid·g)를 확인한다(다르면 notFound reason tag).
     같은 태그 클립이 둘이면(자르기) ambiguous. 결과에 쓰기 전 값 `x0`·`y0`, 예산 7초와 `done`(placeChunk와 같다), 200개 상한.
 - **재배치 클립**(moveRegen, legacyMove, replace)에는 pos를 다시 적용한다. 효과가 있는 클립은 기본적으로 다시 놓지 않는다.
-- **동시 발화 쌓기**(기본 끔): `stackLevels`로 동시에 보이는 묶음 안에서 castOrder 순서로 층을 매긴다. y = y0 − 층 × stackDy × 줄 수.
+- **동시 발화 쌓기**(v1.3.0부터 기본 켬): `stackLevels`로 동시에 보이는 묶음 안에서 castOrder 순서로 층을 매긴다. y = y0 − 층 × stackDy × 줄 수.
   - (S4-2 리뷰) 층은 줄마다 매긴다: 그 줄과 실제로 겹치는 castOrder가 앞선 화자 줄들의 가장 높은 층 + 1 (없으면 0). 동시에 보이는 줄끼리는 늘 castOrder 순서로
     서로 다른 층이고, 겹침이 사슬처럼 이어진 묶음(A-B, B-C)에서도 겹치지 않는 화자 때문에 더 올라가지 않는다. 줄 수(lineFactor)는 묶음 전체의 최댓값 그대로다.
   - (S4-2 리뷰) 위치가 '변경 안 함'인 화자의 쌓은 줄은 (0.5, 0.5)가 아니라 그 줄 클립의 지난 자리(applied: 쌓았던 줄은 mb, 아니면 mo)에서 쌓는다 — null은 클립을 되돌리지 않는다.
@@ -750,16 +750,17 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   | S1-7/S1-8 | importSrt, mergePreview, mergeCommit |
   | S2-4 | plan, apply |
   | S3-1 | cast.set, suggest, sugg.*, verify |
+  | M5.4 | jobs.requestApply, jobs.importSrt, jobs.get; 승인/거절은 기존 approvals.* |
 
-  - agent가 보내는 변경 명령은 M5.4 전까지 needs-approval이다.
+  - agent의 일반 변경 명령은 승인 대기열로 보낸다. M5.4 작업 요청은 `pending_approval`과 작업 ID를 반환하고 패널에서 승인한 뒤 실행한다. agent는 승인 명령을 부를 수 없다.
 - **드리프트 방지**(검증 반영): heartbeat에 `extPath`, `build`, `coreHash`를 싣는다. 서버는 **설치된** app.js의 core region을 읽고, 해시가 다르면 쓰기 도구를 거부한다.
 - **서버**: stdio, 상태 없음, 파일 인박스(`%APPDATA%/MogrtImporter/bridge`).
   - 스키마는 평평하게 쓴다.
   - 결과는 content[0].text에 JSON으로 넣는다.
   - 호출은 20초 안에 끝낸다. 길면 job으로 돌린다.
 - **도구**:
-  - 읽기: get_status, list_presets, get_cast, get_rows, **find_row**, get_suggestions, plan_apply, verify_timeline
-  - 쓰기: set_cast_proposal, suggest_fields, request_apply, wait_job, import_srt
+  - 읽기: get_status, list_presets, get_cast, get_rows, **find_row**, get_suggestions, plan_apply, verify_timeline, get_guide, wait_job
+  - 쓰기: set_cast_proposal, suggest_fields, request_apply, import_srt
 - **Codex 설정**: `[mcp_servers.mogrt_importer] command="node" args=[".../mcp/server.mjs"] startup_timeout_sec=20 tool_timeout_sec=60`
 - **Claude 설정**: `claude mcp add mogrt_importer -- node .../mcp/server.mjs`
 - **단계**: M5.0 스파이크 → M5.1 인박스 → M5.2 읽기 → M5.3 제안 → M5.4 승인 카드 → M5.5 Claude.
@@ -1140,8 +1141,17 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   - 안내문(instructions)·get_guide에 쓰기 도구·seq_id·rejected를 더했다 (1131자, 앞 442자 규칙).
   - 테스트: `tests/unit/panel_inbox.test.js`(rows.raw — 서버 쪽 validateSuggestion 결과 = 패널 suggest 결과, 승인 카드 거절·승인·틀린 요청), `tests/unit/mcp_tools.test.js`(쓰기 도구 정의·parseTrack),
     `tests/mcp/server_write.test.js`(진짜 패널(vm)과 20줄 포인트 텍스트·낡은 sig·캡션 필드·섞인 오류·최대 개수 초과·seq_id·'#12 T2'·카드, fixture 패널로 해시 불일치면 명령 0개), 하드 `s5_mcp` (7)~(10).
-- M5.4 승인 카드
-- M5.5 Claude
+- M5.4 승인 카드 — **구현·자동 테스트 완료, Premiere 하드 검증 보류 (2026-09-28)**
+  - `request_apply {seq_id, scope: changed|rows, uids?}`, `import_srt {seq_id, paths}`, `wait_job {job_id, wait_sec?}`를 추가했다. 전체 14개 도구(읽기 10개, 쓰기 4개).
+  - 요청은 작업 ID를 즉시 반환한다. 패널 승인 후에도 적용 전 점검 또는 SRT 가져오기 창에서 사용자가 선택한다. `pending_approval`·`running`·`waiting_input`과 종료 상태를 구별한다.
+  - 적용은 화자 키가 있는 줄만 지원한다. 화자 없는 기존 목록은 `unsupported-rows`로 거절하며 패널에서 적용하거나 화자를 지정하도록 안내한다. `changed`는 전체 목록을 검사해 실제 변경분을 계획한다.
+  - 요청 시 시퀀스와 자막·프리셋·화자 설정을 확인한다. 승인 전 데이터 변경은 `rows-changed`, 시퀀스 전환은 취소. 점검 만료 후 남은 확인 버튼으로 실행할 수 없고 다른 대기 작업의 만료가 현재 작업을 취소하지 않는다.
+  - 작업 스냅숏은 `cache/ai_jobs.json`에 최대 100개/24시간 보관한다. 승인·입력 대기는 10분 후 만료한다. 서버 재연결로 조회할 수 있고, 패널 재시작 시 미완료 작업은 `cancelled`로 남기며 자동 재실행하지 않는다.
+  - 단위 `tests/unit/panel_jobs.test.js` 9개, SDK/VM 통합 `tests/mcp/server_jobs.test.js`를 추가했다. 하드 `tests/premiere/cases/s5_jobs.case.js`는 준비했으나 현재 Premiere 연결 문제로 미실행이다.
+- M5.5 Claude — **부분 검증, 완료 보류 (2026-09-28)**
+  - 실제 Claude Code 2.1.276에서 격리 설정의 `mcp get/list` 연결 성공. 원래 사용자 설정은 변경하지 않았다.
+  - SDK/VM 테스트의 클라이언트 이름을 Claude로 지정한 결과와 실제 앱/모델 실행 결과를 구별한다. 실제 Desktop 연결과 모델을 통한 전체 흐름은 아직 미확인이다.
+  - 상세 실행 수, 환경 문제, 남은 확인은 [MCP_VALIDATION.md](MCP_VALIDATION.md)에 기록한다. 현재 결과로 M5.5 전체 완료를 표시하지 않는다.
 
 ---
 

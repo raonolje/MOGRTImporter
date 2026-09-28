@@ -11,14 +11,15 @@ const HEAD = [
 	"MOGRT Subtitle Importer(Premiere Pro 자막 패널) 전용 도구다. 규칙:",
 	"① 먼저 get_status를 부른다. 오류 code가 ai-link-off·panel-closed·no-heartbeat·panel-not-responding이면 사용자에게 Premiere에서 패널을 열고 'AI 연결 허용'을 켜 달라고 한다.",
 	"② 줄은 uid로, 필드는 T-ID(T1, T2…)와 그 줄의 field_sig(get_rows·find_row의 sig)로 가리킨다. 사용자가 '#12 T2'·'C2·12'처럼 말하면 find_row로 그 줄의 문장을 확인한 뒤 쓴다.",
-	"③ 캡션 필드(captionFid)와 시간은 절대 쓰지 않는다.",
-	"④ 이 도구는 타임라인을 바꾸지 않는다. 제안(suggest_fields)은 패널 대기열에만 가고, 바꾸는 요청은 패널에서 사용자가 승인한다."
+	"③ 텍스트 제안으로 캡션 필드(captionFid)와 시간을 고치지 않는다.",
+	"④ 제안(suggest_fields)은 패널 대기열에만 간다. 타임라인·목록을 바꾸는 요청은 패널에서 사용자가 승인하고 점검 창도 직접 확인한다."
 ].join("\n");
 
 const TAIL = [
 	"포인트 텍스트: 캡션 문장 안에 그대로 있는 조각을 '$$'로 이은 값(예: 날씨$$하늘). 조각 수는 list_presets notes의 '최대 N개'를 넘지 않는다. 같은 조각이 캡션에 두 번 나오면 첫 번째만 칠해지니 더 긴 조각을 고른다.",
 	"순서: get_status → list_presets(필드·규칙) → get_rows(쪽 나누기, filter warn·sugg) 또는 find_row → suggest_fields(seq_id·uid·field_id·field_sig·value, 200개까지) → get_suggestions로 확인.",
 	"화자 이름·트랙·기본 프리셋은 set_cast_proposal로 제안한다. 결과가 pending(rid)이면 사용자에게 패널 위쪽 카드에서 [승인]해 달라고 알린다. plan_apply·verify_timeline은 읽기만 한다.",
+	"화자 행의 타임라인 적용은 request_apply(seq_id, scope changed 또는 rows와 uids), SRT 가져오기는 import_srt(seq_id, 로컬 절대 paths)로 요청한다. 화자 없는 목록은 패널 ▶ 또는 가져오기 창에서 화자 지정이 필요하다. 승인·점검은 패널 사용자만 한다. 반환된 job_id로 wait_job을 부른다. pending_approval·waiting_input은 사용자 입력 대기이며 완료가 아니다. succeeded만 성공이고 failed·rejected·cancelled·expired는 미완료 종료다. wait_sec(0~25, 기본 0) 뒤에도 실행 중이면 같은 job_id로 다시 확인하며 요청을 중복 생성하지 않는다.",
 	"오류는 {ok:false, code, message, hint} JSON이다. rejected·fields-changed면 results를 보고 고쳐 다시 보낸다(하나라도 틀리면 아무것도 들어가지 않는다). seq-mismatch면 get_status부터, busy면 적용이 끝난 뒤, timeout이면 잠시 뒤 다시 부른다. panel-version-mismatch면 쓰기를 멈추고 패널을 새로 고쳐 달라고 한다.",
 	"자세한 규칙은 get_guide."
 ].join("\n");
@@ -29,7 +30,7 @@ const GUIDE = [
 	"# MOGRT Subtitle Importer MCP 운영 규칙",
 	"",
 	"## 무엇을 하는 도구인가",
-	"- Premiere Pro의 MOGRT Subtitle Importer 패널(자막 목록 → MOGRT 클립)을 읽고, 후반 작업 텍스트 필드에 값을 '제안'한다.",
+	"- Premiere Pro의 MOGRT Subtitle Importer 패널(자막 목록 → MOGRT 클립)을 읽고, 텍스트 필드를 제안하고, 사용자 승인으로 가져오기·배치를 요청한다.",
 	"- 서버는 상태가 없다. 패널과는 파일 다리(%APPDATA%/MogrtImporter/bridge)로만 이야기하고, 세션 파일과 Premiere에는 직접 닿지 않는다.",
 	"- 패널의 'AI 연결 허용'이 꺼져 있으면 아무 도구도 동작하지 않는다 (ai-link-off). 사용자에게 켜 달라고 한다.",
 	"",
@@ -44,7 +45,7 @@ const GUIDE = [
 	"- 조각 수는 list_presets의 notes(프리셋 설명)에 적힌 '최대 N개'까지. 공백뿐인 조각은 안 된다.",
 	"- 같은 조각이 캡션에 두 번 나오면 첫 번째만 칠해진다. 겹치지 않게 조금 더 긴 조각을 고른다.",
 	"- '$$'가 없는 값은 제목 같은 자유 문구다. 캡션에 없는 문구면 패널이 '본문에 없는 문구'로 표시한다.",
-	"- 시간·캡션 문장·프리셋 구조는 만들거나 고치지 않는다.",
+	"- 텍스트 제안으로 시간·캡션 문장·프리셋 구조를 고치지 않는다. import_srt는 사용자가 지정한 SRT 원본을 패널에서 확인해 가져온다.",
 	"",
 	"## 도구",
 	"- get_status: 패널·시퀀스·화자·줄 수·승인 대기 수, core 버전이 맞는지(core.match). 모든 작업의 처음.",
@@ -59,6 +60,11 @@ const GUIDE = [
 	"  하나라도 틀리면 아무것도 넣지 않고 results에 까닭을 준다 (missing-segment·too-many·caption-field·unknown-field·fields-changed …). 통과하면 패널의 제안 대기열에만 들어간다.",
 	"  결과 results[].check('✓ 본문에 있음', '! 본문에 없는 문구' …)를 사용자에게 알려 준다. field_sig는 결과에 그대로 되돌아온다.",
 	"- set_cast_proposal {seq_id, items: [{key, name?, track?('V3'|'auto'), preset_id?, pos_x?, pos_y?}], note?}: 화자 표 변경 제안. 패널 위쪽 승인 카드에 올라간다 (pending, rid).",
+	"- request_apply {seq_id, scope: changed|rows, uids?}: 화자(C1, C2 …)가 지정된 줄의 타임라인 적용 승인 요청. rows는 고유 uid 1~200개, changed에는 uids를 보내지 않는다. 승인 뒤 점검 창의 충돌 선택도 사용자가 한다. 화자 없는 목록은 unsupported-rows로 거절하므로 패널 ▶로 적용하거나 가져오기 창에서 화자를 지정한다.",
+	"- import_srt {seq_id, paths}: 로컬 .srt 절대 경로 1~20개(중복·UNC·장치 경로·URL 불가)의 가져오기 승인 요청. 승인 후 가져오기·병합 창에서 사용자가 방식과 매핑을 확인한다.",
+	"- wait_job {job_id, wait_sec?}: 작업 상태·진행·결과를 읽는다. 최대 대기는 0~25초(기본 0), 도구 한도가 더 짧으면 그 안에 반환한다. 시간 초과로 작업 상태를 실패로 바꾸지 않는다.",
+	"  상태는 pending_approval(승인 대기), running(실행 중), waiting_input(패널 입력 대기), succeeded(성공), failed(실패), rejected(거절), cancelled(중단), expired(만료).",
+	"  job_id는 다른 클라이언트와 서버 재접속 후에도 조회할 수 있다. 패널을 다시 열면 미완료 작업은 취소되며 자동 실행하지 않는다. 같은 요청을 다시 보내면 새 작업이 생기므로 기존 job_id를 먼저 확인한다.",
 	"",
 	"## seq_id",
 	"- get_status·get_rows·find_row 결과의 seq_id를 쓰기 도구에 그대로 보낸다. 그 사이 사용자가 Premiere에서 시퀀스를 바꾸면 패널이 seq-mismatch로 거절한다",
