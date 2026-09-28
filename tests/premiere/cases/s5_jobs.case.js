@@ -43,7 +43,13 @@ async function run(api) {
 	let connection;
 	try {
 		await H.withScratchSequence(api, "s5_jobs", async () => {
+			const scratch = await mi("ping");
+			assert.equal(scratch.ok, true);
+			assert.match(scratch.seqName, /^T_scratch_/, "새 트랙은 복제한 스크래치 시퀀스에서만 만든다");
 			const tracks = Number(await host("String(app.project.activeSequence.videoTracks.numTracks)"));
+			assert.ok(Number.isInteger(tracks) && tracks > 0 && tracks < 99, "새 트랙 점검을 시험할 빈 트랙 번호가 필요합니다 (현재 1~98개)");
+			// 원본의 트랙 수에 따라 V3/V4가 이미 있을 수 있다. C2는 첫 없는 트랙에 고정하여 실제 새 트랙 점검을 유도한다.
+			const c1Track = 2, c2Track = Math.max(3, tracks);
 			for (let i = 1; i < tracks; i++) assert.equal(String(await host(H.jsxClearVideoTrack(i))), "0");
 			assert.equal(await panel(H.pageSelectTrack(2)), "2");
 			const pick = (list) => list.find((p) => !p.native && p.captionFid);
@@ -64,6 +70,7 @@ async function run(api) {
 			const status = await call("get_status", {});
 			assert.equal(status.core.match, true, "설치된 DEV 패널 core 해시");
 			const seq_id = status.seq_id;
+			assert.equal(seq_id, scratch.seqId, "MCP 요청 대상은 이 스크래치 시퀀스여야 한다");
 			const jobState = async (job, expected, timeoutMs = 60000) => {
 				const end = Date.now() + timeoutMs;
 				let r;
@@ -117,8 +124,8 @@ async function run(api) {
 			const imported = await panel(SNAP);
 			assert.deepEqual(imported.mi.castOrder, ["C1", "C2"]);
 			assert.equal(imported.subtitles.length, 4);
-			const resetTracks = await panel(H.pageCmd("cast.set", { items: [{ key: "C1", track: null, pos: null }, { key: "C2", track: null, pos: null }] }));
-			assert.equal(resetTracks.ok, true, "사용자 화자 기본값의 고정 트랙을 테스트에서 사용하지 않는다");
+			const resetTracks = await panel(H.pageCmd("cast.set", { items: [{ key: "C1", track: c1Track, pos: null }, { key: "C2", track: c2Track, pos: null }] }));
+			assert.equal(resetTracks.ok, true, "사용자 기본값 대신 스크래치 전용 고정 트랙을 사용한다");
 			log("(3) 가져오기 승인·창 확정 → succeeded, C1·C2 네 줄");
 
 			const rows = (await call("get_rows", { count: 50 })).rows;
@@ -147,7 +154,9 @@ async function run(api) {
 			await panel("document.getElementById('pfOk').click(), true");
 			const result = await jobState(j, "succeeded", 120000);
 			assert.equal(result.error, null);
+			assert.ok(result.result && result.result.tracksAdded > 0, "확인 후 스크래치에 새 비디오 트랙 생성");
 			const ping = await mi("ping");
+			assert.equal(ping.seqId, scratch.seqId, "트랙 생성/배치는 스크래치 안에서 완료되어야 한다");
 			const scan = await mi("getTracks", { seqId: ping.seqId, build: ping.build, tracks: null });
 			assert.equal(scan.ok, true);
 			const after = await panel(SNAP);
@@ -161,7 +170,7 @@ async function run(api) {
 				const cue = CUES[row.spk].find((x) => x[2] === row.text);
 				const clip = all.find((c) => String(c.name).includes("[MI:" + after.mi.salt + "-" + row.id + "."));
 				assert.ok(clip, "클립 태그: " + row.id);
-				assert.equal(clip.track, row.spk === "C1" ? 2 : 3, "화자별 V3·V4");
+				assert.equal(clip.track, row.spk === "C1" ? c1Track : c2Track, "화자별 고정 트랙 V" + (c1Track + 1) + "·V" + (c2Track + 1));
 				const ft = Number(scan.frameTicks || ping.frameTicks);
 				assert.ok(ft > 0, "frameTicks");
 				assert.ok(Math.abs(clip.sf - Math.round(cue[0] * 254016000000 / ft)) <= 1, "시작 ±1프레임");
@@ -170,7 +179,7 @@ async function run(api) {
 			await panel(H.PAGE_RECORD_HOST_CALLS);
 			await jobState(j, "succeeded");
 			await noWrites("완료한 wait_job은 쓰기 없음");
-			log("(6) 적용 승인·점검 확정 → succeeded, V3·V4 네 클립 ±1프레임, 완료 조회는 읽기만");
+			log("(6) 적용 승인·점검 확정 → succeeded, V" + (c1Track + 1) + "·V" + (c2Track + 1) + " 네 클립 ±1프레임, 완료 조회는 읽기만");
 		});
 	} finally {
 		if (connection) await connection.close();

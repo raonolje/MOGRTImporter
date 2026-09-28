@@ -38,12 +38,12 @@
                     <Menu>MOGRT Subtitle Importer</Menu>
                     <Geometry>
                         <Size>
-                            <Height>700</Height>
-                            <Width>520</Width>
+                            <Height>720</Height>
+                            <Width>760</Width>
                         </Size>
                         <MinSize>
-                            <Height>500</Height>
-                            <Width>400</Width>
+                            <Height>520</Height>
+                            <Width>480</Width>
                         </MinSize>
                     </Geometry>
                 </UI>

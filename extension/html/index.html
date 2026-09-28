@@ -10,24 +10,25 @@
 html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; color: #e0e0e0; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; }
 
 /* ── 레이아웃 ── */
-#app { display: flex; flex-direction: column; height: 100vh; }
+#app { display: flex; flex-direction: column; height: 100vh; min-width: 0; }
 
 /* ── 상단 툴바 ── */
 #topBar {
-    display: flex; align-items: center; gap: 6px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
     padding: 6px 8px;
     background: #252525;
     border-bottom: 1px solid #333;
     flex-shrink: 0;
 }
 #topBar .logo { font-size: 11px; font-weight: 700; color: #64b5f6; white-space: nowrap; margin-right: 4px; }
+#topBar .btn { flex-shrink: 0; white-space: nowrap; }
 #topBar input[type=file] { display: none; }
 /* 부팅 게이트: 시퀀스 키가 정해지기 전 SRT 열기·불러오기 (S1-3) */
 #topBar label.btn.gated { opacity: 0.45; cursor: not-allowed !important; }
 #topBar label.btn.gated:hover { background: #2a2a2a; }
 #mogrtStatus { font-size: 10px; color: #888; white-space: nowrap; flex-shrink: 0; margin-left: auto; }
 #mogrtStatus.ok { color: #4caf50; }
-#activeSeqLabel { font-size: 10px; color: #90caf9; background: #1a3a5a; border: 1px solid #2a5a8a; border-radius: 3px; padding: 2px 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; flex-shrink: 1; margin-left: 6px; }
+#activeSeqLabel { font-size: 10px; color: #90caf9; background: #1a3a5a; border: 1px solid #2a5a8a; border-radius: 3px; padding: 2px 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 200px; flex-shrink: 1; margin-left: 6px; }
 #activeSeqLabel:empty { display: none; }
 /* #mogrtStatus moved above */
 /* AI 연결 허용 (5단계 M5.1): 기본 꺼짐. 켜면 초록, heartbeat를 쓰지 못하면 빨강 */
@@ -76,7 +77,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 
 /* 전체선택 바 */
 #selectAllBar {
-    display: flex; align-items: center; gap: 6px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
     padding: 4px 8px;
     background: #222;
     border-bottom: 1px solid #2e2e2e;
@@ -85,7 +86,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 .btn-sel-toggle {
     font-size: 10px; padding: 2px 8px;
     background: #2a2a2a; border: 1px solid #444; color: #aaa; border-radius: 3px; cursor: pointer;
-    min-width: 60px;
+    min-width: 60px; white-space: nowrap; flex-shrink: 0;
 }
 .btn-sel-toggle:hover { background: #333; color: #ccc; }
 .btn-sel-toggle.has-selection { background: #2a3a1a; border-color: #4a7a2a; color: #81c784; }
@@ -191,7 +192,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 
 /* ── 하단 적용 바 ── */
 #applyBar {
-    display: flex; align-items: center; gap: 6px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
     padding: 6px 8px;
     background: #252525;
     border-top: 1px solid #333;
@@ -200,7 +201,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 #applyBar label { font-size: 10px; color: #888; white-space: nowrap; }
 #trackSel { font-size: 10px; padding: 3px 5px; background: #2a2a2a; border: 1px solid #444; color: #e0e0e0; border-radius: 3px; }
 #btnApply {
-    flex: 1; padding: 6px 0; font-size: 12px; font-weight: 700;
+    flex: 1 1 180px; min-width: 180px; padding: 6px 8px; font-size: 12px; font-weight: 700; white-space: nowrap;
     background: #1a4a8a; border: 1px solid #2a6aaa; color: #90caf9;
     border-radius: 4px; cursor: pointer; transition: background 0.15s;
 }
@@ -211,11 +212,13 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 #subSearchInput {
     font-size: 10px; padding: 2px 7px;
     background: #1e1e1e; border: 1px solid #3a3a3a; color: #ccc;
-    border-radius: 3px; outline: none; width: 140px;
+    border-radius: 3px; outline: none; width: 140px; min-width: 90px; flex: 1 1 140px;
     transition: border-color 0.15s;
 }
 #subSearchInput:focus { border-color: #0d66d0; }
 #subSearchInput::placeholder { color: #555; }
+/* 히스토리·필터·검색을 한 묶음으로 내려 오른쪽 도구가 패널 밖으로 잘리지 않게 한다. */
+#listTools { display: flex; align-items: center; gap: 6px; margin-left: auto; max-width: 100%; min-width: 0; }
 
 /* 검색 필터 적용 시 숨김 */
 .sub-row.search-hidden { display: none !important; }
@@ -272,9 +275,9 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 /* 히스토리 드롭다운 */
 #historyWrap { position: relative; flex-shrink: 0; }
 #historyDropdown {
-    display: none; position: absolute; top: 100%; right: 0; z-index: 200;
+    display: none; position: absolute; top: 100%; left: 0; z-index: 200;
     background: #252525; border: 1px solid #444; border-radius: 4px;
-    min-width: 260px; max-height: 300px; overflow-y: auto;
+    width: 260px; max-height: 300px; overflow-y: auto;
     box-shadow: 0 4px 12px rgba(0,0,0,0.6);
     padding: 4px 0;
     margin-top: 2px;
@@ -302,7 +305,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 /* ── 프리셋 탭 ── */
 #tab-presets { flex-direction: column; min-height: 0; }
 #presetTopBar {
-    display: flex; align-items: center; gap: 6px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
     padding: 6px 8px;
     background: #222;
     border-bottom: 1px solid #2e2e2e;
@@ -1212,28 +1215,29 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 
 /* ── 화자 표 (#castBar)와 화자 칩 (#speakerChips), S2-3 ── */
 #castBar { flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; padding: 3px 8px 4px; background: #1e1e1e; border-bottom: 1px solid #2e2e2e; max-height: 170px; overflow-y: auto; }
-#castHead { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888; }
+#castHead { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 10px; color: #888; }
 #castTitle { flex: 1; }
 .btn-cast-fold { font-size: 10px; padding: 0 7px; background: #2a2a2a; border: 1px solid #444; color: #aaa; border-radius: 3px; cursor: pointer; }
 .btn-cast-fold:hover { background: #333; color: #ccc; }
 #castBar.folded #castRows { display: none; }
 #castRows { display: flex; flex-direction: column; gap: 2px; }
 /* 화자 색은 왼쪽 3px 줄 (행의 테두리·배경은 프리셋 색 .preset-color-N이 쓴다) */
-.cast-row { position: relative; display: flex; align-items: center; gap: 5px; padding: 2px 4px 2px 6px; background: #242424; border-left: 3px solid #555; border-radius: 2px; font-size: 10px; }
+.cast-row { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 0; padding: 2px 4px 2px 6px; background: #242424; border-left: 3px solid #555; border-radius: 2px; font-size: 10px; }
 .cast-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; cursor: pointer; }
 .cast-key { min-width: 24px; color: #90caf9; font-weight: 600; cursor: pointer; flex-shrink: 0; }
 .cast-key.filtered { text-decoration: underline; }
-.cast-name { width: 80px; font-size: 10px; padding: 1px 4px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #ddd; border-radius: 3px; }
+.cast-name { width: 80px; min-width: 60px; flex: 0 1 80px; font-size: 10px; padding: 1px 4px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #ddd; border-radius: 3px; }
 .cast-track, .cast-preset { font-size: 10px; padding: 1px 3px; background: #2a2a2a; border: 1px solid #444; color: #ccc; border-radius: 3px; }
-.cast-preset { max-width: 140px; }
+.cast-track { min-width: 70px; max-width: 110px; flex: 0 1 90px; }
+.cast-preset { min-width: 110px; max-width: 180px; flex: 1 1 140px; }
 /* 화면 위치 (.cast-pos, 직접이면 .cast-x·.cast-y)와 동시 발화 쌓기 (#castStack), 4단계 */
-.cast-pos { font-size: 10px; padding: 1px 3px; background: #2a2a2a; border: 1px solid #444; color: #ccc; border-radius: 3px; max-width: 110px; }
+.cast-pos { font-size: 10px; padding: 1px 3px; background: #2a2a2a; border: 1px solid #444; color: #ccc; border-radius: 3px; min-width: 95px; max-width: 110px; flex: 0 1 110px; }
 .cast-x, .cast-y { width: 46px; font-size: 10px; padding: 1px 3px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #ddd; border-radius: 3px; }
 #castStack { display: flex; align-items: center; gap: 4px; color: #aaa; }
 #castStack label { display: flex; align-items: center; gap: 3px; cursor: pointer; }
 #castStackDy { width: 46px; font-size: 10px; padding: 0 3px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #ddd; border-radius: 3px; }
 #castStackDy:disabled { opacity: 0.5; }
-.cast-count { margin-left: auto; color: #888; white-space: nowrap; }
+.cast-count { margin-left: auto; color: #888; white-space: nowrap; flex-shrink: 0; }
 .cast-more { font-size: 11px; line-height: 1; padding: 1px 6px; background: none; border: 1px solid #3a3a3a; color: #aaa; border-radius: 3px; cursor: pointer; }
 .cast-more:hover { background: #333; color: #ddd; }
 .cast-menu { display: none; position: absolute; right: 0; top: 100%; z-index: 210; min-width: 200px; padding: 3px 0; background: #252525; border: 1px solid #444; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.6); }
@@ -1241,8 +1245,8 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 .cast-menu button { display: block; width: 100%; text-align: left; font-size: 11px; padding: 4px 10px; background: none; border: none; color: #ccc; cursor: pointer; white-space: nowrap; }
 .cast-menu button:hover { background: #333; }
 .cast-menu button.danger { color: #ef9a9a; }
-#speakerChips { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
-.spk-chip { font-size: 10px; padding: 1px 7px; background: #2a2a2a; border: 1px solid #444; color: #aaa; border-radius: 9px; cursor: pointer; white-space: nowrap; }
+#speakerChips { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; min-width: 0; max-width: 100%; }
+.spk-chip { font-size: 10px; padding: 1px 7px; background: #2a2a2a; border: 1px solid #444; color: #aaa; border-radius: 9px; cursor: pointer; white-space: nowrap; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .spk-chip:hover { background: #333; }
 .spk-chip.active { background: #1a3a5a; border-color: #2a6aaa; color: #90caf9; }
 /* 화자 필터 적용 시 숨김 */
@@ -1285,6 +1289,16 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
 }
 .modal-expose-chk--style {
     width: 12px; height: 12px;
+}
+/* 저장된 작은 도킹 폭도 사용 가능: 제목은 따로, 동작 버튼은 글자 대신 줄을 바꾼다. */
+@media (max-width: 640px) {
+    #topBar .logo { flex-basis: 100%; }
+    #mogrtStatus { margin-left: 0; }
+    #activeSeqLabel { max-width: 160px; margin-left: 0; }
+    #aiLink { margin-left: 0; }
+    #listTools { flex: 1 1 100%; }
+    #subSearchInput { margin-left: auto; }
+    #presetFilterDropdown { left: 0; right: auto; }
 }
 </style>
 </head>
@@ -1340,18 +1354,19 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; c
           <button id="btnSuggRejectAll" data-act="reject" class="danger">모두 무시</button>
         </div>
       </div>
-      <div style="flex:1;"></div>
       <!-- 화자 칩 (화자가 둘 이상일 때만, S2-3) -->
       <div id="speakerChips" style="display:none;"></div>
-      <div id="historyWrap">
-        <button id="btnHistory" title="자막 히스토리">히스토리</button>
-        <div id="historyDropdown"></div>
+      <div id="listTools">
+        <div id="historyWrap">
+          <button id="btnHistory" title="자막 히스토리">히스토리</button>
+          <div id="historyDropdown"></div>
+        </div>
+        <div id="presetFilterWrap">
+          <button class="btn-preset-filter" id="btnPresetFilter" title="프리셋별 필터링">프리셋 필터</button>
+          <div id="presetFilterDropdown"></div>
+        </div>
+        <input type="text" id="subSearchInput" placeholder="🔍 자막 검색..." autocomplete="off" spellcheck="false">
       </div>
-      <div id="presetFilterWrap">
-        <button class="btn-preset-filter" id="btnPresetFilter" title="프리셋별 필터링">프리셋 필터</button>
-        <div id="presetFilterDropdown"></div>
-      </div>
-      <input type="text" id="subSearchInput" placeholder="🔍 자막 검색..." autocomplete="off" spellcheck="false">
     </div>
 
     <!-- 화자 표 (다화자: 화자가 있을 때만 보인다, S2-3) -->

@@ -160,6 +160,7 @@ claude mcp add mogrt_importer -- node <repo>/mcp/server.mjs
   테스트에서 클라이언트 이름을 `Claude Desktop`으로 지정해도 실제 Desktop 앱을 실행하는 것은 아닙니다.
 - 하드 (Premiere, DEV 패널): `npm run hard -- s5_inbox`, `npm run hard -- s5_mcp`, `npm run hard -- s5_jobs`.
   `s5_jobs`는 스크래치 시퀀스에서 실제 SRT 가져오기·타임라인 적용의 거절/취소/승인과 네 클립 배치를 확인합니다.
-- 실제 Claude Code/Desktop의 연결·모델 호출 검증 상태와 실행 결과는 [MCP_VALIDATION.md](../docs/MCP_VALIDATION.md)에 별도로 기록합니다. 현재 M5.4 자동 검사는 통과했고, 신규 Premiere 하드와 M5.5 전체 흐름은 보류 중입니다.
+- 실제 Codex CLI 0.155.0-alpha.16 / `gpt-6-astra`에서 읽기→제안→실제 패널 승인→적용→검수까지 통과했습니다. 최종 MCP 호출 14회(서로 다른 도구 10개)로 합성 첫 행을 V3에 배치하고 실제 MOGRT 포인트 텍스트와 시간도 확인했습니다. 사용자 설정은 바꾸지 않았습니다.
+- 실제 클라이언트별 근거는 [MCP_VALIDATION.md](../docs/MCP_VALIDATION.md)에 기록합니다. M5.4 자동 검사와 Premiere 하드 세 케이스는 통과했습니다. 원래 M5.5의 Claude 검증은 Desktop 패널 통신 실패와 Code 조직 정책 차단으로 미완료이며, 위 Codex 성공과 구분합니다.
 
 `lib/loadRegions.js`·`lib/jsmask.js`는 `tests/lib`의 복사본입니다 (바이트까지 같아야 한다 — `mcp_tools.test.js`). 고치면 둘 다 고칩니다.

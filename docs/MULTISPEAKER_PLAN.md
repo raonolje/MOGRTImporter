@@ -1141,17 +1141,20 @@ MI_setMotion({seqId, build, items:[{key, g, track, nodeId, x, y}]}) → {ok, res
   - 안내문(instructions)·get_guide에 쓰기 도구·seq_id·rejected를 더했다 (1131자, 앞 442자 규칙).
   - 테스트: `tests/unit/panel_inbox.test.js`(rows.raw — 서버 쪽 validateSuggestion 결과 = 패널 suggest 결과, 승인 카드 거절·승인·틀린 요청), `tests/unit/mcp_tools.test.js`(쓰기 도구 정의·parseTrack),
     `tests/mcp/server_write.test.js`(진짜 패널(vm)과 20줄 포인트 텍스트·낡은 sig·캡션 필드·섞인 오류·최대 개수 초과·seq_id·'#12 T2'·카드, fixture 패널로 해시 불일치면 명령 0개), 하드 `s5_mcp` (7)~(10).
-- M5.4 승인 카드 — **구현·자동 테스트 완료, Premiere 하드 검증 보류 (2026-09-28)**
+- M5.4 승인 카드 — **구현·자동 테스트·Premiere 하드 검증 완료 (2026-09-28)**
   - `request_apply {seq_id, scope: changed|rows, uids?}`, `import_srt {seq_id, paths}`, `wait_job {job_id, wait_sec?}`를 추가했다. 전체 14개 도구(읽기 10개, 쓰기 4개).
   - 요청은 작업 ID를 즉시 반환한다. 패널 승인 후에도 적용 전 점검 또는 SRT 가져오기 창에서 사용자가 선택한다. `pending_approval`·`running`·`waiting_input`과 종료 상태를 구별한다.
   - 적용은 화자 키가 있는 줄만 지원한다. 화자 없는 기존 목록은 `unsupported-rows`로 거절하며 패널에서 적용하거나 화자를 지정하도록 안내한다. `changed`는 전체 목록을 검사해 실제 변경분을 계획한다.
   - 요청 시 시퀀스와 자막·프리셋·화자 설정을 확인한다. 승인 전 데이터 변경은 `rows-changed`, 시퀀스 전환은 취소. 점검 만료 후 남은 확인 버튼으로 실행할 수 없고 다른 대기 작업의 만료가 현재 작업을 취소하지 않는다.
   - 작업 스냅숏은 `cache/ai_jobs.json`에 최대 100개/24시간 보관한다. 승인·입력 대기는 10분 후 만료한다. 서버 재연결로 조회할 수 있고, 패널 재시작 시 미완료 작업은 `cancelled`로 남기며 자동 재실행하지 않는다.
-  - 단위 `tests/unit/panel_jobs.test.js` 9개, SDK/VM 통합 `tests/mcp/server_jobs.test.js`를 추가했다. 하드 `tests/premiere/cases/s5_jobs.case.js`는 준비했으나 현재 Premiere 연결 문제로 미실행이다.
+  - 단위 `tests/unit/panel_jobs.test.js` 10개, SDK/VM 통합 `tests/mcp/server_jobs.test.js`를 추가했다. 고유 자동 검사 665개 통과. 실제 Premiere Pro 2026 DEV에서 `s5_inbox`·`s5_mcp`·`s5_jobs` 각각 2/2 통과(공통 스모크 제외 시 본 케이스 3개). `s5_jobs`는 가져오기/적용의 거절·취소·승인, V3/V8 네 클립 ±1프레임, 스크래치 정리를 확인했다.
 - M5.5 Claude — **부분 검증, 완료 보류 (2026-09-28)**
-  - 실제 Claude Code 2.1.276에서 격리 설정의 `mcp get/list` 연결 성공. 원래 사용자 설정은 변경하지 않았다.
-  - SDK/VM 테스트의 클라이언트 이름을 Claude로 지정한 결과와 실제 앱/모델 실행 결과를 구별한다. 실제 Desktop 연결과 모델을 통한 전체 흐름은 아직 미확인이다.
+  - 실제 Claude Code 2.1.276에서 격리 설정의 `mcp get/list` 연결 성공. 이후 실제 모델 요청 두 번도 MCP 연결은 됐지만 도구 호출 없이 중단됐고, 진단에서 조직 정책 오류 `oauth_org_not_allowed`를 확인했다. 기능 설정은 보존됐으며 `.claude.json` 자동 캐시만 갱신됐다.
+  - 실제 Claude Desktop 2.9939.2.0 실행과 MCP 초기 연결·도구 목록·모델의 `get_guide` 호출을 확인했다. 패널 조회는 `ai-link-off`/`no-heartbeat`로 실패했고, 일반 다리와 Store 가상화 경로의 오래된 다리 불일치를 발견했다. Desktop의 제안·승인 작업은 미실행이다.
+  - SDK/VM 테스트의 클라이언트 이름을 Claude로 지정한 결과와 실제 앱/모델 실행 결과를 구별한다. Desktop 임시 설정과 junction은 복원했고 합성 스크래치를 정리했다. 두 클라이언트의 읽기·제안·승인 전체 흐름은 아직 미완료다.
+  - 별도 실제 Codex CLI 0.155.0-alpha.16 / `gpt-6-astra`에서는 읽기→T2 `날씨$$하늘` 제안→실제 패널 승인→첫 행 적용→검수까지 통과했다. 최종 MCP 호출 14회(서로 다른 도구 10개), V3 한 클립 1~2.5초 ±1프레임과 실제 MOGRT 속성을 확인했다. 설정은 그대로이며 스크래치·원래 시퀀스·AI 연결 상태를 복원했다. 이 성공으로 Claude M5.5를 완료 처리하지 않는다.
   - 상세 실행 수, 환경 문제, 남은 확인은 [MCP_VALIDATION.md](MCP_VALIDATION.md)에 기록한다. 현재 결과로 M5.5 전체 완료를 표시하지 않는다.
+- 패널 창 보완 (2026-09-28): 기본 760×720, 최소 480×520으로 조정하고 좁은 폭에서 상단·선택·화자·적용 도구를 줄바꿈한다. 실제 CEF 480·520·760px에서 검사 대상 잘림·가로 넘침 0개, 관련 기존 패널 검사 29개 재통과. 기존에 열린 네이티브 창은 Premiere가 저장한 520×700을 유지했다.
 
 ---
 

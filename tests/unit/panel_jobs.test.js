@@ -25,7 +25,7 @@ function tc(x) {
 }
 function makeSim(o) {
 	const sim = createSim();
-	const seq = sim.addSequence({ name: A.seqName, id: A.seqId, ft: F, tracks: 2 });
+	const seq = sim.addSequence({ name: A.seqName, id: A.seqId, ft: F, tracks: o && o.tracks || 2 });
 	sim.addTemplate(MOGRT, { kind: "ae", name: "[라온올제] 합성 자막", params: [aeText("텍스트", "기본"), aeText("포인트 텍스트", ""), color("색", 4294967295)] });
 	const probe = sim.place(seq, 0, MOGRT, 90000, 90100);
 	const r = sim.call("MI_readClipTexts", { seqId: seq.id, build: "@@BUILD@@", items: [{ track: 0, nodeId: sim.nodeId(probe) }], want: { params: true } });
@@ -177,6 +177,22 @@ test("preflight cancel and sequence switch make terminal jobs and never write", 
 		assert.equal(sim.all(seq), 0);
 		healthy(h);
 	}
+});
+
+test("selected rows on existing empty tracks complete after approval without an unnecessary preflight", async () => {
+	const { sim, seq, preset } = makeSim({ tracks: 6 });
+	const h = await boot(sim, preset, castSession(preset, rowsTwo().slice(0, 4)));
+	const rows = (await cmd(h, "rows", {})).data.rows;
+	const j = (await request(h, "jobs.requestApply", { scope: "rows", uids: rows.map((r) => r.uid) })).data;
+	assert.equal(sim.all(seq), 0, "승인 전 쓰기는 없다");
+	await approve(h, j);
+	const done = await get(h, j);
+	assert.equal(done.state, "succeeded", JSON.stringify(done));
+	assert.equal(done.result.created, 4);
+	assert.equal(done.result.tracksAdded, 0);
+	assert.equal(h.$("preflightModal").classList.contains("open"), false);
+	assert.equal(sim.all(seq), 4);
+	healthy(h);
 });
 
 test("approval detects row/settings drift; a changed position without mm remains eligible", async () => {
