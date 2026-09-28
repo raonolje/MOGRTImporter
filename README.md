@@ -2,7 +2,7 @@
 
 Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 타임라인에 자동 배치하는 CEP 확장 패널.
 
-- **패키지 버전** 1.4.0 (`hostscript.jsx` 내부 v27 + v28 `MI_` 구역). Windows 설치본과 macOS 실험용 ZIP을 제공한다. 실제 검증 범위는 [MCP_VALIDATION.md](docs/MCP_VALIDATION.md)를 참고한다. macOS 실기 검증은 아직 완료하지 않았다.
+- **패키지 버전** 1.4.0 (`hostscript.jsx` 내부 v27 + v28 `MI_` 구역). Windows 설치본과 macOS 실험용 ZIP을 제공한다. 실제 검증 범위는 [MCP_VALIDATION.md](docs/MCP_VALIDATION.md)를 참고한다. Intel Mac 실측과 남은 범위는 [MAC_VALIDATION.md](docs/MAC_VALIDATION.md)에 있다.
 - **대상** Premiere Pro 14.0 ~ (실측 26.5.1) / CEP 11.0
 - **번들 ID** `com.raonolje.mogrtimporter`
 
@@ -71,7 +71,7 @@ Premiere Pro에서 SRT 자막을 불러와 각 자막에 MOGRT를 적용하고 �
 
 1. Premiere 프로젝트를 저장하고 Premiere를 완전히 종료한다.
 2. Windows: `MOGRTImporter_v1.4.0_Windows.exe`를 본인 계정에서 실행한다. ZIP 수동 설치 방법은 ZIP 안의 `README_WINDOWS.md`에 있다.
-3. macOS: `MOGRTImporter_v1.4.0_macOS_experimental.zip` 전체를 압축 해제하고 `README_MACOS.md`를 읽은 뒤 `Installer.command`를 실행한다. **실제 Mac/Premiere 실행은 아직 미검증이며, 서명·공증된 `.pkg`가 아니다.**
+3. macOS: `MOGRTImporter_v1.4.0_macOS_experimental.zip` 전체를 압축 해제하고 `README_MACOS.md`를 읽은 뒤 `Installer.command`를 실행한다. **Intel Mac / Premiere 26.3.0에서 설치와 핵심 기능을 검증했다. 서명·공증된 `.pkg`가 아니며 Apple Silicon은 미검증이다.** [Mac 검증 기록](docs/MAC_VALIDATION.md)에서 빌드별 범위를 확인한다.
 4. Premiere를 다시 실행하고 `Window > Extensions (Legacy) > MOGRT Subtitle Importer`를 연다. 메뉴 명칭은 버전에 따라 다를 수 있다.
 
 설치본은 현재 사용자 CEP 폴더에 설치되며, 기존 코드와 `cache`를 확장 폴더 밖에 백업한다. 설치 후 파일 해시와 캐시 보존 여부를 확인한다. 미서명 CEP 허용 설정이 필요한 경우 설치 화면에서 설명하고 선택을 받는다. 설치 폴더 전체를 삭제하지 않는다.

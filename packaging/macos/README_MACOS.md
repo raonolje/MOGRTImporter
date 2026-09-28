@@ -1,13 +1,14 @@
 # macOS 설치 — 실험 배포
 
-이 ZIP은 macOS용 사용자 설치 스크립트입니다. 서명·공증된 PKG/DMG가 아닙니다. **실제 Mac/Premiere에서 설치와 기능 실행을 아직 검증하지 않았습니다.** Windows에서 스크립트 구문과 배포물 구조만 검사했습니다.
+이 ZIP은 macOS용 사용자 설치 스크립트입니다. 서명·공증된 PKG/DMG가 아닙니다. Intel Mac에서 구형 패널 업그레이드와 설치 파일 검증을 수행했습니다. **Intel Mac / Premiere 26.3.0에서 핵심 기능 검증을 통과했습니다.** Apple Silicon과 다른 버전은 미검증입니다. 빌드별 결과와 남은 항목은 [Mac 검증 기록](https://github.com/raonolje/MOGRTImporter/blob/main/docs/MAC_VALIDATION.md)을 확인하세요.
 
 ## 설치
 
 1. Premiere 프로젝트를 저장하고 Premiere Pro를 완전히 종료합니다.
 2. ZIP 전체를 한 폴더에 압축 해제합니다. `Installer.command`, `extension`, `release.json`, `SHA256SUMS`를 함께 둡니다.
 3. `Installer.command`를 엽니다. Terminal 창에서 설치 위치와 Adobe 설정 변경 내용을 읽습니다.
-4. 동의할 때만 `INSTALL`을 입력합니다. 설치 후 Premiere를 실행하고 **창 → 확장(레거시) → MOGRT Subtitle Importer**를 엽니다. 메뉴 명칭은 버전에 따라 다를 수 있습니다.
+4. 설치기가 표시한 Premiere CEP 버전을 확인합니다. 기본값은 설치된 앱에서 찾은 가장 높은 버전입니다. 여러 Premiere를 사용하면 이번에 사용할 앱에 맞춰 11 또는 12를 선택합니다.
+5. 동의할 때만 `INSTALL`을 입력합니다. 설치 후 Premiere를 실행하고 **창 → 확장(레거시) → MOGRT Subtitle Importer**를 엽니다. 메뉴 명칭은 버전에 따라 다를 수 있습니다.
 
 실행 권한이 보존되지 않은 압축 해제 도구를 사용했다면 Terminal에서 `/bin/bash `를 입력하고 `Installer.command`를 창에 끌어 놓은 뒤 Enter를 누르면 됩니다. 관리자 권한이나 `sudo`는 사용하지 않습니다.
 
@@ -21,15 +22,15 @@ macOS가 출처 확인 메시지로 실행을 막는 경우, 파일 출처를 �
 
 설치 전에 배포물 SHA-256을 확인하고, 기존 설치본을 검증 백업한 뒤 코드만 덮어씁니다. `cache`를 포함한 배포물은 거절합니다. 설치 후 코드 SHA-256과 기존 cache 내용이 그대로인지 다시 확인합니다. 백업은 CEP 확장 폴더 밖에 있어 중복 패널로 로드되지 않습니다. 기존 코드의 추가 파일은 삭제하지 않습니다.
 
-시스템 위치 `/Library/Application Support/Adobe/CEP/extensions`에 같은 확장이 있거나 다른 사용자 확장 폴더에 같은 ID가 있으면 중단합니다. 기존 설치 관리자에게 캐시를 보존한 정리를 요청하세요. 설치기는 시스템 설치본을 지우거나 관리자 권한을 요구하지 않습니다. 대상 경로나 기존 설치본에 심볼릭 링크가 있어도 자동 설치를 중단합니다.
+시스템 위치 `/Library/Application Support/Adobe/CEP/extensions`에 같은 확장이 있거나 다른 사용자 확장 폴더에 같은 ID가 있으면 중단합니다. 구형 1.0.0/1.1.6의 `com.manus.mogrtimporter`도 중복 검사에 포함합니다. 사용자 대상 폴더의 구형 ID는 백업 후 업그레이드합니다. 기존 설치 관리자에게 캐시를 보존한 정리를 요청하세요. 설치기는 시스템 설치본을 지우거나 관리자 권한을 요구하지 않습니다. 대상 경로나 기존 설치본에 심볼릭 링크가 있어도 자동 설치를 중단합니다.
 
 ## 미서명 CEP 설정
 
-이 ZIP의 패널은 Adobe CEP 서명이 없습니다. 배포 manifest의 CSXS 11 요구 사항에 맞춰 사용자 기본 설정 `com.adobe.CSXS.11`의 `PlayerDebugMode`만 문자열 `1`로 설정할 수 있습니다. **같은 CEP 버전의 다른 미서명 패널에도 영향을 주는 Adobe 설정**이므로 설치기가 변경할 항목을 보여 주고 동의를 받습니다. 이미 `1`이면 바꾸지 않습니다. 동의하지 않으면 아무것도 설치하지 않습니다. 다른 CEP 런타임의 설정은 자동으로 바꾸지 않으며, 최신 Premiere의 실제 메뉴 노출은 Mac에서 추가 확인해야 합니다.
+이 ZIP의 패널은 Adobe CEP 서명이 없습니다. 설치된 Premiere 앱의 CEPHtmlEngine에서 CEP 11/12를 찾고, 선택한 `com.adobe.CSXS.<버전>`의 `PlayerDebugMode`만 문자열 `1`로 설정할 수 있습니다. manifest의 CSXS 11은 최소 요구 버전입니다. 실제 Premiere 26.3.0의 엔진은 CEP 12.0.1.2였습니다. 기본 Applications 폴더에서 지원하는 엔진을 찾지 못하면 중단합니다. **같은 CEP 버전의 다른 미서명 패널에도 영향을 주는 Adobe 설정**이므로 설치기가 변경할 항목을 보여 주고 동의를 받습니다. 이미 `1`이면 바꾸지 않습니다. 동의하지 않으면 아무것도 설치하지 않습니다. 선택하지 않은 런타임의 설정은 바꾸지 않습니다.
 
-이 설정을 되돌리려면 Premiere를 종료하고 `PlayerDebugMode.before.txt`를 확인하세요. 이전 값이 `<absent>`였던 도메인은 Terminal에서 `defaults delete com.adobe.CSXS.11 PlayerDebugMode`처럼 해당 키만 삭제합니다. 이전 값이 있었다면 같은 도메인의 키를 그 값으로 복원합니다. 다른 도메인에는 적용하지 마세요. 미서명 패널은 이 설정을 되돌리면 로드되지 않을 수 있습니다.
+이 설정을 되돌리려면 Premiere를 종료하고 `PlayerDebugMode.before.txt`를 확인하세요. 이전 값이 `<absent>`였던 도메인은 Terminal에서 `defaults delete com.adobe.CSXS.12 PlayerDebugMode`처럼 백업에 기록된 도메인의 해당 키만 삭제합니다. 이전 값이 있었다면 같은 도메인의 키를 그 값으로 복원합니다. 다른 도메인에는 적용하지 마세요. 미서명 패널은 이 설정을 되돌리면 로드되지 않을 수 있습니다.
 
-CEP 경로와 미서명 확장 설정은 [Adobe CEP 문서](https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_11.x/Documentation/CEP%2011.1%20HTML%20Extension%20Cookbook.md)에 근거합니다.
+CEP 12 설정 도메인은 [Adobe CEP 12 문서](https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_12.x/Documentation/Debugging%20Handbook.md)도 참고하세요. CEP 경로와 미서명 확장 설정은 [Adobe CEP 문서](https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_11.x/Documentation/CEP%2011.1%20HTML%20Extension%20Cookbook.md)에 근거합니다.
 
 ## 실패와 복구
 

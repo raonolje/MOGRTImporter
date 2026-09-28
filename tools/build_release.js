@@ -76,7 +76,7 @@ async function main(argv) {
     const manifest = fs.readFileSync(path.join(extension, "CSXS/manifest.xml"), "utf8");
     if (!manifest.includes('ExtensionBundleVersion="' + version + '"')) throw new Error("Version mismatch.");
     const metadata = { schemaVersion: 1, version, build, sourceCommit: commit, platform, signed: false,
-      validation: platform === "macos" ? "Experimental: actual macOS/Premiere execution not yet verified." : "See docs/MCP_VALIDATION.md for the scope of Premiere validation." };
+      validation: platform === "macos" ? "Experimental: see docs/MAC_VALIDATION.md for build-specific installation and Premiere results." : "See docs/MCP_VALIDATION.md for the scope of Premiere validation." };
     writeJson(payload, "release.json", metadata);
     if (platform === "windows") {
       for (const rel of ["Install.ps1", "installer-engine.ps1", "README_WINDOWS.md"]) write(payload, rel, source("packaging/windows/" + rel));
@@ -97,7 +97,7 @@ async function main(argv) {
   }
   const artifacts = files(out).filter(rel => !rel.includes("/") && /\.(exe|zip)$/.test(rel));
   write(out, "SHA256SUMS", artifacts.map(rel => hash(fs.readFileSync(path.join(out, rel))) + "  " + rel).join("\n") + "\n");
-  writeJson(out, "release.json", { version, build, sourceCommit: commit, macOS: "experimental, not tested on Mac", artifacts });
+  writeJson(out, "release.json", { version, build, sourceCommit: commit, macOS: "experimental; see docs/MAC_VALIDATION.md", artifacts });
   console.log(JSON.stringify({ out, version, build, sourceCommit: commit, artifacts }, null, 2));
 }
 if (require.main === module) main(process.argv.slice(2)).catch(error => { console.error(error.message); process.exitCode = 1; });

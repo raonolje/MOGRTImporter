@@ -1,6 +1,6 @@
 # Mac에서 이어서 작업하기
 
-2026-09-28 기준으로 Mac ZIP은 **실험 배포이며 실제 Mac/Premiere 설치·실행은 미검증**이다. Windows에서 통과한 Premiere·Codex 실측과 자동 검사는 [MCP_VALIDATION.md](MCP_VALIDATION.md)에 있다. 이를 Mac 통과로 옮겨 적지 않는다. 패널 버전은 1.4.0, MCP 서버는 0.2.0이며, 같은 버전 안의 변경은 배포물 `release.json`의 `sourceCommit`과 `build`로 구별한다.
+2026-09-28 Mac 작업에서 Intel 맥의 구형 설치 업그레이드와 파일 검증을 확인했다. Mac ZIP은 계속 **실험 배포이며 Intel Mac / Premiere 26.3.0 핵심 기능 검증을 통과**이다. 최신 실측과 남은 항목은 [MAC_VALIDATION.md](MAC_VALIDATION.md)를 먼저 확인한다. Windows에서 통과한 Premiere·Codex 실측과 자동 검사는 [MCP_VALIDATION.md](MCP_VALIDATION.md)에 있다. 이를 Mac 통과로 옮겨 적지 않는다. 패널 버전은 1.4.0, MCP 서버는 0.2.0이며, 같은 버전 안의 변경은 배포물 `release.json`의 `sourceCommit`과 `build`로 구별한다.
 
 ## 작업 저장소와 동기화
 

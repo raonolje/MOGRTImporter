@@ -26,3 +26,13 @@ test("Mac installer recognizes legacy installs but requires current ID in payloa
     }
   }
 });
+
+test("Mac installer maps actual CEP engine versions, rejecting unknown runtimes", { skip: process.platform === "win32" }, () => {
+  const script = fs.readFileSync(path.join(__dirname, "../../packaging/macos/Installer.command"), "utf8");
+  const fn = script.match(/runtime_major\(\) \{[\s\S]*?\n\}/)[0];
+  for (const [version, expected] of [["12.0.1.2", "12"], ["11.1.0", "11"], ["11", "11"], ["13.0", null], ["", null], ["1.12", null]]) {
+    const result = cp.spawnSync("/bin/bash", ["-c", fn + '\nruntime_major "$1"', "test", version], { encoding: "utf8" });
+    assert.equal(result.status, expected === null ? 1 : 0);
+    assert.equal(result.stdout, expected || "");
+  }
+});

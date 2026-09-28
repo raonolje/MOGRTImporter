@@ -135,13 +135,36 @@ printf '배포 파일 SHA-256 확인 중…\n'
 if [ -d "$TARGET" ] && [ -n "$(find "$TARGET" -type l -print)" ]; then
   fail "기존 설치본에 심볼릭 링크가 있습니다. cache를 보존한 수동 설치가 필요합니다: $TARGET"
 fi
+runtime_major() {
+  case "$1" in
+    11|11.*) printf '11' ;;
+    12|12.*) printf '12' ;;
+    *) return 1 ;;
+  esac
+}
+# Manifest RequiredRuntime is a minimum, not the host's installed CEP version.
+DETECTED_RUNTIME=""
+for app in /Applications/Adobe\ Premiere\ Pro*/*.app /Applications/Adobe\ Premiere\ Pro*.app "$USER_HOME"/Applications/Adobe\ Premiere\ Pro*/*.app "$USER_HOME"/Applications/Adobe\ Premiere\ Pro*.app; do
+  engine="$app/Contents/MacOS/CEPHtmlEngine.app/Contents/Info.plist"
+  [ -f "$engine" ] || continue
+  engine_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$engine" 2>/dev/null || true)
+  major=$(runtime_major "$engine_version" || true)
+  [ -n "$major" ] || continue
+  printf '발견한 Premiere CEP %s: %s\n' "$engine_version" "$app"
+  if [ -z "$DETECTED_RUNTIME" ] || [ "$major" -gt "$DETECTED_RUNTIME" ]; then DETECTED_RUNTIME="$major"; fi
+done
+[ -n "$DETECTED_RUNTIME" ] || fail "지원하는 Premiere CEP 11/12를 찾지 못했습니다. Premiere를 Applications 폴더에 설치한 뒤 다시 실행하세요."
+printf '\n사용할 Premiere의 CEP 버전 [기본 %s, 11 또는 12]: ' "$DETECTED_RUNTIME"
+IFS= read -r selected_runtime
+RUNTIME=${selected_runtime:-$DETECTED_RUNTIME}
+case "$RUNTIME" in 11|12) ;; *) fail "CEP 버전은 11 또는 12여야 합니다." ;; esac
 NEEDS_DEBUG=()
-for runtime in 11; do
+for runtime in "$RUNTIME"; do
   value=$(defaults read "com.adobe.CSXS.$runtime" PlayerDebugMode 2>/dev/null || true)
   [ "$value" = 1 ] || NEEDS_DEBUG+=("$runtime")
 done
 printf '\nMOGRT Subtitle Importer — macOS 실험 배포\n'
-printf '이 설치기는 Windows에서 구문/배포물 검사를 했으며 실제 Mac/Premiere 실행은 아직 검증하지 않았습니다.\n'
+printf '실제 검증 범위와 남은 항목은 README_MACOS.md 및 docs/MAC_VALIDATION.md를 확인하세요.\n'
 printf '설치 위치: %s\n기존 코드와 cache 백업: %s\n' "$TARGET" "$BACKUP_ROOT"
 printf 'Node.js 없이 CEP 패널을 설치합니다. AI/MCP 서버 연결은 별도 설정입니다.\n'
 if [ "${#NEEDS_DEBUG[@]}" -gt 0 ]; then
@@ -149,7 +172,7 @@ if [ "${#NEEDS_DEBUG[@]}" -gt 0 ]; then
   for runtime in "${NEEDS_DEBUG[@]}"; do printf '  com.adobe.CSXS.%s / PlayerDebugMode\n' "$runtime"; done
   printf '이 Adobe 설정은 해당 CEP 버전의 다른 미서명 패널도 허용합니다. macOS Gatekeeper/격리 속성은 변경하지 않습니다.\n'
 else
-  printf '\nCSXS.11의 PlayerDebugMode가 이미 1입니다. 이 설정은 바꾸지 않습니다.\n'
+  printf '\nCSXS.%s의 PlayerDebugMode가 이미 1입니다. 이 설정은 바꾸지 않습니다.\n' "$RUNTIME"
 fi
 printf '\n위 설치와 명시된 Adobe 설정 변경에 동의하면 INSTALL을 입력하세요. 그 외 입력은 취소합니다: '
 IFS= read -r consent
@@ -162,7 +185,7 @@ mkdir -p "$EXTENSIONS" "$BACKUP_ROOT"
 BACKUP="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
 mkdir "$BACKUP"
 cp "$PACKAGE/release.json" "$PACKAGE/SHA256SUMS" "$BACKUP/"
-for runtime in 11; do
+for runtime in "$RUNTIME"; do
   value=$(defaults read "com.adobe.CSXS.$runtime" PlayerDebugMode 2>/dev/null || printf '<absent>')
   printf 'com.adobe.CSXS.%s PlayerDebugMode=%s\n' "$runtime" "$value" >> "$BACKUP/PlayerDebugMode.before.txt"
 done
