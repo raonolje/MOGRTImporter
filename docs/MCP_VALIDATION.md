@@ -125,11 +125,11 @@ M5.5 완료 표시는 실제 Claude Code와 Desktop에서 필요한 시나리오
 
 Windows NSIS 설치기와 macOS 실험용 ZIP을 추가했다. 커밋된 소스에서만 배포물을 만들고 `release.json`에 `sourceCommit`/`build`를 기록한다. 예전 `installer_v1.1.6.exe`는 최신 배포물이 아니다.
 
-- `npm test`: 665개 중 655 통과, 운영 캐시 미지정 10개 건너뜀, 실패 0.
+- `npm test`: 기존 665개 중 655 통과, 운영 캐시 미지정 10개 건너뜀, 실패 0. 이후 Windows 빌드 경고 거부 검사 1개를 추가하고 설치기 검사 7개를 재실행해 모두 통과했다.
 - 운영 캐시를 지정한 호환 검사: 위 10개 모두 통과. 실제 Premiere 실행은 포함하지 않는 읽기/하네스 검사다.
-- `npm run test:mcp`: 14개 통과. 중복 없는 자동 검사 합계는 679개다.
+- `npm run test:mcp`: 14개 통과. 중복 없는 자동 검사 합계는 680개다.
 - JSX ES3 검사: 1940줄, 위반 0.
-- 추가 검사 11개: Windows/macOS 프리셋 경로 2개, 배포 ZIP 바이트·SHA-256·Unix 실행 권한·링크 거부 3개, Windows 설치기 6개.
+- 추가 검사 12개: Windows/macOS 프리셋 경로 2개, 배포 ZIP 바이트·SHA-256·Unix 실행 권한·링크 거부 3개, Windows 설치기 7개.
 - Windows 설치기 검사는 PowerShell 5.1에서 임시 사용자 경로로 설치·업데이트·제거·실패 복원·캐시 보존·옵트인·경로 충돌을 실행하고 NSIS 3.12로 실제 PE 실행 파일을 생성한다. 이 검사는 실제 사용자 계정 설치와 구별한다.
 - macOS 설치 스크립트는 Bash 구문, 비Mac 실행 차단, 배포 해시와 실행 권한을 확인했다. **실제 Mac/Premiere 설치·실행은 미검증**이다. 후속 절차는 [MAC_HANDOFF.md](MAC_HANDOFF.md)를 따른다.
 

@@ -146,5 +146,21 @@ test("NSIS builds a real per-user Windows executable from the verified payload",
   assert.ok(built.size > 30000);
   assert.match(built.sha256, /^[a-f0-9]{64}$/);
   assert.match(built.log, /Output:/);
+  assert.doesNotMatch(built.log, /^\s*(?:warning \d+|\d+ warnings?)[ :]/im);
   assert.equal(fs.existsSync(f.target), false, "compilation must not run the installer");
+});
+
+test("NSIS compiler warnings reject a release build instead of accepting an executable", { skip: !WINDOWS || !fs.existsSync(NSIS) }, t => {
+  const f = fixture(t);
+  const copy = path.join(f.root, "compiler-warning");
+  fs.mkdirSync(copy);
+  const source = path.resolve(__dirname, "../../packaging/windows");
+  for (const name of ["build.js", "installer.nsi", "installer-engine.ps1"]) {
+    fs.copyFileSync(path.join(source, name), path.join(copy, name));
+  }
+  // A real NSIS preprocessor warning must fail the same release builder, even if an .exe could be produced.
+  fs.appendFileSync(path.join(copy, "installer.nsi"), '\n!warning "release-regression-warning"\n');
+  const isolated = require(path.join(copy, "build.js"));
+  assert.throws(() => isolated.buildInstaller({ payload: f.payload, out: path.join(f.root, "rejected.exe"), makensis: NSIS }), /NSIS compilation failed:[\s\S]*release-regression-warning/);
+  assert.equal(fs.existsSync(f.target), false);
 });

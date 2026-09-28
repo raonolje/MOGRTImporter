@@ -111,7 +111,7 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "DisplayName" "MOGRT Subtitle Importer"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "Publisher" "RAONOLJE"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "UninstallString" '$"$INSTDIR\Uninstall.exe$"'
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "URLInfoAbout" "https://github.com/raonolje/MOGRTImporter"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MOGRTImporter" "NoModify" 1

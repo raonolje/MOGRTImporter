@@ -53,7 +53,7 @@ function buildInstaller({ payload, out, makensis }) {
   const verified = validatePayload(payload);
   const compiler = findCompiler(makensis);
   fs.mkdirSync(path.dirname(out), { recursive: true });
-  const args = ["/V3", "/INPUTCHARSET", "UTF8", "/DVERSION=" + verified.metadata.version, "/DSIZE_KB=" + verified.sizeKB,
+  const args = ["/V3", "/WX", "/INPUTCHARSET", "UTF8", "/DVERSION=" + verified.metadata.version, "/DSIZE_KB=" + verified.sizeKB,
     "/DPAYLOAD=" + nsisString(payload), "/DOUTPUT=" + nsisString(out), "/DSOURCE=" + nsisString(__dirname), path.join(__dirname, "installer.nsi")];
   const result = spawnSync(compiler, args, { encoding: "utf8", windowsHide: true });
   if (result.error) throw result.error;
